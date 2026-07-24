@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.log
+.env
+.env.*
+coverage/
+
+# filled-in MCP configs (may contain secrets)
+mcp.local.json
+mcp.*.local.json
+.mcp.json
+
+# local git worktrees
+.worktrees/

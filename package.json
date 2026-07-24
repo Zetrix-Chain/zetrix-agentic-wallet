@@ -1,0 +1,46 @@
+{
+  "name": "agentic-wallet-mcp",
+  "version": "0.4.2",
+  "description": "Agent-facing MCP wallet for Zetrix — orchestrates x401 identity proof, x402 payment, and MBI VC issuance",
+  "keywords": ["mcp", "model-context-protocol", "zetrix", "wallet", "x401", "x402", "blockchain"],
+  "license": "MIT",
+  "author": "MyEG Services Berhad",
+  "homepage": "https://github.com/Zetrix-Chain/zetrix-agentic-wallet",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Zetrix-Chain/zetrix-agentic-wallet.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Zetrix-Chain/zetrix-agentic-wallet/issues"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "agentic-wallet-mcp": "dist/server-bundle.cjs"
+  },
+  "files": [
+    "dist/server-bundle.cjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc --noEmit && esbuild src/index.ts --bundle --platform=node --target=node18 --format=cjs --external:zetrix-sdk-nodejs --outfile=dist/server-bundle.cjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "x401-zetrix-client": "^0.2.1",
+    "x402-zetrix-client": "^0.2.2",
+    "zetrix-sdk-nodejs": "^1.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.9.0",
+    "vitest": "^1.6.0"
+  }
+}
