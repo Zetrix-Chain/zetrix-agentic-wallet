@@ -1,0 +1,18 @@
+{
+  "_README": "Template MCP config for agentic-wallet-mcp (single-holder). COPY this into your MCP client and fill every <...> placeholder — do NOT commit a filled-in copy with real secrets. Claude Desktop: %APPDATA%\\Claude\\claude_desktop_config.json (Windows). Claude Code: .mcp.json in a project, or ~/.claude.json, or `claude mcp add`. Runs via `npx` — no local install/build needed; npx fetches agentic-wallet-mcp from npm on demand. Only ZETRIX_NETWORK and HSM_PASSWORD are required. ZETRIX_ADDRESS and HOLDER_DID are OPTIONAL: first run, omit both — the MCP creates a new HSM account and logs the address to stderr (copy it back in for next time). Existing account: set ZETRIX_ADDRESS; HOLDER_DID is still optional — the MCP always derives the DID from the account's actual public key at startup and, if you set HOLDER_DID and it doesn't match, overrides it with the derived (correct) one and logs the mismatch to stderr. WALLET_BE_URL, MBI_BASE_URL, and OID4VP_BASE_URL are OPTIONAL — just set ZETRIX_NETWORK to `zetrix:testnet` or `zetrix:mainnet` and the MCP (and the x401 SDK) use their built-in default URL for that network; only set any of the three if you run your own instance instead of the default one. STRONGLY RECOMMENDED before mainnet/real funds: add MAX_PAYMENT_AMOUNT to env, e.g. \"{\\\"ZTX\\\":\\\"1000000000\\\",\\\"*\\\":\\\"0\\\"}\" (JSON, asset -> max raw-unit string, \"*\" = fallback) — without it, pay_and_fetch/subscribe_and_issue auto-pay whatever a server's 402 challenge demands with no ceiling.",
+  "mcpServers": {
+    "agentic-wallet": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "agentic-wallet-mcp"
+      ],
+      "env": {
+        "ZETRIX_NETWORK": "zetrix:testnet",
+        "HSM_PASSWORD": "<your-hsm-password>",
+        "ZETRIX_ADDRESS": "<ZTX3...>",
+        "HOLDER_DID": "did:zid:<...>"
+      }
+    }
+  }
+}
