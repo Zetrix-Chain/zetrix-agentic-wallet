@@ -181,7 +181,7 @@ eyJ2ZXJpZmljYXRpb25fZGF0YSI6eyJyZXF1ZXN0VXJpIjoiaHR0cHM6Ly96aWQtb2lkNHZwLXNhbmRi
 > **Live dependency:** the submit step needs MBI's `includeVp` opt-in on
 > `POST /v1/vp/ext/submit` deployed on the target MBI instance — without it, `prove_identity`
 > fails at `/vp/ext/submit` (no `vp` in the response). It is deployed on the sandbox
-> (`mbi-vc.myegdev.com`); a different MBI instance needs the same rollout.
+> (`mbi-vc-sandbox.zetrix.com`); a different MBI instance needs the same rollout.
 
 ---
 

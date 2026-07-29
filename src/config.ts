@@ -69,12 +69,12 @@ function deriveZidResolverBaseUrl(network: string): string {
 
 function deriveWalletBeUrl(network: string): string {
   return network.includes('testnet')
-    ? 'https://wallet-api.myegdev.com/server'
+    ? 'https://wallet-api-sandbox.zetrix.com/server'
     : 'https://wallet-api.zetrix.com/server'
 }
 
 function deriveMbiBaseUrl(network: string): string {
-  return network.includes('testnet') ? 'https://mbi-vc.myegdev.com' : 'https://mbi-vc.zetrix.com'
+  return network.includes('testnet') ? 'https://mbi-vc-sandbox.zetrix.com' : 'https://mbi-vc.zetrix.com'
 }
 
 function deriveTemplateRegistryAddress(network: string): string {

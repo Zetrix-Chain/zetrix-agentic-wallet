@@ -1,6 +1,6 @@
 {
   "name": "agentic-wallet-mcp",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Agent-facing MCP wallet for Zetrix — orchestrates x401 identity proof, x402 payment, and MBI VC issuance",
   "keywords": [
     "mcp",

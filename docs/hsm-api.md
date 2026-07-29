@@ -11,11 +11,11 @@ Ref: https://docs.zetrix.com/en/developer-resources/blockchain-as-a-services-baa
 
 | Network | Base URL |
 |---|---|
-| `zetrix:testnet` | `https://wallet-api.myegdev.com/server` |
+| `zetrix:testnet` | `https://wallet-api-sandbox.zetrix.com/server` |
 | `zetrix:mainnet` | `https://wallet-api.zetrix.com/server` |
 
 All endpoints below are relative to one of these base URLs (both already include `/server`) —
-e.g. `https://wallet-api.myegdev.com/server/wallet/hsm/account/create` on testnet.
+e.g. `https://wallet-api-sandbox.zetrix.com/server/wallet/hsm/account/create` on testnet.
 
 ## Response Envelope
 
@@ -80,7 +80,7 @@ Creates an HSM-backed wallet account. Nothing is persisted server-side.
 **curl**
 
 ```bash
-curl -X POST https://wallet-api.myegdev.com/server/wallet/hsm/account/create \
+curl -X POST https://wallet-api-sandbox.zetrix.com/server/wallet/hsm/account/create \
   -H "Content-Type: application/json" \
   -d '{"password":"<your-password>","label":"my-wallet","purpose":"testing"}'
 ```
@@ -129,7 +129,7 @@ given address.
 **curl**
 
 ```bash
-curl -X POST https://wallet-api.myegdev.com/server/wallet/hsm/sign-blob \
+curl -X POST https://wallet-api-sandbox.zetrix.com/server/wallet/hsm/sign-blob \
   -H "Content-Type: application/json" \
   -d '{"blob":"0102030405","address":"ZTX3...","password":"<your-password>"}'
 ```
@@ -162,7 +162,7 @@ Same request/response shape as sign-blob, with `message` in place of `blob`.
 **curl**
 
 ```bash
-curl -X POST https://wallet-api.myegdev.com/server/wallet/hsm/sign-message \
+curl -X POST https://wallet-api-sandbox.zetrix.com/server/wallet/hsm/sign-message \
   -H "Content-Type: application/json" \
   -d '{"message":"hello world","address":"ZTX3...","password":"<your-password>"}'
 ```

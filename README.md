@@ -216,11 +216,11 @@ network:
 
 | Network | `WALLET_BE_URL` default | `MBI_BASE_URL` default | `OID4VP_BASE_URL` default | `ZID_RESOLVER_BASE_URL` default |
 |---|---|---|---|---|
-| `zetrix:testnet` | `https://wallet-api.myegdev.com/server` | `https://mbi-vc.myegdev.com` | `https://zid-oid4vp-sandbox.zetrix.com/api` | `https://zid-resolver-sandbox.zetrix.com` |
+| `zetrix:testnet` | `https://wallet-api-sandbox.zetrix.com/server` | `https://mbi-vc-sandbox.zetrix.com` | `https://zid-oid4vp-sandbox.zetrix.com/api` | `https://zid-resolver-sandbox.zetrix.com` |
 | `zetrix:mainnet` | `https://wallet-api.zetrix.com/server` | `https://mbi-vc.zetrix.com` | `https://zid-oid4vp.zetrix.com/api` | `https://zid-resolver.zetrix.com` |
 
 Only set any of the four explicitly if you run your own instance of that service instead of the
-default one — an explicit value always wins over the network default. The `*.myegdev.com`
+default one — an explicit value always wins over the network default. The `*-sandbox.zetrix.com`
 (testnet) hosts are public endpoints — no VPN needed; if you're on a corporate VPN and one of
 them times out, disconnecting it is more likely to fix that than connecting it. See "Network
 reachability & troubleshooting" below.
@@ -323,17 +323,25 @@ Independent of Phases 2/3 — no VC or identity proof involved, just a fresh pay
 
 ## Network reachability & troubleshooting
 
-The `*.myegdev.com` testnet endpoints are public — no VPN needed to reach them. One dependency
-sits behind a CDN edge (see the ZID resolver row below). When something that worked before
-suddenly times out or 403s, check this table before assuming a code regression.
+The `*-sandbox.zetrix.com` testnet endpoints are public — no VPN needed to reach them. Reachability
+differs per host, and this is the first thing to check when something that worked before suddenly
+times out or 403s, before assuming a code regression.
+
+- **`wallet-api-sandbox.zetrix.com` / `mbi-vc-sandbox.zetrix.com`** — direct origin IPs
+  (`124.243.148.237` / `111.119.237.222` as of 2026-07-29), **not** CDN-fronted, unlike the ZID
+  hosts and the mainnet endpoints. Being off-CDN is why the **corporate VPN blocks them
+  specifically** while `test-node.zetrix.com` and the mainnet hosts keep working over the same
+  VPN — so a failure here looks like a total outage while everything else looks healthy.
+  Disconnect the VPN. Verified reachable over a plain internet path on 2026-07-29.
+- **ZID resolver** sits behind a CDN edge with a managed challenge — see its row below.
 
 | Symptom | Cause | Fix / status |
 |---|---|---|
-| `Wallet BE /wallet/hsm/sign-blob request failed <- fetch failed <- UND_ERR_CONNECT_TIMEOUT` (or same for `mbi-vc.myegdev.com`) | Transient network issue, or (if you're on a corporate VPN) the VPN routing away from the public internet | If you're on a VPN, try disconnecting it and retrying. Verify reachability directly: `curl -I https://wallet-api.myegdev.com/server` |
+| `Wallet BE /wallet/hsm/sign-blob request failed <- fetch failed <- UND_ERR_CONNECT_TIMEOUT` (or same for `mbi-vc-sandbox.zetrix.com`) | Corporate VPN routing away from the public internet — it blocks these two direct-origin hosts specifically (observed 2026-07-29), or a transient network issue | **Disconnect the VPN and retry.** Verify reachability directly: `curl -sS -o /dev/null -w '%{http_code}\n' "https://wallet-api-sandbox.zetrix.com/server/wallet/hsm/account/activate/status?address=<yourAddress>"` — `200` (with an `errorCode: 0` body) is healthy; `000` means the TCP connect never completed, so it's a network path problem, not a code problem |
 | `VP derivation failed <- ZID resolver HTTP 403 ... cf-mitigated: challenge` | ZID resolver (`zid-resolver-sandbox.zetrix.com`) sitting behind a Cloudflare **managed challenge** that blocks plain server-to-server `fetch` | Server-to-server access to the resolver must be allowlisted so it returns `200` directly. If the challenge is active, `prove_identity`'s `issuerKeys` input is the fallback — fetch the DID document via a real browser (it clears the JS challenge) and pass its `verificationMethod` entries' `publicKeyMultibase` (BBS+) / `publicKeyHex` (Ed25519) directly. |
 | `OID4VP backend returned a malformed presentation definition` | Historical SDK bug: the live sandbox's `GET /v1/presentation/{id}` response has no `expires_at` field, but the SDK guard required one | **Fixed** in `x401-zetrix-client` — `expiresAt` is now optional on `PresentationDefinition`. If you see this, you're on a stale cached `npx` install — clear it (`npx clear-npx-cache` or bump the version) to pick up the current published `agentic-wallet-mcp`. |
 | `SUBMIT_FAILED: OID4VP backend returned 401 ... Missing X-Wallet-Public-Key header` | Historical SDK gap: `POST /v1/presentation/submit` requires wallet-auth headers (`X-Wallet-Public-Key` / `X-Wallet-Signed-Data`, holder signs their own address) that the SDK didn't send | **Fixed** — `X401Wallet` now accepts an injected `submitAuth` provider and the wallet wires it automatically; nothing to configure. |
-| `MBI /vp/ext/submit did not return vp` | MBI's `includeVp` opt-in not deployed on the target instance | Deployed on the sandbox (`mbi-vc.myegdev.com`). If you see this against a different MBI instance, that instance needs the same rollout. |
+| `MBI /vp/ext/submit did not return vp` | MBI's `includeVp` opt-in not deployed on the target instance | Deployed on the sandbox (`mbi-vc-sandbox.zetrix.com`). If you see this against a different MBI instance, that instance needs the same rollout. |
 
 ## Security notes
 

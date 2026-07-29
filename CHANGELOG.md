@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > Entries for 0.5.0 and earlier were reconstructed from commit history when this file was
 > introduced in 0.6.0, so they summarise each release rather than being exhaustive.
 
+## [0.6.1] — 2026-07-29
+
+**Upgrade if you use testnet.** The testnet Wallet BE and MBI endpoints have moved to the Zetrix
+sandbox hosts. No API, tool or config surface changed — this is an endpoint migration only.
+
+### Changed
+
+- **Testnet default endpoints moved to the Zetrix sandbox hosts.** `ZETRIX_NETWORK=zetrix:testnet`
+  now derives `https://wallet-api-sandbox.zetrix.com/server` (was
+  `https://wallet-api.myegdev.com/server`) and `https://mbi-vc-sandbox.zetrix.com` (was
+  `https://mbi-vc.myegdev.com`). Anyone on testnet relying on the built-in defaults should upgrade
+  to follow the platform; mainnet defaults are unchanged, and an explicit `WALLET_BE_URL` /
+  `MBI_BASE_URL` still wins over the network default, so anyone pinning those is unaffected.
+  Note the Wallet BE base keeps its `/server` path suffix — verified against the new host, which
+  returns nginx `404` without it.
+
 ## [0.6.0] — 2026-07-28
 
 This release is about the wallet never misstating what a call cost. Four reporting defects were

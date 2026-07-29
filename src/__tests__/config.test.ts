@@ -10,9 +10,9 @@ describe('loadConfig', () => {
   it('reads required fields, strips trailing slashes, and derives testnet defaults', () => {
     const cfg = loadConfig(base)
     expect(cfg).toEqual({
-      walletBeUrl: 'https://wallet-api.myegdev.com/server',
+      walletBeUrl: 'https://wallet-api-sandbox.zetrix.com/server',
       oid4vpBaseUrl: undefined,
-      mbiBaseUrl: 'https://mbi-vc.myegdev.com',
+      mbiBaseUrl: 'https://mbi-vc-sandbox.zetrix.com',
       network: 'zetrix:testnet',
       zetrixAddress: undefined,
       holderDid: undefined,
