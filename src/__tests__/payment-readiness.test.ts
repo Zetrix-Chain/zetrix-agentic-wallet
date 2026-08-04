@@ -30,6 +30,23 @@ describe('toPaymentReadinessError', () => {
   it('returns null for a non-InsufficientBalanceError', () => {
     expect(toPaymentReadinessError(new Error('network down'), 'ZTX')).toBeNull()
   })
+
+  it('reports not_activated when the holder account is not yet on chain', () => {
+    const err = new InsufficientBalanceError('Insufficient ZTX for gas: required 100, available 0', '100', '0', 'ZTX')
+    const out = toPaymentReadinessError(err, 'ZTX3token00000000000000000000000000', false)
+    expect(out?.shortfall.reason).toBe('not_activated')
+    expect(out?.message).toMatch(/not been activated/i)
+  })
+
+  it('still reports gas when the account is known to be activated', () => {
+    const err = new InsufficientBalanceError('Insufficient ZTX for gas: required 100, available 10', '100', '10', 'ZTX')
+    expect(toPaymentReadinessError(err, 'ZTX3token00000000000000000000000000', true)?.shortfall.reason).toBe('gas')
+  })
+
+  it('treats an omitted activation flag as "not checked", preserving the old behaviour', () => {
+    const err = new InsufficientBalanceError('Insufficient ZTX for gas: required 100, available 10', '100', '10', 'ZTX')
+    expect(toPaymentReadinessError(err, 'ZTX3token00000000000000000000000000')?.shortfall.reason).toBe('gas')
+  })
 })
 
 describe('payWithReadinessCheck', () => {

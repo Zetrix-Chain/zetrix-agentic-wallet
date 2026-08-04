@@ -19,11 +19,10 @@
  * into the MCP config for the *next* run. This just avoids requiring that round trip before the
  * first run can do anything at all.
  *
- * `hsmPassword` is always the caller's own — this module never generates, invents, or infers
- * one. It's a required (non-optional) field on `ResolveHolderInput`, and `config.ts` requires
- * `HSM_PASSWORD` from the environment before `main()` ever calls this function; there is no
- * code path in this file (or anywhere else in this repo — see the `createAccount` call below)
- * that creates a password on the user's behalf.
+ * `hsmPassword` is a required (non-optional) field on `ResolveHolderInput` and this module never
+ * invents one — but as of the self-service change it may receive a password that `startup-env.ts`
+ * generated rather than one a human typed. That distinction is invisible here on purpose: from
+ * this module's point of view the password is just an opaque credential.
  */
 
 import { deriveHolderDid } from './onboard.js'

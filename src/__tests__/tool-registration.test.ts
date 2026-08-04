@@ -16,9 +16,21 @@ describe('buildToolList', () => {
     // templateId must point callers at the x401 challenge's credential id, not its requirementsId label.
     expect(byName.subscribe_and_issue.inputSchema.properties.templateId.description).toMatch(/credential_requirements/)
     expect(byName.wallet_status.inputSchema.type).toBe('object')
-    expect(byName.create_holder_account.inputSchema.required).toEqual(['password'])
+    expect(byName.create_holder_account.inputSchema.required).toBeUndefined()
     expect(byName.query_contract.inputSchema.required).toEqual(['contractAddress', 'method'])
     expect(byName.get_template_schema.inputSchema.required).toEqual(['templateId'])
+  })
+
+  // The password must not be reachable by a model: not as a parameter, and not as an
+  // instruction telling the agent to go and ask for one.
+  it('does not expose a password parameter on create_holder_account', () => {
+    const tool = buildToolList().find((t) => t.name === 'create_holder_account')
+    expect(tool?.inputSchema.properties.password).toBeUndefined()
+  })
+
+  it('does not tell the agent anything about a password', () => {
+    const tool = buildToolList().find((t) => t.name === 'create_holder_account')
+    expect(tool?.description).not.toMatch(/password/i)
   })
 
   // The whole point of this tool is that an agent hunting for required fields reaches for it

@@ -6,6 +6,8 @@
  *  - MBI RS issues the VC and derives the BBS+ VP proof server-side — needs only its own base URL.
  */
 
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { parsePaymentCaps } from './payment-guard.js'
 
 export interface AgenticWalletConfig {
@@ -20,6 +22,15 @@ export interface AgenticWalletConfig {
   mbiBaseUrl: string
   /** Zetrix network, e.g. "zetrix:testnet" | "zetrix:mainnet". */
   network: string
+  /**
+   * Directory holding this wallet's own state — `account.json` and `vc-cache/<scope>`.
+   * Defaults to `~/.agentic-wallet-mcp`. Configurable so a plugin-hosted wallet can keep
+   * state inside its own data directory rather than a shared home directory. That matters when one
+   * machine hosts more than one wallet: this directory's `account.json` holds the HSM password, so two
+   * wallets sharing a home directory would read each other's credentials, and whichever started last
+   * would overwrite the stored identity.
+   */
+  stateDir: string
   /**
    * Holder Zetrix address (the HSM account that pays + holder-binds). Optional — omit on
    * first run (only `hsmPassword` set) to have the MCP create a new HSM account at startup
@@ -47,10 +58,11 @@ export interface AgenticWalletConfig {
   /** ZID resolver base URL (issuer DID → BBS+/Ed25519 verification keys) — auto-derived from network when not set. */
   zidResolverBaseUrl: string
   /**
-   * Per-asset x402 auto-pay ceiling, asset -> max raw-unit string,
-   * `"*"` as fallback. Unset -> no cap enforced. See src/payment-guard.ts.
+   * Per-asset x402 auto-pay ceiling, asset -> max raw-unit string, `"*"` as fallback.
+   * Defaults to `{ "*": "0" }` — every payment is refused until a cap is set explicitly.
+   * See src/payment-guard.ts.
    */
-  maxPaymentAmount?: Record<string, string>
+  maxPaymentAmount: Record<string, string>
 }
 
 function stripTrailingSlash(v: string): string {
@@ -109,7 +121,9 @@ export function loadConfig(env: NodeJS.ProcessEnv): AgenticWalletConfig {
     return v && v.trim() ? v.trim() : undefined
   }
 
-  const network = req('ZETRIX_NETWORK')
+  // Testnet by default so a zero-configuration start is safe: mainnet, like a non-zero
+  // payment cap, requires a deliberate act.
+  const network = opt('ZETRIX_NETWORK') ?? 'zetrix:testnet'
 
   const oid4vpBaseUrlOverride = opt('OID4VP_BASE_URL')
 
@@ -118,16 +132,21 @@ export function loadConfig(env: NodeJS.ProcessEnv): AgenticWalletConfig {
     oid4vpBaseUrl: oid4vpBaseUrlOverride ? stripTrailingSlash(oid4vpBaseUrlOverride) : undefined,
     mbiBaseUrl: stripTrailingSlash(opt('MBI_BASE_URL') ?? deriveMbiBaseUrl(network)),
     network,
+    stateDir: stripTrailingSlash(opt('ZETRIX_WALLET_STATE_DIR') ?? join(homedir(), '.agentic-wallet-mcp')),
     zetrixAddress: opt('ZETRIX_ADDRESS'),
     holderDid: opt('HOLDER_DID'),
     hsmPassword: req(
       'HSM_PASSWORD',
-      'set your own HSM password in the MCP config before starting the server — this MCP never generates, invents, or infers a password on your behalf',
+      'the server is normally started through main(), which generates a password when none exists — ' +
+        'reaching this error means loadConfig was called directly without one',
     ),
     nodeHost: opt('ZETRIX_NODE_HOST') ?? deriveNodeHost(network),
     nodePort: opt('ZETRIX_NODE_PORT') ?? '',
     templateRegistryAddress: opt('ZETRIX_TEMPLATE_REGISTRY_ADDRESS') ?? deriveTemplateRegistryAddress(network),
     zidResolverBaseUrl: stripTrailingSlash(opt('ZID_RESOLVER_BASE_URL') ?? deriveZidResolverBaseUrl(network)),
-    maxPaymentAmount: parsePaymentCaps(opt('MAX_PAYMENT_AMOUNT')),
+    // Fail closed: an unset cap means "spend nothing", not "spend anything". A wallet that starts
+    // with no configuration at all must not be able to auto-pay a hostile x402 challenge. Raising
+    // it is a deliberate act.
+    maxPaymentAmount: parsePaymentCaps(opt('MAX_PAYMENT_AMOUNT')) ?? { '*': '0' },
   }
 }

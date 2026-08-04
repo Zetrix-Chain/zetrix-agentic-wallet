@@ -10,6 +10,7 @@
 
 import { Buffer } from 'node:buffer'
 import { createHash } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import packageJson from '../package.json' with { type: 'json' }
@@ -24,6 +25,7 @@ import { loadConfig, resolveTokenAddress } from './config.js'
 import { resolveAssetSymbol, type ContractQuery } from './clients/token-info-client.js'
 import { queryContract as runContractQuery, type ContractQueryInput, type ContractQueryResult } from './clients/contract-query-client.js'
 import {
+  parseNativeBalance,
   queryTokenBalance as runTokenBalanceQuery,
   type TokenBalanceDeps,
   type TokenBalanceResult,
@@ -40,6 +42,10 @@ import type { PayFetch } from './orchestrator/pay.js'
 import { assertWithinPaymentCap } from './payment-guard.js'
 import { payWithReadinessCheck, PaymentReadinessError } from './payment-readiness.js'
 import { resolveHolder } from './orchestrator/resolve-holder.js'
+import { resolveStartupEnv } from './startup-env.js'
+import { loadConfigFileEnv } from './config-file.js'
+import { generateHsmPassword } from './hsm-password.js'
+import { exportCredentials } from './export-credentials.js'
 import { createFsVcCache } from './clients/vc-cache.js'
 import { createFsAccountStore } from './clients/account-store.js'
 
@@ -196,16 +202,16 @@ export function buildToolList() {
     {
       name: 'create_holder_account',
       description:
-        'Create a new holder HSM account on Wallet BE (onboarding). Ask the user for a password first — never ' +
-        'invent one. ALWAYS check first: if an account already exists for this session, this returns ' +
-        '{ alreadyExists: true, existing: {...} } WITHOUT creating anything — ask the user whether to keep using ' +
-        'the existing account or create a new one, then call again with confirmNew:true only if they choose new. ' +
-        'A freshly created account is saved to this MCP\'s local account store and reused automatically on the ' +
-        'next restart; an explicit ZETRIX_ADDRESS in the MCP config still overrides it.',
+        'Create a new holder HSM account on Wallet BE (onboarding). ALWAYS check first: if an account ' +
+        'already exists for this session, this returns { alreadyExists: true, existing: {...} } WITHOUT ' +
+        'creating anything — ask the user whether to keep using the existing account or create a new one, ' +
+        'then call again with confirmNew:true only if they choose new. The wallet manages its own ' +
+        'credentials; you neither need nor can supply any. A freshly created account is saved to this ' +
+        "MCP's local account store and reused automatically on the next restart; an explicit " +
+        'ZETRIX_ADDRESS in the MCP config still overrides it.',
       inputSchema: {
         type: 'object',
         properties: {
-          password: { type: 'string', description: 'HSM password to protect the new account. Must come from the user.' },
           label: { type: 'string' },
           purpose: { type: 'string' },
           confirmNew: {
@@ -213,7 +219,6 @@ export function buildToolList() {
             description: 'Set true to mint a new account even though one already exists for this session — only after the user has confirmed they want a new one.',
           },
         },
-        required: ['password'],
       },
     },
   ]
@@ -232,14 +237,39 @@ async function main(): Promise<void> {
   // Local store for a holder account created via create_holder_account or first-run
   // auto-create — lets the account (address, DID, AND its password) survive a restart
   // without requiring the user to hand-edit their MCP host's config file (whose path this
-  // stdio-spawned process can't reliably discover). Read BEFORE loadConfig so a stored
-  // value can fill in for an unset env var; an explicit env value always wins over the store.
-  const accountStore = createFsAccountStore(join(homedir(), '.agentic-wallet-mcp', 'account.json'))
+  // stdio-spawned process can't reliably discover). Read BEFORE resolveStartupEnv so a
+  // stored value can fill in for an unset env var; see startup-env.ts for full precedence.
+  // The config file is read first because it can set the state directory, and the store must be
+  // read before resolveStartupEnv/loadConfig run — a stored account is one of their inputs. Env
+  // still wins over the file here, matching the precedence resolveStartupEnv applies.
+  const fileEnv = loadConfigFileEnv(process.argv, (p) => readFileSync(p, 'utf8'))
+  const stateDir = (
+    process.env.ZETRIX_WALLET_STATE_DIR ??
+    fileEnv.ZETRIX_WALLET_STATE_DIR ??
+    join(homedir(), '.agentic-wallet-mcp')
+  ).replace(/\/+$/, '')
+  const accountStore = createFsAccountStore(join(stateDir, 'account.json'))
+
+  // Backup path for a self-provisioned wallet, before any server setup: it needs no password,
+  // no network and no Wallet BE. Writing to stdout is safe here precisely because this branch
+  // never starts the MCP server, so there is no protocol stream to corrupt.
+  if (process.argv[2] === 'export-credentials') {
+    const { exitCode } = await exportCredentials({
+      getAccount: () => accountStore.get(),
+      isTty: Boolean(process.stdout.isTTY),
+      write: (s) => process.stdout.write(s),
+      writeErr: (s) => process.stderr.write(s),
+    })
+    process.exit(exitCode)
+  }
+
   const storedAccount = process.env.ZETRIX_ADDRESS ? null : await accountStore.get()
-  const env: NodeJS.ProcessEnv = { ...process.env }
-  if (!env.ZETRIX_ADDRESS && storedAccount) env.ZETRIX_ADDRESS = storedAccount.zetrixAddress
-  if (!env.HOLDER_DID && storedAccount) env.HOLDER_DID = storedAccount.holderDid
-  if (!env.HSM_PASSWORD && storedAccount) env.HSM_PASSWORD = storedAccount.hsmPassword
+  const { env, passwordGenerated } = resolveStartupEnv({
+    processEnv: process.env,
+    storedAccount,
+    fileEnv,
+    generatePassword: generateHsmPassword,
+  })
 
   const config = loadConfig(env)
   const hsmPassword = config.hsmPassword
@@ -263,9 +293,14 @@ async function main(): Promise<void> {
   if (created) {
     await accountStore.set({ zetrixAddress, holderDid, hsmPassword, createdAt: new Date().toISOString() })
     process.stderr.write(
-      `agentic-wallet-mcp: no ZETRIX_ADDRESS was set — created a new HSM account and saved it (address, DID, ` +
-        `and password) to ~/.agentic-wallet-mcp/account.json; it will be reused automatically next run. ` +
-        `ZETRIX_ADDRESS=${zetrixAddress} (HOLDER_DID=${holderDid} is optional; it re-derives automatically).\n`,
+      `agentic-wallet-mcp: no ZETRIX_ADDRESS was set — created a new HSM account and saved it to ` +
+        `~/.agentic-wallet-mcp/account.json; it will be reused automatically next run. ` +
+        `ZETRIX_ADDRESS=${zetrixAddress} (HOLDER_DID=${holderDid} is optional; it re-derives automatically).` +
+        (passwordGenerated
+          ? ` An HSM password was generated for this account — you never need to enter it, but it is the ` +
+            `ONLY thing that can authorize signing for this wallet. If this file is lost the account cannot ` +
+            `be recovered. Back it up with: npx agentic-wallet-mcp export-credentials\n`
+          : `\n`),
     )
   } else if (storedAccount && config.zetrixAddress === storedAccount.zetrixAddress) {
     process.stderr.write(
@@ -302,13 +337,9 @@ async function main(): Promise<void> {
   // rather than PaymentEngine.fetchAccountInfo/fetchZTP20Balance: those return `{ balance: '0' }`
   // on any failure, which reports an unreachable node as an empty wallet. Here a failed read
   // throws and surfaces as `query_failed`.
-  const fetchNativeBalance = async (address: string): Promise<string> => {
-    const res = await sdk.account.getInfo(address)
-    if (res.errorCode !== 0) throw new Error(`getInfo failed with errorCode ${res.errorCode}`)
-    const balance = res.result?.balance
-    if (typeof balance !== 'string') throw new Error('getInfo returned no balance')
-    return balance
-  }
+  // parseNativeBalance handles the node omitting `balance` when it is zero — see its docblock.
+  const fetchNativeBalance = async (address: string): Promise<string> =>
+    parseNativeBalance(await sdk.account.getInfo(address))
   const tokenBalanceDeps: TokenBalanceDeps = {
     address: zetrixAddress,
     fetchNativeBalance,
@@ -332,7 +363,7 @@ async function main(): Promise<void> {
   // credential the holder already has. Scoped by network + holder so different identities
   // or networks (e.g. testnet vs mainnet) never share a cache directory.
   const cacheScope = createHash('sha256').update(`${config.network}:${zetrixAddress}`).digest('hex')
-  const vcCache = createFsVcCache(join(homedir(), '.agentic-wallet-mcp', 'vc-cache', cacheScope))
+  const vcCache = createFsVcCache(join(config.stateDir, 'vc-cache', cacheScope))
 
   // x402 self-pay: build the X-PAYMENT header for a given accept. Shared by pay_and_fetch
   // (below) and subscribe_and_issue (subscribeDeps.pay), so the cap covers both
@@ -340,8 +371,10 @@ async function main(): Promise<void> {
   // regardless of what the calling agent was told to do.
   const pay = (accept: PayRequirement) => {
     assertWithinPaymentCap(accept, config.maxPaymentAmount)
-    return payWithReadinessCheck(String(accept.asset ?? ''), () =>
-      PaymentEngine.pay(asPayRequest(accept), walletCfg, node, {}, walletBeSignerFn),
+    return payWithReadinessCheck(
+      String(accept.asset ?? ''),
+      () => PaymentEngine.pay(asPayRequest(accept), walletCfg, node, {}, walletBeSignerFn),
+      activated,
     )
   }
 
@@ -412,8 +445,10 @@ async function main(): Promise<void> {
     subscribeDeps: { mbi, sign: subscribeSign, pay, resolveSymbol, holderDid, resolveTemplateFields, cache: vcCache },
     queryContract: (input: ContractQueryInput): Promise<ContractQueryResult> => runContractQuery(input, contractQuery),
     queryTokenBalance,
-    createAccount: (password, label, purpose) => be.createAccount(password, label, purpose),
-    saveAccount: (account) => accountStore.set({ ...account, createdAt: new Date().toISOString() }),
+    // The session password is bound here, in the wiring, so it never crosses into the tool
+    // layer — create_holder_account has no password parameter for a model to be asked for.
+    createAccount: (label, purpose) => be.createAccount(hsmPassword, label, purpose),
+    saveAccount: (account) => accountStore.set({ ...account, hsmPassword, createdAt: new Date().toISOString() }),
     checkActivationStatus: (address: string) => be.checkActivationStatus(address),
     sleep,
     cache: vcCache,

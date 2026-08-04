@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { loadConfig } from '../config'
 
 const base = {
@@ -21,7 +23,18 @@ describe('loadConfig', () => {
       nodePort: '',
       templateRegistryAddress: 'ZTX3JszqPgRUx743SAp7q7zURfjvkWuH2FMEz',
       zidResolverBaseUrl: 'https://zid-resolver-sandbox.zetrix.com',
+      maxPaymentAmount: { '*': '0' },
+      stateDir: join(homedir(), '.agentic-wallet-mcp'),
     })
+  })
+
+  it('defaults stateDir to ~/.agentic-wallet-mcp', () => {
+    expect(loadConfig(base).stateDir).toBe(join(homedir(), '.agentic-wallet-mcp'))
+  })
+
+  it('honors ZETRIX_WALLET_STATE_DIR and strips a trailing slash', () => {
+    const cfg = loadConfig({ ...base, ZETRIX_WALLET_STATE_DIR: '/var/lib/zetrix-wallet/' } as NodeJS.ProcessEnv)
+    expect(cfg.stateDir).toBe('/var/lib/zetrix-wallet')
   })
 
   it('derives the mainnet template-registry address and honors the override', () => {
@@ -82,18 +95,36 @@ describe('loadConfig', () => {
     expect(cfg.holderDid).toBeUndefined()
   })
 
+  it('defaults network to zetrix:testnet when ZETRIX_NETWORK is unset', () => {
+    const { ZETRIX_NETWORK, ...withoutNetwork } = base
+    const cfg = loadConfig(withoutNetwork as NodeJS.ProcessEnv)
+    expect(cfg.network).toBe('zetrix:testnet')
+    expect(cfg.walletBeUrl).toBe('https://wallet-api-sandbox.zetrix.com/server')
+  })
+
+  it('honors an explicit mainnet network over the testnet default', () => {
+    const { ZETRIX_NETWORK, ...withoutNetwork } = base
+    const cfg = loadConfig({ ...withoutNetwork, ZETRIX_NETWORK: 'zetrix:mainnet' } as NodeJS.ProcessEnv)
+    expect(cfg.network).toBe('zetrix:mainnet')
+  })
+
   it('throws naming the missing required var', () => {
     const { HSM_PASSWORD, ...withoutHsmPassword } = base
     expect(() => loadConfig(withoutHsmPassword as NodeJS.ProcessEnv)).toThrow(/HSM_PASSWORD/)
   })
 
-  it('throws a hint that the MCP never generates a password on the user\'s behalf when HSM_PASSWORD is missing', () => {
+  it('throws a hint pointing at main() when loadConfig is called directly without a password', () => {
     const { HSM_PASSWORD, ...withoutHsmPassword } = base
-    expect(() => loadConfig(withoutHsmPassword as NodeJS.ProcessEnv)).toThrow(/never generates|never invents/i)
+    expect(() => loadConfig(withoutHsmPassword as NodeJS.ProcessEnv)).toThrow(/generates a password when none exists/)
   })
 
-  it('leaves maxPaymentAmount undefined when MAX_PAYMENT_AMOUNT is unset (no cap enforced)', () => {
-    expect(loadConfig(base).maxPaymentAmount).toBeUndefined()
+  it('defaults maxPaymentAmount to a zero cap when MAX_PAYMENT_AMOUNT is unset — fail closed', () => {
+    expect(loadConfig(base).maxPaymentAmount).toEqual({ '*': '0' })
+  })
+
+  it('still honors an explicit MAX_PAYMENT_AMOUNT over the zero default', () => {
+    const cfg = loadConfig({ ...base, MAX_PAYMENT_AMOUNT: '{"ZTX":"500"}' } as NodeJS.ProcessEnv)
+    expect(cfg.maxPaymentAmount).toEqual({ ZTX: '500' })
   })
 
   it('parses MAX_PAYMENT_AMOUNT into maxPaymentAmount', () => {

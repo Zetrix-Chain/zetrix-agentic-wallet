@@ -30,10 +30,10 @@ describe('createHolderAccount', () => {
 
     const out = await createHolderAccount(
       { create, getExistingAccount, saveAccount, checkActivationStatus, sleep },
-      { password: 'pw123456', label: 'agent', purpose: 'onboarding' },
+      { label: 'agent', purpose: 'onboarding' },
     )
 
-    expect(create).toHaveBeenCalledWith('pw123456', 'agent', 'onboarding')
+    expect(create).toHaveBeenCalledWith('agent', 'onboarding')
     expect(checkActivationStatus).not.toHaveBeenCalled()
     expect(out.created).toBe(true)
     expect(out.alreadyExists).toBe(false)
@@ -44,7 +44,7 @@ describe('createHolderAccount', () => {
     expect(out.message).toMatch(/ZETRIX_ADDRESS/)
     expect(out.message).toMatch(/HOLDER_DID/)
     expect(out.message).toMatch(/restart/i)
-    expect(saveAccount).toHaveBeenCalledWith({ zetrixAddress: 'ZTX3New', holderDid: `did:zid:${rawPart}`, hsmPassword: 'pw123456', label: 'agent', purpose: 'onboarding' })
+    expect(saveAccount).toHaveBeenCalledWith({ zetrixAddress: 'ZTX3New', holderDid: `did:zid:${rawPart}`, label: 'agent', purpose: 'onboarding' })
   })
 
   it('does NOT create a new account when one already exists, and asks the caller to confirm instead', async () => {
@@ -55,7 +55,7 @@ describe('createHolderAccount', () => {
     const existing = { zetrixAddress: 'ZTX3Old', holderDid: 'did:zid:old' }
     const getExistingAccount = vi.fn().mockResolvedValue(existing)
 
-    const out = await createHolderAccount({ create, getExistingAccount, saveAccount, checkActivationStatus, sleep }, { password: 'pw123456' })
+    const out = await createHolderAccount({ create, getExistingAccount, saveAccount, checkActivationStatus, sleep }, {})
 
     expect(create).not.toHaveBeenCalled()
     expect(saveAccount).not.toHaveBeenCalled()
@@ -77,15 +77,15 @@ describe('createHolderAccount', () => {
 
     const out = await createHolderAccount(
       { create, getExistingAccount, saveAccount, checkActivationStatus, sleep },
-      { password: 'pw123456', confirmNew: true },
+      { confirmNew: true },
     )
 
-    expect(create).toHaveBeenCalledWith('pw123456', undefined, undefined)
+    expect(create).toHaveBeenCalledWith(undefined, undefined)
     expect(out.created).toBe(true)
     expect(out.alreadyExists).toBe(true)
     expect(out.zetrixAddress).toBe('ZTX3New')
     expect(out.activated).toBe(true)
-    expect(saveAccount).toHaveBeenCalledWith({ zetrixAddress: 'ZTX3New', holderDid: `did:zid:${rawPart}`, hsmPassword: 'pw123456', label: undefined, purpose: undefined })
+    expect(saveAccount).toHaveBeenCalledWith({ zetrixAddress: 'ZTX3New', holderDid: `did:zid:${rawPart}`, label: undefined, purpose: undefined })
   })
 
   it('polls checkActivationStatus and reports activated:true when it becomes activated', async () => {
@@ -97,7 +97,7 @@ describe('createHolderAccount', () => {
 
     const out = await createHolderAccount(
       { create, getExistingAccount, saveAccount, checkActivationStatus, sleep },
-      { password: 'pw123456' },
+      {},
     )
 
     expect(checkActivationStatus).toHaveBeenCalledWith('ZTX3New')
@@ -114,7 +114,7 @@ describe('createHolderAccount', () => {
 
     const out = await createHolderAccount(
       { create, getExistingAccount, saveAccount, checkActivationStatus, sleep },
-      { password: 'pw123456' },
+      {},
     )
 
     expect(checkActivationStatus).toHaveBeenCalledTimes(3)

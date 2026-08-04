@@ -14,8 +14,11 @@
  * string. The 402 challenge's asset is not fixed — it may be the native ZETRIX token
  * (asset code `ZTX`) or a ZTP20 token (e.g. `JMYR`) — so cap whichever you expect, e.g.
  * `{"ZTX":"1000000000","JMYR":"5000000","*":"0"}`. `"*"` is the fallback cap for any
- * asset without its own entry. Left unset entirely, no cap is enforced — see README for
- * why this must be set before pointing the wallet at mainnet/real funds.
+ * asset without its own entry.
+ *
+ * config.ts defaults it to `{"*":"0"}` when unset, so an unconfigured wallet refuses every
+ * payment. `assertWithinPaymentCap` still no-ops on `undefined` caps, which is now reachable
+ * only by a caller that constructs config by hand rather than through loadConfig.
  */
 
 export class PaymentCapError extends Error {

@@ -8,9 +8,11 @@
  * the caller must pass `confirmNew: true` to mint a new one anyway, so the human gets to
  * choose between keeping the existing account or replacing it.
  *
- * A freshly created account — address, DID, AND the password the caller just supplied — is
- * saved via `saveAccount` to this MCP's own local account store (see
- * `clients/account-store.ts`), so both are picked up automatically on the next restart with
+ * A freshly created account — address and DID — is saved via `saveAccount` to this MCP's own
+ * local account store (see `clients/account-store.ts`), together with the session's HSM
+ * password, which the wiring layer in index.ts holds. The password is NOT a parameter of this
+ * function or of the tool: a model can neither be asked for it nor supply it, which is the
+ * point. Everything is picked up automatically on the next restart with
  * no manual config edit. We still can't write the *host's* MCP config file ourselves — the
  * stdio spawn doesn't reliably tell us its path, and some clients keep every server's config
  * in one shared file — so an explicit `ZETRIX_ADDRESS`/`HSM_PASSWORD` set via env still
@@ -25,7 +27,6 @@
 import { waitForActivation, type CheckActivationStatus } from './wait-for-activation.js'
 
 export type CreateAccount = (
-  password: string,
   label?: string,
   purpose?: string,
 ) => Promise<{ zetrixAddress: string; publicKeyHex: string; activated: boolean; activationTxHash: string | null }>
@@ -39,14 +40,13 @@ export interface CreateHolderAccountDeps {
   create: CreateAccount
   /** The account already active for this session, if any — env-configured or auto-created at startup. */
   getExistingAccount: () => Promise<ExistingAccount | null>
-  /** Persists a freshly minted account (address, DID, AND its password) locally so it's reused automatically on the next restart. */
-  saveAccount: (account: ExistingAccount & { hsmPassword: string; label?: string; purpose?: string }) => Promise<void>
+  /** Persists a freshly minted account locally so it's reused automatically on the next restart. */
+  saveAccount: (account: ExistingAccount & { label?: string; purpose?: string }) => Promise<void>
   checkActivationStatus: CheckActivationStatus
   sleep: (ms: number) => Promise<void>
 }
 
 export interface CreateHolderAccountInput {
-  password: string
   label?: string
   purpose?: string
   /** Required to mint a new account when one already exists for this session. */
@@ -90,9 +90,9 @@ export async function createHolderAccount(deps: CreateHolderAccountDeps, input: 
     }
   }
 
-  const { zetrixAddress, publicKeyHex, activated } = await deps.create(input.password, input.label, input.purpose)
+  const { zetrixAddress, publicKeyHex, activated } = await deps.create(input.label, input.purpose)
   const holderDid = deriveHolderDid(publicKeyHex)
-  await deps.saveAccount({ zetrixAddress, holderDid, hsmPassword: input.password, label: input.label, purpose: input.purpose })
+  await deps.saveAccount({ zetrixAddress, holderDid, label: input.label, purpose: input.purpose })
 
   const finalActivated = activated || (await waitForActivation(deps.checkActivationStatus, zetrixAddress, deps.sleep))
 

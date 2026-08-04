@@ -43,8 +43,12 @@ export interface ToolDeps {
   /** Read-only contract/account query, backing the query_contract tool. */
   queryContract: (input: ContractQueryInput) => Promise<ContractQueryResult>
   createAccount: CreateAccount
-  /** Persists a freshly created account (address, DID, password) locally so create_holder_account survives a restart. */
-  saveAccount: (account: ExistingAccount & { hsmPassword: string; label?: string; purpose?: string }) => Promise<void>
+  /**
+   * Persists a freshly created account locally so create_holder_account survives a restart.
+   * The session's HSM password is added by the wiring in index.ts, not passed through here —
+   * no credential crosses the tool boundary.
+   */
+  saveAccount: (account: ExistingAccount & { label?: string; purpose?: string }) => Promise<void>
   /** Ground-truth on-chain activation check — backs the polling create_holder_account does after minting a new account. */
   checkActivationStatus: CheckActivationStatus
   sleep: (ms: number) => Promise<void>

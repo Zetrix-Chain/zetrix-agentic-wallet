@@ -196,7 +196,7 @@ describe('createTools', () => {
 
   it('create_holder_account does NOT create when an account already exists for this session, and asks to confirm', async () => {
     const { deps, createAccount, saveAccount } = makeDeps()
-    const out = await createTools(deps).create_holder_account({ password: 'pw123456' })
+    const out = await createTools(deps).create_holder_account({})
     expect(createAccount).not.toHaveBeenCalled()
     expect(saveAccount).not.toHaveBeenCalled()
     expect(out).toMatchObject({
@@ -208,15 +208,14 @@ describe('createTools', () => {
 
   it('create_holder_account creates + saves a new HSM account when confirmNew is set', async () => {
     const { deps, createAccount, saveAccount } = makeDeps()
-    const out = await createTools(deps).create_holder_account({ password: 'pw123456', confirmNew: true })
-    expect(createAccount).toHaveBeenCalledWith('pw123456', undefined, undefined)
+    const out = await createTools(deps).create_holder_account({ confirmNew: true })
+    expect(createAccount).toHaveBeenCalledWith(undefined, undefined)
     expect(out.zetrixAddress).toBe('ZTX3New')
     expect(out.holderDid).toBe('did:zid:ba4f1fcf68831a5c689dfaa2195da1a3a7c37930228f886611f936fed0df66b9')
     expect(out.message).toMatch(/ZETRIX_ADDRESS/)
     expect(saveAccount).toHaveBeenCalledWith({
       zetrixAddress: 'ZTX3New',
       holderDid: 'did:zid:ba4f1fcf68831a5c689dfaa2195da1a3a7c37930228f886611f936fed0df66b9',
-      hsmPassword: 'pw123456',
       label: undefined,
       purpose: undefined,
     })
@@ -224,7 +223,7 @@ describe('createTools', () => {
 
   it('create_holder_account threads checkActivationStatus/sleep through to the orchestrator', async () => {
     const { deps, checkActivationStatus } = makeDeps()
-    await createTools(deps).create_holder_account({ password: 'pw123456', confirmNew: true })
+    await createTools(deps).create_holder_account({ confirmNew: true })
     expect(checkActivationStatus).not.toHaveBeenCalled() // activated:true on create — no polling needed
   })
 

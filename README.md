@@ -165,8 +165,8 @@ Node ≥ 18 required (built-in `fetch`).
 
 | Variable | Required | Description |
 |---|---|---|
-| `ZETRIX_NETWORK` | yes | `zetrix:testnet` or `zetrix:mainnet` — also selects the default `WALLET_BE_URL`/`MBI_BASE_URL`/`OID4VP_BASE_URL`/`ZID_RESOLVER_BASE_URL` below |
-| `HSM_PASSWORD` | yes* | HSM password |
+| `ZETRIX_NETWORK` | no | `zetrix:testnet` or `zetrix:mainnet` — also selects the default `WALLET_BE_URL`/`MBI_BASE_URL`/`OID4VP_BASE_URL`/`ZID_RESOLVER_BASE_URL` below. **Defaults to `zetrix:testnet`**; mainnet is always a deliberate choice |
+| `HSM_PASSWORD` | no* | HSM password. Omit it and the wallet generates one on first run and stores it in its own state directory — see "Onboarding" below |
 | `ZETRIX_ADDRESS` | no | Holder Zetrix address (the HSM account). Omit on first run — see "Onboarding" below |
 | `HOLDER_DID` | no | Holder DID. Omit and the MCP derives it automatically — see "Onboarding" below |
 | `WALLET_BE_URL` | no | Wallet BE base URL override (HSM `/wallet/hsm/sign-blob`) — auto-derived from `ZETRIX_NETWORK` when not set |
@@ -174,22 +174,25 @@ Node ≥ 18 required (built-in `fetch`).
 | `OID4VP_BASE_URL` | no | OID4VP verifier base URL override — auto-derived from `ZETRIX_NETWORK` by the x401 SDK when not set |
 | `ZETRIX_NODE_HOST` / `ZETRIX_NODE_PORT` | no | RPC node override (auto-derived from network) |
 | `ZID_RESOLVER_BASE_URL` | no | ZID resolver override (auto-derived from network: sandbox for testnet, prod for mainnet) |
-| `MAX_PAYMENT_AMOUNT` | no** | Per-asset x402 auto-pay cap — JSON `{ "<asset>": "<maxRawUnits>", "*": "<fallback>" }`. `pay_and_fetch`/`subscribe_and_issue` are asset-agnostic: the resource server's 402 challenge may quote the native ZETRIX token (asset code `ZTX`) **or** a ZTP20 token (e.g. `JMYR`) — cap whichever assets you expect, e.g. `{"ZTX":"1000000000","JMYR":"5000000","*":"0"}`. Unset = no cap enforced. |
+| `MAX_PAYMENT_AMOUNT` | no** | Per-asset x402 auto-pay cap — JSON `{ "<asset>": "<maxRawUnits>", "*": "<fallback>" }`. `pay_and_fetch`/`subscribe_and_issue` are asset-agnostic: the resource server's 402 challenge may quote the native ZETRIX token (asset code `ZTX`) **or** a ZTP20 token (e.g. `JMYR`) — cap whichever assets you expect, e.g. `{"ZTX":"1000000000","JMYR":"5000000","*":"0"}`. **Defaults to `{"*":"0"}` — every payment is refused until you set this.** |
+| `ZETRIX_WALLET_STATE_DIR` | no | Where the wallet keeps `account.json` and its VC cache. Defaults to `~/.agentic-wallet-mcp` |
 
-\* sensitive — never logged.
+\* sensitive — never logged, never returned in a tool result, and never a tool parameter.
 
 ### Onboarding: two ways to set up your holder identity
 
 `ZETRIX_ADDRESS` and `HOLDER_DID` are both optional — the MCP resolves your holder identity at
 startup, in one of two ways:
 
-1. **First-time user — only `HSM_PASSWORD` set.** The MCP creates a brand-new HSM account on
-   Wallet BE (`POST /wallet/hsm/account/create`) and derives the DID from the returned public
-   key. It logs the new `ZETRIX_ADDRESS` (and `HOLDER_DID`) to stderr on startup, and saves the
-   address, DID, and password to a local account store
-   (`~/.agentic-wallet-mcp/account.json`, owner-only) — it's reused automatically next run, no
-   config edit required. An explicit `ZETRIX_ADDRESS`/`HSM_PASSWORD` set later in your MCP
-   config still overrides the saved account.
+1. **First-time user — nothing set at all, or only `HSM_PASSWORD` set.** The MCP creates a
+   brand-new HSM account on Wallet BE (`POST /wallet/hsm/account/create`) and derives the DID from
+   the returned public key. If you did not set `HSM_PASSWORD`, it generates one for you first. It
+   logs the new `ZETRIX_ADDRESS` (and `HOLDER_DID`) to stderr on startup, and saves the address,
+   DID, and password to a local account store (`~/.agentic-wallet-mcp/account.json`, owner-only) —
+   it's reused automatically next run, no config edit required. An explicit
+   `ZETRIX_ADDRESS`/`HSM_PASSWORD` set later in your MCP config still overrides the saved account.
+
+   **If the wallet generated your password, back it up — see below.**
 2. **Existing user — `ZETRIX_ADDRESS` + `HSM_PASSWORD` set, `HOLDER_DID` optional.** The MCP
    always self-signs the address via the existing `POST /wallet/hsm/sign-message` call and
    derives the DID from the `publicKey` the response carries — no separate lookup endpoint
@@ -201,13 +204,28 @@ startup, in one of two ways:
 Either way, `wallet_status` always reports the resolved `zetrixAddress`/`holderDid` for the
 running session, so you can confirm what the MCP resolved to at any time.
 
-\*\* **strongly recommended before pointing this wallet at mainnet/real funds.** `pay_and_fetch`
-and `subscribe_and_issue` auto-pay whatever `maxAmountRequired` a remote server's 402 challenge
-demands, with no built-in ceiling — a prompt-injected or misled agent calling either tool against
-a hostile endpoint would pay whatever that endpoint asks for, bounded only by the HSM account
-balance. `MAX_PAYMENT_AMOUNT` is a hard, code-enforced cap that holds regardless of what the
-calling agent decides. Once set, it becomes an allowlist: an asset with no entry and no `"*"`
-fallback is **denied**, not passed through uncapped.
+### Backing up a self-provisioned wallet
+
+If you never set `HSM_PASSWORD`, the wallet generated one and stored it in
+`~/.agentic-wallet-mcp/account.json`. You never have to type it — but it is the only thing that
+can authorize signing for your account. Wallet BE holds the key and will not use it without this
+password, so if you lose the file the account cannot be recovered and any funds in it are gone.
+Back it up with:
+
+```bash
+npx agentic-wallet-mcp export-credentials
+```
+
+This only runs in an interactive terminal, so it can't be piped into a file or a log, and it is
+deliberately **not** available as an MCP tool — an AI agent can never read your password.
+
+\*\* **You must set this before the wallet will pay for anything.** It defaults to `{"*":"0"}`,
+which refuses every payment. `pay_and_fetch` and `subscribe_and_issue` auto-pay whatever
+`maxAmountRequired` a remote server's 402 challenge demands, so without a ceiling a prompt-injected
+or misled agent calling either tool against a hostile endpoint would pay whatever that endpoint
+asks for, bounded only by the account balance. `MAX_PAYMENT_AMOUNT` is a hard, code-enforced cap
+that holds regardless of what the calling agent decides. It is also an allowlist: an asset with no
+entry and no `"*"` fallback is **denied**, not passed through uncapped.
 
 You don't need to look up or fill in `WALLET_BE_URL`/`MBI_BASE_URL`/`OID4VP_BASE_URL`/
 `ZID_RESOLVER_BASE_URL` yourself — just pick `zetrix:testnet` or `zetrix:mainnet` for

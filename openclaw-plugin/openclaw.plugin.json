@@ -1,0 +1,43 @@
+{
+  "id": "zetrix-agentic-wallet",
+  "name": "Zetrix Agentic Wallet",
+  "description": "Zetrix identity, verifiable-credential and pay-per-use wallet tools for agents.",
+  "version": "0.1.0",
+  "activation": {
+    "onStartup": true
+  },
+  "skills": ["./skills/zetrix-agentic-wallet"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "network": {
+        "type": "string",
+        "enum": ["zetrix:testnet", "zetrix:mainnet"],
+        "default": "zetrix:testnet"
+      },
+      "maxPaymentAmount": {
+        "type": "object",
+        "additionalProperties": { "type": "string" },
+        "default": { "*": "0" }
+      },
+      "zetrixAddress": {
+        "type": "string"
+      }
+    }
+  },
+  "uiHints": {
+    "network": {
+      "label": "Zetrix network",
+      "help": "Testnet by default. Mainnet spends real funds."
+    },
+    "maxPaymentAmount": {
+      "label": "Maximum payment per call",
+      "help": "Per-asset ceiling in raw units, e.g. {\"ZTX\":\"1000000000\",\"*\":\"0\"}. Defaults to refusing every payment — you must set this before the wallet will pay for anything."
+    },
+    "zetrixAddress": {
+      "label": "Existing holder address (optional)",
+      "help": "Leave empty and the wallet creates its own account on first run."
+    }
+  }
+}

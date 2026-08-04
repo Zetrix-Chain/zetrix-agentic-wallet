@@ -12,7 +12,7 @@ export interface PaymentShortfall {
   asset: string
   required: string
   available: string
-  reason: 'gas' | 'resource_payment'
+  reason: 'gas' | 'resource_payment' | 'not_activated'
 }
 
 export class PaymentReadinessError extends Error {
@@ -34,8 +34,25 @@ export class PaymentReadinessError extends Error {
  * itself IS ZTX, checkBalance's single combined check (amount + fee) is reported as
  * "resource_payment" (it's the payment itself that's short, gas is inseparable from it).
  */
-export function toPaymentReadinessError(err: unknown, requestedAsset: string): PaymentReadinessError | null {
+export function toPaymentReadinessError(
+  err: unknown,
+  requestedAsset: string,
+  activated?: boolean,
+): PaymentReadinessError | null {
   if (!(err instanceof InsufficientBalanceError)) return null
+
+  // An unactivated account reads as a zero balance, but the fix is different: the address does
+  // not exist on chain yet and needs gas sent to it from an already-funded account. Reporting
+  // "balance too low" would send the user looking for the wrong problem. `undefined` means we
+  // never checked (an existing account), which must keep the original mapping.
+  if (activated === false) {
+    return new PaymentReadinessError(
+      `payment blocked: this wallet's address has not been activated on chain yet — send ZTX to it ` +
+        `from a funded account, then retry`,
+      { asset: err.asset, required: err.required, available: err.available, reason: 'not_activated' },
+    )
+  }
+
   const reason: PaymentShortfall['reason'] = err.asset === 'ZTX' && requestedAsset !== 'ZTX' ? 'gas' : 'resource_payment'
   return new PaymentReadinessError(err.message, {
     asset: err.asset,
@@ -46,11 +63,15 @@ export function toPaymentReadinessError(err: unknown, requestedAsset: string): P
 }
 
 /** Wrap a raw PaymentEngine.pay call: success passes through; InsufficientBalanceError becomes PaymentReadinessError. */
-export async function payWithReadinessCheck(requestedAsset: string, rawPay: () => Promise<string>): Promise<string> {
+export async function payWithReadinessCheck(
+  requestedAsset: string,
+  rawPay: () => Promise<string>,
+  activated?: boolean,
+): Promise<string> {
   try {
     return await rawPay()
   } catch (err) {
-    const readinessError = toPaymentReadinessError(err, requestedAsset)
+    const readinessError = toPaymentReadinessError(err, requestedAsset, activated)
     if (readinessError) throw readinessError
     throw err
   }

@@ -34,6 +34,43 @@ export interface TokenBalanceDeps {
   query: ContractQuery
 }
 
+/** The shape of a `sdk.account.getInfo` response, as much of it as this module reads. */
+export interface AccountInfoResponse {
+  errorCode?: number
+  result?: { balance?: unknown; nonce?: unknown } | null
+}
+
+/**
+ * Extract the native ZTX balance from a `getInfo` response.
+ *
+ * **The node omits `balance` entirely when it is zero.** Verified against test-node.zetrix.com on
+ * 4 August 2026 — a funded account returns `balance: 1333492010`, while an activated account holding
+ * nothing, a contract account, and a never-activated account all return no `balance` key at all
+ * (confirmed on both `/getAccount` and `/getAccountBase`, and through the SDK).
+ *
+ * This used to require `typeof balance === 'string'` and throw otherwise, which made a zero balance
+ * indistinguishable from an unreadable one — `wallet_status({ token: 'ZTX' })` reported
+ * `query_failed` for every account with no ZTX. A successful RPC that omits a zero-valued field is a
+ * successful read, so absence now means `'0'`.
+ *
+ * The strictness that remains is deliberate and is the point of this module: a non-zero `errorCode`,
+ * or a response with no `result` at all, still throws rather than reporting a fabricated zero. That
+ * is what keeps an unreachable node from looking like an empty wallet.
+ *
+ * The SDK hands us a string even though the raw node emits a JSON number, so numbers are accepted
+ * too rather than trusting that conversion to hold forever.
+ */
+export function parseNativeBalance(res: AccountInfoResponse | null | undefined): string {
+  if (res?.errorCode !== 0) throw new Error(`getInfo failed with errorCode ${res?.errorCode}`)
+  if (res.result === undefined || res.result === null) throw new Error('getInfo returned no result')
+
+  const balance = res.result.balance
+  if (typeof balance === 'string') return balance
+  if (typeof balance === 'number' && Number.isFinite(balance)) return String(balance)
+  if (balance === undefined || balance === null) return '0'
+  throw new Error(`getInfo returned an unusable balance of type ${typeof balance}`)
+}
+
 /**
  * Read a ZTP20 `balanceOf` and return the raw base-unit balance. Throws on any RPC error,
  * missing field, or malformed payload — never substitutes a zero.

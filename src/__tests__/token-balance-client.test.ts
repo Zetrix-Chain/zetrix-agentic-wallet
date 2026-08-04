@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { queryTokenBalance, fetchZTP20BalanceStrict, ZTX_DECIMALS } from '../clients/token-balance-client'
+import { queryTokenBalance, fetchZTP20BalanceStrict, parseNativeBalance, ZTX_DECIMALS, type TokenBalanceDeps } from '../clients/token-balance-client'
 
 const holder = 'ZTXholder000000000000000000000000000'
 const jmyr = 'ZTX3jmyrcontract0000000000000000000'
@@ -86,5 +86,68 @@ describe('queryTokenBalance', () => {
   it('upper-cases the requested symbol before resolving it', async () => {
     const out = await queryTokenBalance(deps(), 'jmyr')
     expect(out).toEqual({ token: 'JMYR', balance: '473999900', decimals: 6 })
+  })
+})
+
+describe('parseNativeBalance', () => {
+  it('returns the balance when the node reports one', () => {
+    // A funded account, as observed live: ZTX3YzAyKBxjbSaMPeaPKEBpV93wjzN4SjTaN.
+    expect(parseNativeBalance({ errorCode: 0, result: { balance: '1333492010', nonce: '1336' } })).toBe('1333492010')
+  })
+
+  it('returns "0" when the node OMITS balance — it does that for a zero balance', () => {
+    // The whole bug: an activated account holding nothing returns no balance key at all.
+    // Observed on the template registry (nonce 218) and the JMYR contract (nonce 5370).
+    expect(parseNativeBalance({ errorCode: 0, result: { nonce: '218' } })).toBe('0')
+  })
+
+  it('returns "0" for a never-activated account — no balance and no nonce', () => {
+    expect(parseNativeBalance({ errorCode: 0, result: {} })).toBe('0')
+  })
+
+  it('treats an explicit null balance as zero too', () => {
+    expect(parseNativeBalance({ errorCode: 0, result: { balance: null } })).toBe('0')
+  })
+
+  it('accepts a numeric balance — the raw node emits a JSON number, the SDK stringifies it', () => {
+    expect(parseNativeBalance({ errorCode: 0, result: { balance: 1333492010 } })).toBe('1333492010')
+  })
+
+  it('still throws on a failed RPC, so an unreachable node never looks like an empty wallet', () => {
+    expect(() => parseNativeBalance({ errorCode: 4, result: {} })).toThrow(/errorCode 4/)
+    expect(() => parseNativeBalance({ result: {} })).toThrow(/errorCode/)
+    expect(() => parseNativeBalance(null)).toThrow(/errorCode/)
+  })
+
+  it('throws when the response carries no result at all — that is malformed, not zero', () => {
+    expect(() => parseNativeBalance({ errorCode: 0 })).toThrow(/no result/)
+    expect(() => parseNativeBalance({ errorCode: 0, result: null })).toThrow(/no result/)
+  })
+
+  it('throws on a balance of an unusable type rather than coercing it', () => {
+    expect(() => parseNativeBalance({ errorCode: 0, result: { balance: {} } })).toThrow(/unusable balance/)
+    expect(() => parseNativeBalance({ errorCode: 0, result: { balance: Number.NaN } })).toThrow(/unusable balance/)
+  })
+})
+
+describe('queryTokenBalance with the real parseNativeBalance', () => {
+  it('reports a zero ZTX balance instead of query_failed — the end-to-end fix', async () => {
+    const deps = {
+      address: 'ZTX3Holder',
+      fetchNativeBalance: async () => parseNativeBalance({ errorCode: 0, result: { nonce: '1' } }),
+      resolveTokenAddress: () => null,
+      query: async () => ({ errorCode: 0 }),
+    } as unknown as TokenBalanceDeps
+    expect(await queryTokenBalance(deps, 'ZTX')).toEqual({ token: 'ZTX', balance: '0', decimals: ZTX_DECIMALS })
+  })
+
+  it('still reports query_failed when the node itself fails', async () => {
+    const deps = {
+      address: 'ZTX3Holder',
+      fetchNativeBalance: async () => parseNativeBalance({ errorCode: 4, result: {} }),
+      resolveTokenAddress: () => null,
+      query: async () => ({ errorCode: 0 }),
+    } as unknown as TokenBalanceDeps
+    expect(await queryTokenBalance(deps, 'ZTX')).toEqual({ token: 'ZTX', error: 'query_failed' })
   })
 })

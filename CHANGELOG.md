@@ -8,6 +8,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > Entries for 0.5.0 and earlier were reconstructed from commit history when this file was
 > introduced in 0.6.0, so they summarise each release rather than being exhaustive.
 
+## [0.7.0] — 4 August 2026
+
+**Read the breaking change before upgrading if you make x402 payments.** This release lets the wallet
+provision itself, so it can start with no configuration at all — which is what makes an OpenClaw plugin
+install possible, and also why the payment cap now has to default to zero.
+
+### Changed (breaking)
+
+- **`MAX_PAYMENT_AMOUNT` now defaults to `{"*":"0"}` instead of being unset.** An unconfigured wallet
+  refuses every x402 payment rather than allowing any amount. Previously an unset cap disabled the
+  ceiling entirely, which was defensible only while every install required hand-written environment
+  variables; a wallet that can now start with no configuration must not be able to auto-pay a hostile
+  challenge. To keep paying, set the cap explicitly, e.g.
+  `MAX_PAYMENT_AMOUNT={"ZTX":"1000000000","*":"0"}`.
+
+- **`create_holder_account` no longer takes a `password` parameter.** The wallet uses the password
+  already active for the session, so a model can neither be asked for one nor supply one. A
+  `password` still passed by an old caller is **silently ignored** rather than rejected, because the
+  tool schema permits extra properties. Consequence: a newly minted account now inherits the session
+  password instead of taking a different one.
+
+### Added
+
+- **The wallet provisions itself.** `HSM_PASSWORD` and `ZETRIX_NETWORK` are both optional now.
+  With neither set, the wallet defaults to testnet, generates a random HSM password, creates a
+  holder account, and stores address, DID and password in its own state directory — so it starts
+  with no configuration at all. An explicit env var still wins over every other source, so an
+  existing `.mcp.json` behaves exactly as before.
+- **`npx agentic-wallet-mcp export-credentials`** prints the address, DID and HSM password for
+  backup. A generated password is the only thing that can authorize signing for the account, so
+  losing the state directory means losing the account. Interactive terminals only, and deliberately
+  not an MCP tool, so an agent can never read it.
+- **`--config <path>`** reads settings from a JSON file instead of the environment, for hosts that
+  cannot set env vars. It carries no secret: a `hsmPassword` key is a hard error, and so is any
+  unknown key, so a typo cannot silently start the wallet on the wrong network.
+- **`ZETRIX_WALLET_STATE_DIR`** moves `account.json` and the VC cache out of the home directory.
+  The default is unchanged.
+- `pay_and_fetch` and `subscribe_and_issue` now report a `not_activated` shortfall when the holder
+  address is not yet on chain, instead of reporting it as a low balance — the remedy is to send it
+  gas, not to top up a token.
+
+### Fixed
+
+- **A zero ZTX balance no longer reports `query_failed`.** The node omits the `balance` field
+  entirely when it is zero, and `wallet_status({ token: "ZTX" })` treated its absence as a failed
+  read — so every account holding no ZTX looked like a broken lookup. A successful RPC that omits a
+  zero-valued field is now read as `0`. A non-zero `errorCode`, or a response with no `result` at
+  all, still fails loudly rather than reporting a fabricated zero.
+
 ## [0.6.1] — 2026-07-29
 
 **Upgrade if you use testnet.** The testnet Wallet BE and MBI endpoints have moved to the Zetrix
