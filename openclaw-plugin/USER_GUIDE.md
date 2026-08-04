@@ -89,23 +89,59 @@ It takes effect immediately — no gateway restart.
 
 ### Reading the limit
 
+The value is a map of **token → maximum per payment**, and `"*"` is the fallback for any token you have
+not listed.
+
 ```json
 { "ZTX": "1000000000", "*": "0" }
 ```
 
-- **`"ZTX": "1000000000"`** — up to 1,000,000,000 raw units of ZTX per payment. ZTX has 6 decimals, so
-  that is **1,000 ZTX**.
-- **`"*": "0"`** — everything else is refused.
+- **`"ZTX": "1000000000"`** — up to 1,000,000,000 raw units of ZTX per payment
+- **`"*": "0"`** — everything else refused
 
-Amounts are in **raw units**, not whole tokens. Divide by 10⁶ for ZTX to get the human figure. Some
-services charge in other tokens (for example JMYR); add an entry per token you want to allow:
+Amounts are in **raw units**, not whole tokens. ZTX has 6 decimals, so `1000000000` is **1,000 ZTX**.
+
+### One limit for everything, or a limit per token?
+
+Both work. Pick based on how much you care about what you are paying *in*.
+
+**One limit for everything** — simplest, and fine for testing:
 
 ```json
-{ "ZTX": "1000000000", "JMYR": "5000000", "*": "0" }
+{ "*": "1000000000" }
 ```
 
-**Once set, the limit is an allowlist.** A token with no entry and no `"*"` fallback is **denied**, not
-allowed through. Keeping `"*": "0"` means "only the tokens I have listed".
+Any token, up to 1,000,000,000 raw units per payment.
+
+**A limit per token** — safer, and what we recommend once real money is involved:
+
+```json
+{ "ZTX": "1000000000", "ZTX3WeinXtt28YMyr4vUZ14ddTgEMGeuc1e6b": "5000000", "*": "0" }
+```
+
+Only those two are payable, each with its own ceiling; everything else is refused.
+
+⚠️ **Use `ZTX` for the native coin, and the token's contract address for anything else.** A payment
+request identifies a token by its contract address, not its ticker, so a limit written as `"JMYR"` never
+matches — the payment falls through to `"*"` and is refused. That looks like the limit working, when
+really it was never consulted.
+
+To find a token's address, ask your agent:
+
+> Look up the JMYR token contract address on this network
+
+**Why per-token is safer**, despite being more work:
+
+- **The same number is not the same value.** 1,000 ZTX and 1,000 JMYR are different amounts of money. A
+  single universal limit treats them as interchangeable, because it only counts units.
+- **Decimals vary by token.** ZTX and JMYR both use 6, but nothing guarantees the next one does. On a
+  token with 2 decimals, `1000000000` raw units would be ten million tokens.
+- **It auto-approves tokens you have never heard of.** With `{"*": "1000000000"}`, a service can quote
+  an obscure token and be paid, as long as the unit count fits. Listing tokens explicitly means you
+  decide what is acceptable currency, not the service asking for money.
+
+**Once you list any token, the limit becomes an allowlist.** A token with no entry and no `"*"` fallback
+is **denied**, not passed through. Keeping `"*": "0"` means "only the tokens I have listed".
 
 ### It is a hard limit, not a prompt
 

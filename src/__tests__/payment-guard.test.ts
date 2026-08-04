@@ -73,3 +73,45 @@ describe('assertWithinPaymentCap', () => {
     expect(() => assertWithinPaymentCap({ asset: 'ZTX' }, caps)).not.toThrow()
   })
 })
+
+describe('a universal-only cap', () => {
+  // The user guide offers `{"*": "N"}` as the simple alternative to a per-token allowlist, so the
+  // behaviour it describes needs pinning — including the downside, which is the reason the guide
+  // recommends per-token once real money is involved.
+  const universal = { '*': '1000000000' }
+
+  it('permits any asset under the limit', () => {
+    for (const asset of ['ZTX', 'JMYR']) {
+      expect(() => assertWithinPaymentCap({ asset, maxAmountRequired: '500' }, universal)).not.toThrow()
+    }
+  })
+
+  it('permits an asset the wallet has never seen — the reason per-token is safer', () => {
+    expect(() => assertWithinPaymentCap({ asset: 'ZTX3UnknownToken', maxAmountRequired: '500' }, universal)).not.toThrow()
+  })
+
+  it('still refuses anything over the limit', () => {
+    expect(() => assertWithinPaymentCap({ asset: 'ZTX', maxAmountRequired: '1000000001' }, universal)).toThrow(PaymentCapError)
+  })
+})
+
+describe('the cap key format for ZTP20 tokens', () => {
+  // The 402 challenge's `asset` is 'ZTX' for the native coin or a CONTRACT ADDRESS for a ZTP20 token
+  // (x402-zetrix-client blob-builder). The cap is checked against that raw value before any symbol
+  // resolution, so a cap keyed by symbol silently does not apply — it falls through to '*'. Docs
+  // previously suggested {"JMYR": "..."}, which would never have matched a real payment.
+  const jmyrAddress = 'ZTX3WeinXtt28YMyr4vUZ14ddTgEMGeuc1e6b'
+
+  it('matches a ZTP20 cap keyed by contract address', () => {
+    const caps = { [jmyrAddress]: '5000000', '*': '0' }
+    expect(() => assertWithinPaymentCap({ asset: jmyrAddress, maxAmountRequired: '4999999' }, caps)).not.toThrow()
+    expect(() => assertWithinPaymentCap({ asset: jmyrAddress, maxAmountRequired: '5000001' }, caps)).toThrow(PaymentCapError)
+  })
+
+  it('does NOT match a cap keyed by symbol — it falls through to the "*" fallback', () => {
+    const capsBySymbol = { JMYR: '5000000', '*': '0' }
+    expect(() => assertWithinPaymentCap({ asset: jmyrAddress, maxAmountRequired: '1' }, capsBySymbol)).toThrow(
+      PaymentCapError,
+    )
+  })
+})

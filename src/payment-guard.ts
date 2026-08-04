@@ -12,9 +12,15 @@
  *
  * Configured via `MAX_PAYMENT_AMOUNT` — a JSON object mapping asset -> max raw-unit
  * string. The 402 challenge's asset is not fixed — it may be the native ZETRIX token
- * (asset code `ZTX`) or a ZTP20 token (e.g. `JMYR`) — so cap whichever you expect, e.g.
- * `{"ZTX":"1000000000","JMYR":"5000000","*":"0"}`. `"*"` is the fallback cap for any
- * asset without its own entry.
+ * (asset code `ZTX`) or a ZTP20 token — so cap whichever you expect, e.g.
+ * `{"ZTX":"1000000000","ZTX3Wein…c1e6b":"5000000","*":"0"}`. `"*"` is the fallback cap
+ * for any asset without its own entry.
+ *
+ * **Key by contract address, not by symbol.** The challenge identifies a ZTP20 token by its
+ * contract address (`x402-zetrix-client` blob-builder: `"ZTX"` for the native coin, otherwise
+ * a contract address), and the cap is checked against that raw value before any symbol
+ * resolution. A cap written as `{"JMYR":"…"}` therefore never matches — it falls through to
+ * `"*"` and is refused, which looks like the cap working when it was never consulted.
  *
  * config.ts defaults it to `{"*":"0"}` when unset, so an unconfigured wallet refuses every
  * payment. `assertWithinPaymentCap` still no-ops on `undefined` caps, which is now reachable

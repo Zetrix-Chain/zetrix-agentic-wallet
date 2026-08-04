@@ -6,20 +6,29 @@
   "activation": {
     "onStartup": true
   },
-  "skills": ["./skills/zetrix-agentic-wallet"],
+  "skills": [
+    "./skills/zetrix-agentic-wallet"
+  ],
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
     "properties": {
       "network": {
         "type": "string",
-        "enum": ["zetrix:testnet", "zetrix:mainnet"],
+        "enum": [
+          "zetrix:testnet",
+          "zetrix:mainnet"
+        ],
         "default": "zetrix:testnet"
       },
       "maxPaymentAmount": {
         "type": "object",
-        "additionalProperties": { "type": "string" },
-        "default": { "*": "0" }
+        "additionalProperties": {
+          "type": "string"
+        },
+        "default": {
+          "*": "0"
+        }
       },
       "zetrixAddress": {
         "type": "string"
@@ -33,7 +42,7 @@
     },
     "maxPaymentAmount": {
       "label": "Maximum payment per call",
-      "help": "Per-asset ceiling in raw units, e.g. {\"ZTX\":\"1000000000\",\"*\":\"0\"}. Defaults to refusing every payment — you must set this before the wallet will pay for anything."
+      "help": "Maximum per payment, in the token's raw units. Simplest form is one limit for everything: {\"*\":\"1000000000\"}. To limit per token, use \"ZTX\" for the native coin and the CONTRACT ADDRESS for any other — a ticker like \"JMYR\" never matches and the payment is refused. Defaults to refusing every payment until you set this."
     },
     "zetrixAddress": {
       "label": "Existing holder address (optional)",

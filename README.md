@@ -174,7 +174,7 @@ Node ≥ 18 required (built-in `fetch`).
 | `OID4VP_BASE_URL` | no | OID4VP verifier base URL override — auto-derived from `ZETRIX_NETWORK` by the x401 SDK when not set |
 | `ZETRIX_NODE_HOST` / `ZETRIX_NODE_PORT` | no | RPC node override (auto-derived from network) |
 | `ZID_RESOLVER_BASE_URL` | no | ZID resolver override (auto-derived from network: sandbox for testnet, prod for mainnet) |
-| `MAX_PAYMENT_AMOUNT` | no** | Per-asset x402 auto-pay cap — JSON `{ "<asset>": "<maxRawUnits>", "*": "<fallback>" }`. `pay_and_fetch`/`subscribe_and_issue` are asset-agnostic: the resource server's 402 challenge may quote the native ZETRIX token (asset code `ZTX`) **or** a ZTP20 token (e.g. `JMYR`) — cap whichever assets you expect, e.g. `{"ZTX":"1000000000","JMYR":"5000000","*":"0"}`. **Defaults to `{"*":"0"}` — every payment is refused until you set this.** |
+| `MAX_PAYMENT_AMOUNT` | no** | Per-asset x402 auto-pay cap — JSON `{ "<asset>": "<maxRawUnits>", "*": "<fallback>" }`. `pay_and_fetch`/`subscribe_and_issue` are asset-agnostic: the resource server's 402 challenge may quote the native ZETRIX token (asset code `ZTX`) **or** a ZTP20 token (e.g. `JMYR`) — cap whichever assets you expect. **Key by contract address, not symbol** — the challenge identifies a ZTP20 token by its contract address, so `{"JMYR":...}` never matches and falls through to `"*"`. e.g. `{"ZTX":"1000000000","ZTX3WeinXtt28YMyr4vUZ14ddTgEMGeuc1e6b":"5000000","*":"0"}`. **Defaults to `{"*":"0"}` — every payment is refused until you set this.** |
 | `ZETRIX_WALLET_STATE_DIR` | no | Where the wallet keeps `account.json` and its VC cache. Defaults to `~/.agentic-wallet-mcp` |
 
 \* sensitive — never logged, never returned in a tool result, and never a tool parameter.
