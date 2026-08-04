@@ -144,6 +144,18 @@ describe('package metadata', () => {
     for (const f of ['dist', 'skills', 'openclaw.plugin.json']) expect(pkg.files).toContain(f)
   })
 
+  it('ships the user guide, and it covers the things a subscriber cannot discover alone', () => {
+    // The guide is the only place a subscriber learns three non-obvious facts: payments are refused
+    // until they set a limit, the wallet generated a password only they can back up, and the limit must
+    // be set through plugin config rather than by editing mcp.servers. Dropping it from `files` would
+    // publish a plugin that silently refuses to pay with no explanation anywhere.
+    expect(pkg.files).toContain('USER_GUIDE.md')
+    const guide = readFileSync(join(pluginRoot, 'USER_GUIDE.md'), 'utf8').replace(/\r\n/g, '\n')
+    expect(guide).toMatch(/export-credentials/)
+    expect(guide).toMatch(/maxPaymentAmount/)
+    expect(guide).toMatch(/not by editing `openclaw\.json` directly/i)
+  })
+
   it('points public metadata at the GitHub mirror, never the internal host', () => {
     expect(pkg.homepage).toMatch(/^https:\/\/github\.com\//)
     expect(pkg.repository.url).toMatch(/^https:\/\/github\.com\//)

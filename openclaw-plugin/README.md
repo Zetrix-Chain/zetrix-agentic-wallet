@@ -1,5 +1,11 @@
 # Zetrix Agentic Wallet — OpenClaw plugin
 
+**Using the wallet?** See **[USER_GUIDE.md](USER_GUIDE.md)** — install, first steps, spending limits and
+backup, written for subscribers. This file is the engineering detail: why the plugin is built the way it
+is, and what to know before changing it.
+
+---
+
 Installs the Zetrix Agentic Wallet into an OpenClaw gateway, so a subscriber gets the wallet by
 installing one package instead of hand-writing an `mcp.servers` entry — which they cannot do at all on
 a hosted gateway they do not own.
@@ -30,6 +36,25 @@ Set by the subscriber, through the gateway's plugin config UI or `plugins.entrie
 | `network` | `zetrix:testnet` | Mainnet spends real funds |
 | `maxPaymentAmount` | `{"*":"0"}` | Per-asset ceiling in raw units. **Refuses every payment until set** |
 | `zetrixAddress` | *(unset)* | Pin an existing holder account instead of creating one |
+
+These defaults apply with no action from the subscriber, so a fresh install is safe but **cannot pay**
+until a cap is set. Changing config takes effect without a gateway restart:
+
+```bash
+openclaw config set plugins.entries.zetrix-agentic-wallet.config.maxPaymentAmount \
+  '{"ZTX":"1000000000","*":"0"}' --json
+openclaw mcp reload
+```
+
+⚠️ **Configure through `plugins.entries`, never by editing `mcp.servers` directly.** The plugin owns
+that entry and rewrites it from plugin config, so a hand-edit is the wrong layer in two ways. It is
+overwritten the next time the plugin registers — and if it is *not* overwritten, that is worse: the
+plugin fingerprints the entry it wrote and disowns anything that no longer matches, so a hand-edited
+entry is left permanently unmanaged and stops tracking config changes. Neither failure announces itself.
+
+Setting plugin config re-registers the entry immediately, because the CLI loads the plugin in-process
+(see [If the MCP entry goes missing](#if-the-mcp-entry-goes-missing)). Editing `openclaw.json` by hand
+does not.
 
 ## Why it works the way it does
 

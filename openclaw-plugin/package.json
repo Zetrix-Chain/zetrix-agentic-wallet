@@ -18,6 +18,7 @@
     "dist",
     "skills",
     "openclaw.plugin.json",
+    "USER_GUIDE.md",
     "README.md"
   ],
   "openclaw": {
