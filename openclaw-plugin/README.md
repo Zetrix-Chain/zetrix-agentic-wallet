@@ -5,7 +5,7 @@ installing one package instead of hand-writing an `mcp.servers` entry — which 
 a hosted gateway they do not own.
 
 ```bash
-openclaw plugins install clawhub:@zetrix/openclaw-agentic-wallet@<version>
+openclaw plugins install clawhub:zetrix-agentic-wallet@<version>
 openclaw plugins enable zetrix-agentic-wallet
 openclaw gateway restart
 ```
@@ -37,9 +37,10 @@ Three things were tested against a live gateway (OpenClaw **2026.7.1-2**) and sh
 is stated here with what was observed, because the design looks odd without it — and because if any of
 them changes upstream, the corresponding workaround should be deleted rather than carried forever.
 
-**The manifest declares no `mcpServers`, and that is deliberate.** It is the documented way for a
-plugin to contribute an MCP server, and on this version it silently contributes nothing — the server
-is never spawned and no diagnostic is emitted. Native `api.registerTool` tools do register, but never
+**The manifest declares no `mcpServers`, and that is deliberate.** It is the documented way for a plugin
+to contribute an MCP server, but **it is not a field this OpenClaw release implements** — the ClawHub
+Plugin Inspector lists every supported `PluginManifest` field for 2026.7.1-2 and `mcpServers` is not
+among them. So a declared server is silently dropped: never spawned, no diagnostic. Native `api.registerTool` tools do register, but never
 reach a `claude-cli` harness, so an agent cannot call them. Writing the entry into `mcp.servers` from
 the registration hook is the only route that works end to end. *If the manifest route is ever fixed
 upstream, `src/index.ts` is what should be deleted.*
@@ -131,3 +132,19 @@ Two things to know if `mcp unset` fails: OpenClaw rejects config writes that shr
 - **`plugins.allow` is a whitelist, not additive trust.** If you set it, enumerate every required
   plugin — setting it to a single id excluded the agent harness during testing and left the agent
   unable to run at all.
+
+## Validating before publish
+
+```bash
+npm run build                 # from the repo root
+node scripts/build.mjs        # from openclaw-plugin
+clawhub package validate . --openclaw-version <target>
+```
+
+Run this before treating any plugin change as done. It extracts the real `PluginManifest` type from the
+target OpenClaw release and checks the manifest against it, which catches a class of mistake nothing else
+does: a field that is silently ignored rather than rejected. It found two in this plugin — `uiHints`
+instead of `configUiHints`, and confirmed `mcpServers` is not implemented in 2026.7.1-2 at all.
+
+Reports land in `reports/` (gitignored). `--runtime --allow-execute` additionally imports the plugin code
+in an isolated workspace.

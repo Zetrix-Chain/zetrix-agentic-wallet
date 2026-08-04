@@ -21,6 +21,11 @@ function fakeFs(initial: Record<string, string> = {}) {
       writeFile: (p: string, c: string) => {
         files[p] = c
       },
+      renameFile: (from: string, to: string) => {
+        if (!(from in files)) throw new Error(`ENOENT: ${from}`)
+        files[to] = files[from]
+        delete files[from]
+      },
       exists: (p: string) => p in files,
       removeFile: (p: string) => {
         delete files[p]
@@ -155,5 +160,86 @@ describe('unregisterServer', () => {
     const { files, deps } = fakeFs({ '/cfg/openclaw.json': '{}' })
     expect(() => unregisterServer(deps)).not.toThrow()
     expect(files['/cfg/openclaw.json']).toBe('{}')
+  })
+})
+
+describe('security fixes', () => {
+  it('writes the config atomically — via a temp file, never in place', () => {
+    const { files, deps } = fakeFs({ '/cfg/openclaw.json': '{}' })
+    const writes: string[] = []
+    const spied = { ...deps, writeFile: (p: string, c: string) => { writes.push(p); deps.writeFile(p, c) } }
+    registerServer(spied, entry)
+    // A truncated openclaw.json stops the gateway starting at all, so the config is never the target
+    // of a direct write: a temp file is written and renamed over it.
+    expect(writes).toContain('/cfg/openclaw.json.zetrix-tmp')
+    expect(writes).not.toContain('/cfg/openclaw.json')
+    expect(files['/cfg/openclaw.json.zetrix-tmp']).toBeUndefined()
+    expect(JSON.parse(files['/cfg/openclaw.json']).mcp.servers[SERVER_NAME]).toEqual(entry)
+  })
+
+  it('does not touch the config at all when the entry is already correct', () => {
+    const { deps } = fakeFs({ '/cfg/openclaw.json': '{}' })
+    registerServer(deps, entry)
+    const writes: string[] = []
+    const spied = { ...deps, writeFile: (p: string, c: string) => { writes.push(p); deps.writeFile(p, c) } }
+    registerServer(spied, entry)
+    // The hook runs on every gateway start and every CLI plugin load. Rewriting an identical config
+    // each time is pure risk for no benefit.
+    expect(writes).not.toContain('/cfg/openclaw.json.zetrix-tmp')
+    expect(writes).toEqual(['/plugin/.mcp-registration.json'])
+  })
+
+  it('will not reclaim an entry the subscriber edited after we wrote it', () => {
+    const { files, deps, logs } = fakeFs({ '/cfg/openclaw.json': '{}' })
+    registerServer(deps, entry)
+
+    // Subscriber hand-edits the entry — e.g. repoints it at their own build.
+    const cfg = JSON.parse(files['/cfg/openclaw.json'])
+    cfg.mcp.servers[SERVER_NAME].args = ['/their/own/wallet.cjs']
+    files['/cfg/openclaw.json'] = JSON.stringify(cfg)
+
+    registerServer(deps, entry)
+    // The marker still exists, so presence alone would have let us overwrite them. The fingerprint is
+    // what stops it.
+    expect(JSON.parse(files['/cfg/openclaw.json']).mcp.servers[SERVER_NAME].args).toEqual(['/their/own/wallet.cjs'])
+    expect(logs.join(' ')).toMatch(/changed since/i)
+  })
+
+  it('still updates its own entry when the subscriber changes plugin config', () => {
+    const { files, deps } = fakeFs({ '/cfg/openclaw.json': '{}' })
+    registerServer(deps, entry)
+    const changed = buildServerEntry(BUNDLE, { network: 'zetrix:mainnet' }, STATE)
+    registerServer(deps, changed)
+    expect(JSON.parse(files['/cfg/openclaw.json']).mcp.servers[SERVER_NAME].env.ZETRIX_NETWORK).toBe('zetrix:mainnet')
+  })
+
+  it('treats a corrupt ownership marker as "not ours" rather than assuming ownership', () => {
+    const { files, deps } = fakeFs({ '/cfg/openclaw.json': '{}' })
+    registerServer(deps, entry)
+    files['/plugin/.mcp-registration.json'] = 'not json'
+    const theirs = { command: 'node', args: ['/theirs.cjs'], env: {} }
+    const cfg = JSON.parse(files['/cfg/openclaw.json'])
+    cfg.mcp.servers[SERVER_NAME] = theirs
+    files['/cfg/openclaw.json'] = JSON.stringify(cfg)
+    registerServer(deps, entry)
+    expect(JSON.parse(files['/cfg/openclaw.json']).mcp.servers[SERVER_NAME]).toEqual(theirs)
+  })
+
+  it('unregister leaves an entry the subscriber has since edited', () => {
+    const { files, deps } = fakeFs({ '/cfg/openclaw.json': '{}' })
+    registerServer(deps, entry)
+    const cfg = JSON.parse(files['/cfg/openclaw.json'])
+    cfg.mcp.servers[SERVER_NAME].args = ['/their/own/wallet.cjs']
+    files['/cfg/openclaw.json'] = JSON.stringify(cfg)
+    unregisterServer(deps)
+    expect(JSON.parse(files['/cfg/openclaw.json']).mcp.servers[SERVER_NAME]).toBeDefined()
+  })
+
+  it('records the entry as a fingerprint in the marker', () => {
+    const { files, deps } = fakeFs({ '/cfg/openclaw.json': '{}' })
+    registerServer(deps, entry)
+    const marker = JSON.parse(files['/plugin/.mcp-registration.json'])
+    expect(marker.entry).toEqual(entry)
+    expect(marker.serverName).toBe(SERVER_NAME)
   })
 })

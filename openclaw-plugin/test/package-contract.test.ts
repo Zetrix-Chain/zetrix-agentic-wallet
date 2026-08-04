@@ -72,8 +72,40 @@ describe('manifest', () => {
     expect(keys.some((k) => /password|secret|key$/i.test(k))).toBe(false)
   })
 
+  it('uses configUiHints, not uiHints', () => {
+    // `uiHints` is not a field in OpenClaw 2026.7.1-2's PluginManifest — the ClawHub Plugin Inspector
+    // flags it as an unsupported top-level field, which means it would be silently ignored and the
+    // subscriber would see no help text on the config form. The real field is `configUiHints`.
+    expect(manifest.configUiHints).toBeDefined()
+    expect(manifest.uiHints).toBeUndefined()
+  })
+
+  it('declares only fields OpenClaw 2026.7.1-2 actually supports', () => {
+    // Taken from the PluginManifest type the Plugin Inspector extracted from the target OpenClaw
+    // release. Running `clawhub package validate` is the authoritative check; this is the cheap guard
+    // that runs on every `npm test`.
+    const supported = new Set([
+      'activation',
+      'configSchema',
+      'configUiHints',
+      'contracts',
+      'description',
+      'icon',
+      'id',
+      'name',
+      'skills',
+      'toolMetadata',
+      'version',
+    ])
+    const unsupported = Object.keys(manifest).filter((k) => !supported.has(k))
+    expect(unsupported).toEqual([])
+  })
+
   it('does NOT declare mcpServers', () => {
-    // It silently contributes nothing on OpenClaw 2026.7.1-2, and declaring it
+    // `mcpServers` is not a field in OpenClaw 2026.7.1-2's PluginManifest at all — confirmed by the
+    // ClawHub Plugin Inspector, which lists every supported field and does not include it. That is why
+    // a declared server was never spawned and no diagnostic appeared: the field was simply dropped.
+    // Declaring it
     // alongside self-registration would risk a duplicate entry if it is ever fixed upstream.
     // Removing this assertion is the deliberate signal that the manifest route has been re-tested.
     expect(manifest.mcpServers).toBeUndefined()
@@ -86,6 +118,21 @@ describe('package metadata', () => {
     // loading an npm package. Shipping only `extensions` risks the wrong file being loaded.
     expect(pkg.openclaw.extensions).toEqual(['./src/index.ts'])
     expect(pkg.openclaw.runtimeExtensions).toEqual(['./dist/index.js'])
+  })
+
+  it('uses an unscoped name matching the manifest id', () => {
+    // Two reasons this is pinned rather than left to taste.
+    //
+    // Unscoped: the org publishes unscoped names (agentic-wallet-mcp, x402-zetrix-client). An earlier
+    // draft used `@zetrix/...`, a scope the org does not own, which would have failed to publish.
+    //
+    // Matching the manifest id: the installer warns when they differ and falls back to the manifest
+    // id as the config key — and that key becomes the MCP server name, which becomes the agent-visible
+    // tool prefix (`mcp__zetrix-agentic-wallet__wallet_status`). Keeping them identical means the tool
+    // contract cannot drift from the package name.
+    expect(pkg.name).toBe('zetrix-agentic-wallet')
+    expect(pkg.name).toBe(manifest.id)
+    expect(pkg.name.startsWith('@')).toBe(false)
   })
 
   it('declares OpenClaw compatibility metadata', () => {

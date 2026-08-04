@@ -35,13 +35,28 @@ export interface McpServerEntry {
 export interface RegistrationDeps {
   /** Path to the gateway's openclaw.json. */
   configPath: string
-  /** Sidecar recording that we created the entry. */
+  /** Sidecar recording the entry we created, so we can tell ours from the subscriber's. */
   ownershipPath: string
   readFile: (path: string) => string
   writeFile: (path: string, contents: string) => void
+  /**
+   * Atomic move. Config is written to a temp file and renamed over the original, so a crash, a full
+   * disk, or two plugin loads racing each other cannot leave a truncated `openclaw.json` behind — that
+   * would stop the gateway starting at all, which is a far worse outcome than the wallet not working.
+   * OpenClaw's own config writer guards against truncation with a size-drop check; writing the file
+   * directly bypasses that guard, so we have to supply the equivalent ourselves.
+   */
+  renameFile: (from: string, to: string) => void
   exists: (path: string) => boolean
   removeFile: (path: string) => void
   log: (message: string) => void
+}
+
+/** What the ownership sidecar stores. `entry` is the fingerprint — see `weOwnIt`. */
+interface OwnershipRecord {
+  serverName: string
+  entry?: McpServerEntry
+  note: string
 }
 
 /**
@@ -96,21 +111,76 @@ function readConfig(deps: RegistrationDeps): OpenclawConfig | null {
   }
 }
 
-/** True when the sidecar says this plugin created the entry. */
-function weOwnIt(deps: RegistrationDeps): boolean {
-  return deps.exists(deps.ownershipPath)
+function readOwnership(deps: RegistrationDeps): OwnershipRecord | null {
+  if (!deps.exists(deps.ownershipPath)) return null
+  try {
+    return JSON.parse(deps.readFile(deps.ownershipPath)) as OwnershipRecord
+  } catch {
+    // A corrupt marker must not be read as "we own this". Treat it as absent, which is the safe
+    // direction: we leave the subscriber's entry alone rather than overwriting it.
+    return null
+  }
+}
+
+/**
+ * Do we own the entry currently in the config?
+ *
+ * Presence of the marker is not enough. The marker lives outside the plugin so it survives updates
+ * (inside, `install --force` wiped it and the plugin then disowned its own entry) — but surviving means
+ * it also outlives an uninstall. Without a fingerprint the sequence
+ *
+ *   uninstall -> subscriber edits mcp.servers by hand -> reinstall
+ *
+ * would see the stale marker, assume ownership, and silently overwrite their edit. So the marker
+ * records the entry we wrote, and we only claim ownership while the config still matches it. Any
+ * divergence means someone changed it after us, and their version wins.
+ */
+function weOwnIt(deps: RegistrationDeps, existing: McpServerEntry | undefined): boolean {
+  const record = readOwnership(deps)
+  if (!record) return false
+  if (!existing) return true
+  // Older markers carry no fingerprint; fall back to presence so an upgrade does not disown itself.
+  if (!record.entry) return true
+  return JSON.stringify(record.entry) === JSON.stringify(existing)
+}
+
+function writeOwnership(deps: RegistrationDeps, entry: McpServerEntry): void {
+  const record: OwnershipRecord = {
+    serverName: SERVER_NAME,
+    entry,
+    note:
+      'Created by the Zetrix Agentic Wallet plugin. The entry above is a fingerprint: the plugin only ' +
+      'manages mcp.servers while the live entry still matches it, so a hand-edited entry is never ' +
+      'overwritten. Deleting this file makes the plugin treat the entry as subscriber-owned.',
+  }
+  deps.writeFile(deps.ownershipPath, `${JSON.stringify(record, null, 2)}\n`)
+}
+
+/** Write the config atomically: temp file, then rename over the original. */
+function writeConfigAtomically(deps: RegistrationDeps, config: OpenclawConfig): void {
+  const tmp = `${deps.configPath}.zetrix-tmp`
+  deps.writeFile(tmp, `${JSON.stringify(config, null, 2)}\n`)
+  deps.renameFile(tmp, deps.configPath)
 }
 
 export function registerServer(deps: RegistrationDeps, entry: McpServerEntry): void {
   const config = readConfig(deps)
   if (!config) return
 
-  const existing = config.mcp?.servers?.[SERVER_NAME]
-  if (existing && !weOwnIt(deps)) {
+  const existing = config.mcp?.servers?.[SERVER_NAME] as McpServerEntry | undefined
+  if (existing && !weOwnIt(deps, existing)) {
     deps.log(
-      `mcp.servers["${SERVER_NAME}"] is already present and was not created by this plugin — ` +
-        `leaving it untouched. Remove it if you want the plugin to manage the server instead.`,
+      `mcp.servers["${SERVER_NAME}"] is already present and was not created by this plugin (or was ` +
+        `changed since) — leaving it untouched. Remove it if you want the plugin to manage the server.`,
     )
+    return
+  }
+
+  // Nothing to do when the live entry is already exactly what we would write. This is the common case
+  // on every gateway start and every CLI plugin load, so skipping it removes almost all writes to the
+  // subscriber's config — the less this plugin touches that file, the less it can break.
+  if (existing && JSON.stringify(existing) === JSON.stringify(entry)) {
+    writeOwnership(deps, entry)
     return
   }
 
@@ -118,11 +188,8 @@ export function registerServer(deps: RegistrationDeps, entry: McpServerEntry): v
   config.mcp.servers = config.mcp.servers ?? {}
   config.mcp.servers[SERVER_NAME] = entry
 
-  deps.writeFile(deps.configPath, `${JSON.stringify(config, null, 2)}\n`)
-  deps.writeFile(
-    deps.ownershipPath,
-    `${JSON.stringify({ serverName: SERVER_NAME, note: 'Created by the Zetrix Agentic Wallet plugin. Deleting this file makes the plugin treat the mcp.servers entry as subscriber-owned.' }, null, 2)}\n`,
-  )
+  writeConfigAtomically(deps, config)
+  writeOwnership(deps, entry)
   deps.log(existing ? `refreshed mcp.servers["${SERVER_NAME}"]` : `registered mcp.servers["${SERVER_NAME}"]`)
 }
 
@@ -132,14 +199,15 @@ export function registerServer(deps: RegistrationDeps, entry: McpServerEntry): v
  * subscriber's config with no plugin left to blame for it.
  */
 export function unregisterServer(deps: RegistrationDeps): void {
-  if (!weOwnIt(deps)) return
-
   const config = readConfig(deps)
   if (!config) return
 
+  const existing = config.mcp?.servers?.[SERVER_NAME] as McpServerEntry | undefined
+  if (!weOwnIt(deps, existing)) return
+
   if (config.mcp?.servers && SERVER_NAME in config.mcp.servers) {
     delete config.mcp.servers[SERVER_NAME]
-    deps.writeFile(deps.configPath, `${JSON.stringify(config, null, 2)}\n`)
+    writeConfigAtomically(deps, config)
     deps.log(`removed mcp.servers["${SERVER_NAME}"]`)
   }
   deps.removeFile(deps.ownershipPath)

@@ -12,3 +12,6 @@ mcp.*.local.json
 
 # local git worktrees
 .worktrees/
+
+# ClawHub Plugin Inspector reports — regenerate with: clawhub package validate .
+openclaw-plugin/reports/

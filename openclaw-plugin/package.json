@@ -1,5 +1,5 @@
 {
-  "name": "@zetrix/openclaw-agentic-wallet",
+  "name": "zetrix-agentic-wallet",
   "version": "0.1.0",
   "description": "OpenClaw plugin: Zetrix identity, verifiable-credential and pay-per-use wallet tools for agents",
   "license": "MIT",

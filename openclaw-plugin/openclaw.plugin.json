@@ -26,7 +26,7 @@
       }
     }
   },
-  "uiHints": {
+  "configUiHints": {
     "network": {
       "label": "Zetrix network",
       "help": "Testnet by default. Mainnet spends real funds."

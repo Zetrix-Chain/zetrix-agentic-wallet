@@ -21,7 +21,8 @@
  * credential to place in config, in the manifest, or in this code.
  */
 
-import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { resolvePluginPaths, type PluginPaths } from './paths.js'
 import { buildServerEntry, registerServer, type PluginConfig, type RegistrationDeps } from './mcp-registration.js'
@@ -39,10 +40,52 @@ function makeDeps(paths: PluginPaths, log: (m: string) => void): RegistrationDep
     ownershipPath: paths.ownershipPath,
     readFile: (p) => readFileSync(p, 'utf8'),
     writeFile: (p, c) => writeFileSync(p, c, { encoding: 'utf8', mode: 0o600 }),
+    renameFile: (from, to) => renameSync(from, to),
     exists: (p) => existsSync(p),
     removeFile: (p) => rmSync(p, { force: true }),
     log,
   }
+}
+
+/**
+ * Refuse to touch a path that is not where we expect.
+ *
+ * `runtimeDir` is derived from `api.rootDir` by walking up two levels, and it is the target of a
+ * recursive delete. `rootDir` comes from OpenClaw so it should always be sane — but "should" is not a
+ * guard, and the blast radius of being wrong is `rm -rf` on somewhere unintended. Cheap to verify, so
+ * verify.
+ */
+function pathIsExpected(paths: PluginPaths): boolean {
+  const expectedSuffix = join('zetrix-agentic-wallet', 'runtime')
+  return (
+    paths.runtimeDir.endsWith(expectedSuffix) &&
+    paths.runtimeDir.startsWith(paths.homeDir) &&
+    paths.homeDir.length > expectedSuffix.length
+  )
+}
+
+/**
+ * Verify the shipped bundle matches the digest recorded beside it at build time.
+ *
+ * This is not signing and does not defend against a compromised build machine — the digest is
+ * self-attested, written by the same build that produced the bundle. What it does catch is the bundle
+ * and its VERSION file disagreeing: a corrupted download, a partial extract, or a hand-edited runtime
+ * inside an otherwise-valid package. Cheap, and it fails closed.
+ */
+function shippedBundleMatchesDigest(paths: PluginPaths, shippedVersion: string, log: (m: string) => void): boolean {
+  const recorded = /sha256:([0-9a-f]{64})/.exec(shippedVersion)?.[1]
+  if (!recorded) return true // Pre-digest build; nothing to check against.
+
+  const shippedBundle = join(paths.shippedRuntimeDir, 'server-bundle.cjs')
+  const actual = createHash('sha256').update(readFileSync(shippedBundle)).digest('hex')
+  if (actual === recorded) return true
+
+  log(
+    `refusing to install the wallet runtime: the shipped bundle does not match the digest recorded in ` +
+      `VERSION (expected ${recorded.slice(0, 12)}, got ${actual.slice(0, 12)}). The package may be ` +
+      `corrupt or modified — reinstall it from a trusted source.`,
+  )
+  return false
 }
 
 /**
@@ -61,6 +104,12 @@ function syncRuntime(paths: PluginPaths, log: (m: string) => void): boolean {
   const installed = existsSync(installedVersionFile) ? readFileSync(installedVersionFile, 'utf8').trim() : null
 
   if (installed === shipped && existsSync(paths.walletBundlePath)) return true
+
+  if (!pathIsExpected(paths)) {
+    log(`refusing to install the wallet runtime: unexpected target path ${paths.runtimeDir}`)
+    return false
+  }
+  if (!shippedBundleMatchesDigest(paths, shipped, log)) return false
 
   // VERSION is `name@version` plus a `sha256:` line. The hash is what makes two builds of the same
   // wallet version distinguishable — without it a rebuilt wallet was silently never installed.
