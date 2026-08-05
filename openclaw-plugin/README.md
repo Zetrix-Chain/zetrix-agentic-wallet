@@ -1,8 +1,10 @@
 # Zetrix Agentic Wallet — OpenClaw plugin
 
-**Using the wallet?** See **[USER_GUIDE.md](USER_GUIDE.md)** — install, first steps, spending limits and
-backup, written for subscribers. This file is the engineering detail: why the plugin is built the way it
-is, and what to know before changing it.
+**Using the wallet?** See the
+**[user guide](https://github.com/Zetrix-Chain/zetrix-agentic-wallet/blob/main/openclaw-plugin/USER_GUIDE.md)**
+— install, first steps, spending limits and backup, written for subscribers. It also ships inside this
+package as `USER_GUIDE.md`. This file is the engineering detail: why the plugin is built the way it is,
+and what to know before changing it.
 
 ---
 

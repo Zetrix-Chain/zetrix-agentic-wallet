@@ -144,6 +144,17 @@ describe('package metadata', () => {
     for (const f of ['dist', 'skills', 'openclaw.plugin.json']) expect(pkg.files).toContain(f)
   })
 
+  it('README links are absolute, because it is rendered outside the repo', () => {
+    // ClawHub renders this README on the package page, where a relative link like `](USER_GUIDE.md)`
+    // resolves to nothing — the reader gets a dead link to the one document that explains the spending
+    // limit and the backup step. Anchors are fine (same rendered page); anything else must be a URL.
+    const readme = readFileSync(join(pluginRoot, 'README.md'), 'utf8').replace(/\r\n/g, '\n')
+    const relative = [...readme.matchAll(/\]\(([^)]+)\)/g)]
+      .map((m) => m[1])
+      .filter((href) => !href.startsWith('http') && !href.startsWith('#'))
+    expect(relative).toEqual([])
+  })
+
   it('ships the user guide, and it covers the things a subscriber cannot discover alone', () => {
     // The guide is the only place a subscriber learns three non-obvious facts: payments are refused
     // until they set a limit, the wallet generated a password only they can back up, and the limit must
