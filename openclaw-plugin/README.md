@@ -26,7 +26,7 @@ password**: the wallet generates and stores its own credentials.
 ```bash
 npm run build          # in the repo root — produces the wallet bundle
 npm run build          # in openclaw-plugin — bundles the plugin and vendors the wallet
-npm test               # 40 tests: registration logic, paths, and the package contract
+npm test               # 56 tests: registration logic, paths, and the package contract
 ```
 
 ## Configuration

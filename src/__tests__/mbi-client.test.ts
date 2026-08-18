@@ -165,6 +165,63 @@ describe('MbiClient', () => {
       mbi.submitVp({ blobId: 'b1', signedBlob: 's', publicKey: 'pk' }, { signedData: 's', publicKey: 'pk' }),
     ).rejects.toMatchObject({ name: 'MbiError', httpStatus: 403 })
   })
+
+  it('downloadVcs POSTs /v1/vc/ext/download with the signedData/publicKey auth headers and unwraps the list', async () => {
+    const ok = { status: 200, data: [{ vc: { id: 'did:zid:vc-1' }, extraData: { foo: 'bar' } }] }
+    const fetchMock = vi.fn().mockResolvedValue(resp(200, ok))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const out = await mbi.downloadVcs({ address: 'ZTX3Holder' }, { signedData: 'sig-over-address', publicKey: 'b001pk' })
+
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe('https://mbi.test/v1/vc/ext/download')
+    expect(init.headers.signedData).toBe('sig-over-address')
+    expect(init.headers.publicKey).toBe('b001pk')
+    expect(JSON.parse(init.body)).toEqual({ address: 'ZTX3Holder' })
+    expect(out).toEqual([{ vc: { id: 'did:zid:vc-1' }, extraData: { foo: 'bar' } }])
+  })
+
+  it('downloadVcs throws MbiError on a non-2xx response (e.g. address mismatch)', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(resp(403, { status: 403, message: 'address mismatch' })))
+    await expect(
+      mbi.downloadVcs({ address: 'ZTX3Other' }, { signedData: 's', publicKey: 'pk' }),
+    ).rejects.toMatchObject({ name: 'MbiError', httpStatus: 403 })
+  })
+
+  // Confirmed live against MBI (2026-08-17): a 2xx response whose `data` field is not an array
+  // (observed transiently right as an async issuance was still landing) must not be handed to a
+  // caller expecting MbiVcEntry[] — that produced a raw, undiagnosable
+  // "entries.find is not a function" crash in checkAiBirthcertVerification instead of a clean error.
+  it('downloadVcs throws MbiError (not a raw TypeError downstream) when a 2xx response has a non-array data field', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(resp(200, { status: 200, data: {} })))
+    await expect(
+      mbi.downloadVcs({ address: 'ZTX3Holder' }, { signedData: 's', publicKey: 'pk' }),
+    ).rejects.toMatchObject({ name: 'MbiError', httpStatus: 200, message: expect.stringContaining('non-array') })
+  })
+
+  it('downloadVcs throws MbiError when a 2xx response has no data field at all', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(resp(200, { status: 200 })))
+    await expect(
+      mbi.downloadVcs({ address: 'ZTX3Holder' }, { signedData: 's', publicKey: 'pk' }),
+    ).rejects.toMatchObject({ name: 'MbiError', httpStatus: 200 })
+  })
+
+  // Confirmed live against MBI (2026-08-17, real successful download captured after fixing the
+  // crash above): MBI's actual response for this endpoint double-wraps the list —
+  // `body.data.data` is the array, NOT `body.data` directly, contradicting SPEC.md's documented
+  // (never-live-verified-until-now) single-level `{ data: [...] }` example.
+  it('downloadVcs unwraps a double-nested { data: { data: [...] } } envelope (the real MBI shape)', async () => {
+    const ok = {
+      status: 200,
+      message: 'OK',
+      data: { data: [{ vc: { id: 'did:zid:vc-1' }, extraData: { vcPassBase64: null }, status: 'ISSUED' }] },
+    }
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(resp(200, ok)))
+
+    const out = await mbi.downloadVcs({ address: 'ZTX3Holder' }, { signedData: 's', publicKey: 'pk' })
+
+    expect(out).toEqual([{ vc: { id: 'did:zid:vc-1' }, extraData: { vcPassBase64: null }, status: 'ISSUED' }])
+  })
 })
 
 // MBI's ResponseWrapper carries a numeric `status` code that is finer-grained than the HTTP

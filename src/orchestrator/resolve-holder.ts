@@ -44,6 +44,8 @@ export interface ResolveHolderInput {
 export interface ResolveHolderResult {
   zetrixAddress: string
   holderDid: string
+  /** The holder's own hex-encoded Zetrix public key (raw or Zetrix's b001-prefixed encoded form, whatever Wallet BE returned) — needed by callers that must present the raw key, e.g. myid's SSIVC session API. */
+  publicKeyHex: string
   /** True when a new HSM account was just created (scenario 1) — the caller should tell the user to save it. */
   created: boolean
   /** True when a supplied `holderDid` didn't match the account's derived DID — `holderDid` above is the corrected value. */
@@ -66,12 +68,12 @@ export async function resolveHolder(deps: ResolveHolderDeps, input: ResolveHolde
         finalActivated = false
       }
     }
-    return { zetrixAddress, holderDid: deriveHolderDid(publicKeyHex), created: true, didMismatch: false, activated: finalActivated }
+    return { zetrixAddress, holderDid: deriveHolderDid(publicKeyHex), publicKeyHex, created: true, didMismatch: false, activated: finalActivated }
   }
 
   const { publicKey } = await deps.signMessage(input.zetrixAddress, input.zetrixAddress, input.hsmPassword)
   const derivedDid = deriveHolderDid(publicKey)
   const didMismatch = input.holderDid !== undefined && input.holderDid !== derivedDid
 
-  return { zetrixAddress: input.zetrixAddress, holderDid: derivedDid, created: false, didMismatch }
+  return { zetrixAddress: input.zetrixAddress, holderDid: derivedDid, publicKeyHex: publicKey, created: false, didMismatch }
 }

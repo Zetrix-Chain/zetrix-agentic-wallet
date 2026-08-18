@@ -26,7 +26,7 @@ Check it worked:
 ```bash
 openclaw plugins list          # zetrix-agentic-wallet, enabled
 openclaw mcp doctor            # zetrix-agentic-wallet: ok
-openclaw mcp probe zetrix-agentic-wallet   # 7 tools
+openclaw mcp probe zetrix-agentic-wallet   # 9 tools
 ```
 
 Nothing else is needed. No `npx`, no account signup, no password, no MCP configuration.
@@ -63,8 +63,9 @@ Other things that work straight away, all free:
 | Proving your identity to a service | no |
 | **Fetching a resource that charges per use** | **yes** |
 | **Obtaining a verifiable credential** | **yes** |
+| **Starting a Verified AI Birthcert check (owner identity verification via MyDigital ID)** | **yes** |
 
-The two paid actions are refused until you set a limit.
+The three paid actions are refused until you set a limit.
 
 ---
 
@@ -193,6 +194,10 @@ Before you do:
 
 - **Back up your wallet** (above) if you have not already
 - **Review your spending limit** — the same number now means real money
+- **The Verified AI Birthcert check is unavailable on mainnet through this plugin.** Its endpoint
+  was never confirmed reachable on mainnet, so the wallet refuses to use it there unless an
+  operator sets it explicitly — something this plugin does not currently expose a setting for.
+  Every other tool works normally.
 - Note that mainnet uses a **different account** from your testnet one
 
 ## If something is wrong

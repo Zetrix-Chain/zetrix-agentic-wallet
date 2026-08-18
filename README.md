@@ -27,6 +27,8 @@ VC issuance → identity proof → pay-per-use).
 | `create_holder_account` | Onboarding: mint an HSM account (the MCP already auto-creates one at startup if `ZETRIX_ADDRESS` is omitted — see Environment below). Always checks for an existing account first — if one is active for this session, returns `{ alreadyExists: true, existing }` without creating anything; pass `confirmNew: true` (after asking the user) to mint a new one anyway | `{ password, label?, purpose?, confirmNew? }` | `{ created, alreadyExists, existing?, zetrixAddress?, holderDid?, publicKeyHex?, message }` |
 | `get_template_schema` | **Free** read of a VC template's declared attribute schema. Call before `subscribe_and_issue` to learn which attributes it requires | `{ templateId }` | `{ templateId, schema: { required, optional } }` or `{ templateId, error }` |
 | `query_contract` | Read-only query against any Zetrix contract — call an arbitrary method and return its raw result. No signing, no state change | `{ contractAddress, method, params? }` | `{ ok: true, result }` or `{ ok: false, error }` |
+| `request_ai_birthcert_verification` | Start a **Verified** AI Birthcert issuance session with myid (MyDigital ID owner verification) — distinct from `subscribe_and_issue`'s self-declared Basic AI Birthcert | `{ agentName, agentPurpose?, evidenceAssuranceLevel?, ownerType?, ownerVerified? }` | `{ sessionId, verificationUrl, expiresAt }` |
+| `check_ai_birthcert_verification` | Poll the most recently requested Verified AI Birthcert session; on `status: "issued"`, also fetches, verifies, and caches the credential | (none) | `{ status: "pending" \| "issued" \| "no_session", vcId?, vc?, cacheError? }` |
 
 > **VCs are cached locally**, keyed by `templateId`, under `~/.agentic-wallet-mcp/vc-cache/`
 > (scoped per network + holder — different identities or networks never share a cache).
@@ -176,6 +178,8 @@ Node ≥ 18 required (built-in `fetch`).
 | `ZID_RESOLVER_BASE_URL` | no | ZID resolver override (auto-derived from network: sandbox for testnet, prod for mainnet) |
 | `MAX_PAYMENT_AMOUNT` | no** | Per-asset x402 auto-pay cap — JSON `{ "<asset>": "<maxRawUnits>", "*": "<fallback>" }`. `pay_and_fetch`/`subscribe_and_issue` are asset-agnostic: the resource server's 402 challenge may quote the native ZETRIX token (asset code `ZTX`) **or** a ZTP20 token (e.g. `JMYR`) — cap whichever assets you expect. **Key by contract address, not symbol** — the challenge identifies a ZTP20 token by its contract address, so `{"JMYR":...}` never matches and falls through to `"*"`. e.g. `{"ZTX":"1000000000","ZTX3WeinXtt28YMyr4vUZ14ddTgEMGeuc1e6b":"5000000","*":"0"}`. **Defaults to `{"*":"0"}` — every payment is refused until you set this.** |
 | `ZETRIX_WALLET_STATE_DIR` | no | Where the wallet keeps `account.json` and its VC cache. Defaults to `~/.agentic-wallet-mcp` |
+| `SSIVC_BASE_URL` | no | myid's SSIVC API base URL, for the Verified AI Birthcert flow (`request_ai_birthcert_verification`/`check_ai_birthcert_verification`). **Auto-derived per network** — testnet `https://ssivc-api-uat.myegdev.com/api`, mainnet `https://verifyid-api.zetrix.com/api`. Override only if either changes |
+| `AI_BIRTHCERT_VERIFIED_TEMPLATE_ID` | no | The Verified AI Birthcert's on-chain `did:zid:...` template id. Auto-derived per network by default — **the mainnet default is unverified**, so override this explicitly once the mainnet template id is confirmed |
 
 \* sensitive — never logged, never returned in a tool result, and never a tool parameter.
 

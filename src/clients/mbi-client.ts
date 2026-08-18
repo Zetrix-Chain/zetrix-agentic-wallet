@@ -109,6 +109,12 @@ export interface MbiVpSubmitResult {
   vp?: unknown
 }
 
+/** One entry from `POST /v1/vc/ext/download` — every VC the holder has, not just one. */
+export interface MbiVcEntry {
+  vc: unknown
+  extraData?: unknown
+}
+
 export class MbiClient {
   private readonly baseUrl: string
   /** Per-request deadline in ms. See {@link MbiClient.DEFAULT_TIMEOUT_MS}. */
@@ -173,6 +179,26 @@ export class MbiClient {
     const res = await this.fetch('POST', '/v1/vp/ext/submit', body, { signedData: auth.signedData, publicKey: auth.publicKey })
     if (!res.ok) throw await this.error(res, 'vp/ext/submit failed')
     return this.unwrap<MbiVpSubmitResult>(res)
+  }
+
+  /** POST /v1/vc/ext/download — holder-authenticated; returns EVERY VC for the address, not one. */
+  async downloadVcs(body: { address: string }, auth: MbiVpAuth): Promise<MbiVcEntry[]> {
+    const res = await this.fetch('POST', '/v1/vc/ext/download', body, { signedData: auth.signedData, publicKey: auth.publicKey })
+    if (!res.ok) throw await this.error(res, 'vc/ext/download failed')
+    const raw = await this.unwrap<unknown>(res)
+    // Confirmed live (2026-08-17): MBI's real response double-wraps the list —
+    // `{ data: { data: [...] } }` — NOT `{ data: [...] }` as SPEC.md's documented example assumed
+    // (that example was never verified live until now). Accept either shape: the confirmed live
+    // one (`raw.data` is the array) and the originally-documented one (`raw` itself is the array),
+    // rather than trusting unwrap's bare type cast — so a genuinely malformed envelope still fails
+    // cleanly instead of crashing the caller with a raw TypeError (e.g.
+    // checkAiBirthcertVerification's entries.find).
+    const nested = raw !== null && typeof raw === 'object' ? (raw as Record<string, unknown>).data : undefined
+    const data = Array.isArray(raw) ? raw : Array.isArray(nested) ? nested : undefined
+    if (!data) {
+      throw new MbiError(`MBI vc/ext/download succeeded (2xx) but returned a non-array data envelope: ${JSON.stringify(raw)}`, res.status)
+    }
+    return data as MbiVcEntry[]
   }
 
   private fetch(method: string, path: string, body?: unknown, extraHeaders?: Record<string, string>): Promise<Response> {

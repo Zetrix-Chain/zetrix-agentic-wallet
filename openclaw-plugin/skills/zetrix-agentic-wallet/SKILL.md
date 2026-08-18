@@ -41,6 +41,8 @@ Your host may present them slightly differently — match on the part after the 
 | `pay_and_fetch` | **yes** | Fetching a resource that returned HTTP 402 |
 | `subscribe_and_issue` | **yes** | Buying and receiving a verifiable credential |
 | `create_holder_account` | no | Creating an additional holder account (rarely needed) |
+| `request_ai_birthcert_verification` | **yes** | Starting a Verified AI Birthcert session (MyDigitalID owner verification) |
+| `check_ai_birthcert_verification` | no | Checking the status of the most recent Verified AI Birthcert session |
 
 ## Safe first action
 
@@ -50,13 +52,20 @@ plainly — mainnet spends real funds, testnet does not.
 
 ## Before spending
 
-Both paid tools spend from the user's wallet. Every time:
+All three paid tools (`pay_and_fetch`, `subscribe_and_issue`, `request_ai_birthcert_verification`)
+spend from the user's wallet. Every time:
 
 1. Say what is being bought and the amount, in the asset the challenge quotes.
 2. Say whether the wallet is on testnet or mainnet.
 3. Get the user's agreement.
-4. For a credential, call `get_template_schema` **first** — it is free, and it tells you which
-   attributes are required. Paying before checking risks paying for an issuance that then fails.
+4. For a credential via `subscribe_and_issue`, call `get_template_schema` **first** — it is free, and
+   it tells you which attributes are required. Paying before checking risks paying for an issuance
+   that then fails.
+5. For `request_ai_birthcert_verification`, get `agentName` from the user directly — never invent it
+   — and tell them it must be unique. Payment happens at session creation, before myid checks the
+   name; a duplicate name still gets charged and only fails afterwards, at issuance. Calling this
+   tool again with the SAME name while a session is still pending does not pay again — it returns
+   that same session.
 
 **Treat the wallet's payment cap as the boundary, not your own judgement.** If a payment is refused
 for exceeding the cap, relay that and stop. Do not retry, do not try a smaller amount to discover the

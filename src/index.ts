@@ -4,7 +4,7 @@
  *
  * `buildToolList()` is unit-tested; `main()` is the live wiring (the integration seam).
  * It constructs Wallet BE + signer, the x402 self-pay payer, and the MBI client (used both for
- * x402 VC issuance and VP creation/submission), then registers the 5 tools. Run the
+ * x402 VC issuance and VP creation/submission), then registers the 9 tools. Run the
  * esbuild bundle for the bin (x401-zetrix-client's ESM uses extensionless imports).
  */
 
@@ -48,6 +48,10 @@ import { generateHsmPassword } from './hsm-password.js'
 import { exportCredentials } from './export-credentials.js'
 import { createFsVcCache } from './clients/vc-cache.js'
 import { createFsAccountStore } from './clients/account-store.js'
+import { SsivcClient } from './clients/ssivc-client.js'
+import { createFsSsivcSessionStore } from './clients/ssivc-session-store.js'
+import { createFsDownloadQuarantineStore } from './clients/ssivc-download-quarantine-store.js'
+import { requestAiBirthcertVerification, checkAiBirthcertVerification } from './orchestrator/verify-ai-birthcert.js'
 
 // esbuild resolves this JSON import at build time and inlines it into the bundle, so the
 // reported version always matches whatever package.json said when this bundle was built.
@@ -162,7 +166,11 @@ export function buildToolList() {
         'look the paymentId up instead. ' +
         'Every response except a cache hit also includes { schema: { required, optional } } — the ' +
         "template's full declared attribute schema read from chain — so you see the complete field list, " +
-        'not just what went wrong; a cache hit skips the chain lookup and omits it.',
+        'not just what went wrong; a cache hit skips the chain lookup and omits it. ' +
+        'For the AI Birthcert specifically: this issues the BASIC one — self-declared by the agent, ' +
+        'agent-paid via x402, owner identity NOT identity-verified. If the user asked for a "verified" AI ' +
+        'birthcert (owner identity confirmed via MyDigital ID), use request_ai_birthcert_verification ' +
+        'instead — this tool cannot produce that credential.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -173,7 +181,9 @@ export function buildToolList() {
               "challenge's credential_requirements.query.credentials[].id — NOT from requirementsId " +
               '(that\'s just a label for the requirement set, e.g. "agent-identity"). A known template\'s ' +
               'natural-language name (e.g. "AI Birthcert") is also accepted and resolved to the right ' +
-              'did:zid:... for the configured network.',
+              'did:zid:... for the configured network. ' +
+              'This resolves to the BASIC (self-declared, non-verified) template — for the Verified ' +
+              'AI Birthcert, use request_ai_birthcert_verification, not this tool.',
           },
           attributes: {
             type: 'object',
@@ -198,6 +208,57 @@ export function buildToolList() {
         },
         required: ['templateId', 'attributes'],
       },
+    },
+    {
+      name: 'request_ai_birthcert_verification',
+      description:
+        'Start a Verified AI Birthcert issuance session with myid (MyDigital ID owner verification). ' +
+        'Returns { sessionId, verificationUrl, expiresAt } — show verificationUrl to the human owner ' +
+        'and ask them to open it and complete MyDigital ID verification (typically finishes in ' +
+        'seconds). Once they confirm they are done, call check_ai_birthcert_verification to see ' +
+        'whether the credential was issued. IMPORTANT: agentName must be unique — if this exact name ' +
+        'has already been used to request a Verified AI Birthcert, issuance will fail. Before calling, ' +
+        'ask the human owner whether they want to supply any of the optional fields — agentPurpose, ' +
+        'evidenceAssuranceLevel, ownerType, ownerVerified — do not silently omit them; they only need ' +
+        'to say no. Calling this ' +
+        'again with the SAME agentName while a prior session is still pending returns that same ' +
+        'session unchanged — no new session is started and nothing is paid again. This tool spends ' +
+        'real funds: it self-pays an x402 challenge, subject to the wallet\'s configured ' +
+        'MAX_PAYMENT_AMOUNT cap, the same as pay_and_fetch/subscribe_and_issue. It can return ' +
+        '{ error: "..." } instead of a session if that payment fails (insufficient funds, or the ' +
+        'payment cap blocked it) — nothing is created in that case. ' +
+        'If the user did NOT ask for a "verified" credential specifically, they most likely want the ' +
+        'self-declared, non-verified Basic AI Birthcert instead — use subscribe_and_issue for that.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          agentName: {
+            type: 'string',
+            description: 'A unique, human-readable name for this agent. Must not already be in use for a Verified AI Birthcert, or issuance will fail.',
+          },
+          agentPurpose: { type: 'string', description: 'Optional — what this agent does, e.g. "Negotiate and settle supplier invoices".' },
+          evidenceAssuranceLevel: { type: 'string', description: 'Optional — assurance level of the identity evidence, e.g. "high".' },
+          ownerType: { type: 'string', description: 'Optional — the owner\'s type, e.g. "Individual".' },
+          ownerVerified: { type: 'string', description: 'Optional — whether the owner is already verified, as the string "true" or "false".' },
+        },
+        required: ['agentName'],
+      },
+    },
+    {
+      name: 'check_ai_birthcert_verification',
+      description:
+        'Check the status of the most recently requested Verified AI Birthcert session (see ' +
+        'request_ai_birthcert_verification). Returns { status: "pending" } while the owner has not ' +
+        'yet completed MyDigital ID verification, or { status: "issued", vcId } once myid has minted ' +
+        'the credential — myid returns vcId ONLY when status is "issued", never otherwise. On ' +
+        '{ status: "issued" }, the wallet also fetches the credential from MBI, verifies it, and caches ' +
+        'it locally, returning it as `vc` — it is then also visible via wallet_status and usable by ' +
+        'prove_identity without any further call. If `cacheError` is present instead of `vc`, the ' +
+        'credential WAS issued successfully but could not be fetched/verified/cached yet (e.g. a ' +
+        'transient MBI error) — this is NOT the same as issuance failing, so do not retry ' +
+        'request_ai_birthcert_verification; call check_ai_birthcert_verification again instead. Returns ' +
+        '{ status: "no_session" } if request_ai_birthcert_verification has never been called.',
+      inputSchema: { type: 'object', properties: {} },
     },
     {
       name: 'create_holder_account',
@@ -281,7 +342,7 @@ async function main(): Promise<void> {
   // Scenario 2 (ZETRIX_ADDRESS resolved from env or the local store): always derive + verify
   // the DID from the account's actual public key — a supplied HOLDER_DID is never trusted
   // blindly. See resolve-holder.ts.
-  const { zetrixAddress, holderDid, created, didMismatch, activated } = await resolveHolder(
+  const { zetrixAddress, holderDid, publicKeyHex, created, didMismatch, activated } = await resolveHolder(
     {
       createAccount: (password) => be.createAccount(password),
       signMessage: (message, address, password) => be.signMessage(message, address, password),
@@ -365,6 +426,10 @@ async function main(): Promise<void> {
   const cacheScope = createHash('sha256').update(`${config.network}:${zetrixAddress}`).digest('hex')
   const vcCache = createFsVcCache(join(config.stateDir, 'vc-cache', cacheScope))
 
+  const mbi = new MbiClient(config.mbiBaseUrl)
+  // MBI's /vp/ext/* message-signing auth: sign the holder's own address (UTF-8), not a hex blob.
+  const messageSigner = (message: string) => be.signMessage(message, zetrixAddress, hsmPassword)
+
   // x402 self-pay: build the X-PAYMENT header for a given accept. Shared by pay_and_fetch
   // (below) and subscribe_and_issue (subscribeDeps.pay), so the cap covers both
   // auto-pay tools from this one call site — a hard ceiling on maxAmountRequired, enforced
@@ -377,6 +442,42 @@ async function main(): Promise<void> {
       activated,
     )
   }
+
+  // AI Birthcert verification session (myid SSIVC) — persisted so check_ai_birthcert_verification
+  // survives a restart. As of 2026-08-17 the session-create call needs no bearer token — it's
+  // gated by x402 instead (see docs/verified-birthcert-vc/SPEC.md §5.0), so payment readiness/cap
+  // checks (this same `pay` closure) are what gate spending. Wiring itself is gated on
+  // `config.ssivcBaseUrl` being set: it's undefined on mainnet unless explicitly overridden
+  // (APP-M04 — the mainnet host was never actually confirmed reachable), so the feature reports
+  // itself as not configured there rather than being wired against an unverified endpoint.
+  const verifyAiBirthcert = config.ssivcBaseUrl
+    ? (() => {
+        const ssivcSessionStore = createFsSsivcSessionStore(join(config.stateDir, 'ssivc-session.json'))
+        // R2-M01: a DIRECTORY, not a single file — one quarantine file per vcId, so a later
+        // download can never overwrite an earlier, still-needed preserved credential.
+        const downloadQuarantine = createFsDownloadQuarantineStore(join(config.stateDir, 'ssivc-download-quarantine'))
+        const ssivc = new SsivcClient(config.ssivcBaseUrl!)
+        const verifyAiBirthcertDeps = {
+          ssivc,
+          signHexBlob: walletBeSignerFn,
+          messageSigner,
+          mbi,
+          pay,
+          publicKeyHex,
+          address: zetrixAddress,
+          holderDid,
+          now: () => new Date(),
+          sessionStore: ssivcSessionStore,
+          verifiedTemplateId: config.aiBirthcertVerifiedTemplateId,
+          cache: vcCache,
+          quarantine: downloadQuarantine,
+        }
+        return {
+          request: (input: Parameters<typeof requestAiBirthcertVerification>[1]) => requestAiBirthcertVerification(verifyAiBirthcertDeps, input),
+          check: () => checkAiBirthcertVerification(verifyAiBirthcertDeps),
+        }
+      })()
+    : undefined
 
   // pay_and_fetch: fetch → on 402, pay → retry.
   const payer: PayFetch = async (req) => {
@@ -414,10 +515,6 @@ async function main(): Promise<void> {
   // `blob`. Wallet BE `/sign-blob` decodes that hex and Ed25519-signs those bytes. Forward verbatim.
   const subscribeSign = (blob: string) => be.signBlob(blob, zetrixAddress, hsmPassword)
 
-  const mbi = new MbiClient(config.mbiBaseUrl)
-  // MBI's /vp/ext/* message-signing auth: sign the holder's own address (UTF-8), not a hex blob.
-  const messageSigner = (message: string) => be.signMessage(message, zetrixAddress, hsmPassword)
-
   // The VC's *issuer* BBS+/Ed25519 keys, for the OID4VP submit body — see mbi-vp-adapter.ts.
   const zidResolver = new ZidResolverClient(config.zidResolverBaseUrl)
   const resolveIssuerKeys = (vc: unknown) => resolveIssuerProofKeys(vc, zidResolver)
@@ -452,6 +549,7 @@ async function main(): Promise<void> {
     checkActivationStatus: (address: string) => be.checkActivationStatus(address),
     sleep,
     cache: vcCache,
+    verifyAiBirthcert,
   }
   const tools = createTools(deps) as unknown as Record<string, (a: unknown) => Promise<unknown> | unknown>
 

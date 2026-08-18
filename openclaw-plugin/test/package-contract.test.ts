@@ -19,23 +19,36 @@ const pkg = JSON.parse(readFileSync(join(pluginRoot, 'package.json'), 'utf8'))
 // Normalised: the repo checks out CRLF on Windows, and none of these assertions are about newlines.
 const skill = readFileSync(join(pluginRoot, 'skills', 'zetrix-agentic-wallet', 'SKILL.md'), 'utf8').replace(/\r\n/g, '\n')
 
-/** The seven tool names the wallet actually exposes, read from its tool descriptors. */
+/** The nine tool names the wallet actually exposes, read from its tool descriptors. */
 const walletToolNames = (() => {
   const src = readFileSync(join(walletRoot, 'src', 'index.ts'), 'utf8')
   return [...src.matchAll(/^\s{6}name: '([a-z_]+)',$/gm)].map((m) => m[1])
 })()
 
 describe('the wallet tool list is readable', () => {
-  it('finds exactly the seven tools', () => {
+  it('finds exactly the nine tools', () => {
     expect(walletToolNames.sort()).toEqual([
+      'check_ai_birthcert_verification',
       'create_holder_account',
       'get_template_schema',
       'pay_and_fetch',
       'prove_identity',
       'query_contract',
+      'request_ai_birthcert_verification',
       'subscribe_and_issue',
       'wallet_status',
     ])
+  })
+
+  it('USER_GUIDE.md\'s "openclaw mcp probe" tool count matches the real tool count', () => {
+    // Caught drifting once already: the guide said "7 tools" from before the two AI Birthcert tools
+    // existed, and nothing enforced it — a subscriber following the install steps would see 9 and
+    // wonder if something was wrong. The count itself is intentionally hardcoded in the guide (it's
+    // prose a human reads, not a template), so this test is what keeps it honest.
+    const guide = readFileSync(join(pluginRoot, 'USER_GUIDE.md'), 'utf8').replace(/\r\n/g, '\n')
+    const match = guide.match(/openclaw mcp probe zetrix-agentic-wallet\s+# (\d+) tools/)
+    expect(match).not.toBeNull()
+    expect(Number(match?.[1])).toBe(walletToolNames.length)
   })
 })
 
@@ -220,8 +233,8 @@ describe('SKILL.md', () => {
     expect(unknown).toEqual([])
   })
 
-  it('mentions every paid tool, so neither can be used without the spend rules', () => {
-    for (const t of ['pay_and_fetch', 'subscribe_and_issue']) expect(skill).toContain(t)
+  it('mentions every paid tool, so none can be used without the spend rules', () => {
+    for (const t of ['pay_and_fetch', 'subscribe_and_issue', 'request_ai_birthcert_verification']) expect(skill).toContain(t)
   })
 
   it('contains no install or host-configuration instructions', () => {

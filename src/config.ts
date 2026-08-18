@@ -63,6 +63,24 @@ export interface AgenticWalletConfig {
    * See src/payment-guard.ts.
    */
   maxPaymentAmount: Record<string, string>
+  /**
+   * myid's SSIVC "AI Birthcert" session API base URL — backs request_ai_birthcert_verification /
+   * check_ai_birthcert_verification. Auto-derived on testnet only (the only host ever actually
+   * reached and confirmed live); undefined on mainnet unless SSIVC_BASE_URL is set explicitly
+   * (APP-M04 — the mainnet host was an assumption by analogy, never tested). Unset means the AI
+   * Birthcert verification tools report themselves as not configured rather than being wired
+   * against an unconfirmed endpoint.
+   */
+  ssivcBaseUrl?: string
+  /**
+   * The Verified AI Birthcert's on-chain templateId, distinct from the Basic Birthcert's.
+   * Auto-derived on testnet only (confirmed on-chain, see deriveAiBirthcertVerifiedTemplateId);
+   * undefined on mainnet unless AI_BIRTHCERT_VERIFIED_TEMPLATE_ID is set explicitly (APP-M04 — a
+   * chain read at the mainnet registry address returned `result: null`, so the id was never
+   * confirmed). Unset means check_ai_birthcert_verification reports a cacheError instead of
+   * caching a mainnet credential under a possibly-wrong key.
+   */
+  aiBirthcertVerifiedTemplateId?: string
 }
 
 function stripTrailingSlash(v: string): string {
@@ -93,6 +111,28 @@ function deriveTemplateRegistryAddress(network: string): string {
   return network.includes('testnet')
     ? 'ZTX3JszqPgRUx743SAp7q7zURfjvkWuH2FMEz'
     : 'ZTX3GqJM1U6ifMPonwD4fGvrgoTKJua7b2cKX'
+}
+
+/**
+ * myid's SSIVC "AI Birthcert" session API. Testnet confirmed reachable (fetched and read in full
+ * 2026-08-13). The mainnet host (`https://verifyid-api.zetrix.com/api`) was never actually reached
+ * — an assumption by analogy with the other services' testnet/mainnet naming, not a confirmed
+ * endpoint (APP-M04, 2026-08-17). Returns undefined on mainnet so the caller fails closed rather
+ * than wiring the feature against an unverified host; set SSIVC_BASE_URL explicitly once confirmed.
+ */
+function deriveSsivcBaseUrl(network: string): string | undefined {
+  return network.includes('testnet') ? 'https://ssivc-api-uat.myegdev.com/api' : undefined
+}
+
+/**
+ * `AI_BIRTHCERT_VERIFIED` templateId, deployed 2026-08-05 (`TEMPLATE_ONCHAIN_REFERENCE.md` §2).
+ * Testnet id confirmed on-chain. The mainnet id is UNVERIFIED — a chain read at the mainnet
+ * registry address returned `result: null` — so this returns undefined on mainnet (APP-M04,
+ * 2026-08-17) rather than a guessed id a mainnet credential could get cached under incorrectly.
+ * Set AI_BIRTHCERT_VERIFIED_TEMPLATE_ID explicitly once the mainnet registry account is confirmed.
+ */
+function deriveAiBirthcertVerifiedTemplateId(network: string): string | undefined {
+  return network.includes('testnet') ? 'did:zid:9641ee92552e9bcec672f300b071ff86d340ac78c83c225e95971cab8108fb80' : undefined
 }
 
 /**
@@ -148,5 +188,10 @@ export function loadConfig(env: NodeJS.ProcessEnv): AgenticWalletConfig {
     // with no configuration at all must not be able to auto-pay a hostile x402 challenge. Raising
     // it is a deliberate act.
     maxPaymentAmount: parsePaymentCaps(opt('MAX_PAYMENT_AMOUNT')) ?? { '*': '0' },
+    ssivcBaseUrl: (() => {
+      const v = opt('SSIVC_BASE_URL') ?? deriveSsivcBaseUrl(network)
+      return v ? stripTrailingSlash(v) : undefined
+    })(),
+    aiBirthcertVerifiedTemplateId: opt('AI_BIRTHCERT_VERIFIED_TEMPLATE_ID') ?? deriveAiBirthcertVerifiedTemplateId(network),
   }
 }

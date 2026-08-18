@@ -17,7 +17,7 @@ describe('resolveHolder', () => {
     expect(signMessage).not.toHaveBeenCalled()
     expect(checkActivationStatus).not.toHaveBeenCalled()
     expect(sleep).not.toHaveBeenCalled()
-    expect(out).toEqual({ zetrixAddress: 'ZTX3New', holderDid: correctDid, created: true, didMismatch: false, activated: true })
+    expect(out).toEqual({ zetrixAddress: 'ZTX3New', holderDid: correctDid, publicKeyHex: `b001${rawPart}4a10ec51`, created: true, didMismatch: false, activated: true })
   })
 
   it('scenario 1 — activated:false on create, then becomes activated during polling', async () => {
@@ -29,7 +29,7 @@ describe('resolveHolder', () => {
     const out = await resolveHolder({ createAccount, signMessage, checkActivationStatus, sleep }, { hsmPassword: 'pw123456' })
 
     expect(checkActivationStatus).toHaveBeenCalledWith('ZTX3New')
-    expect(out).toEqual({ zetrixAddress: 'ZTX3New', holderDid: correctDid, created: true, didMismatch: false, activated: true })
+    expect(out).toEqual({ zetrixAddress: 'ZTX3New', holderDid: correctDid, publicKeyHex: `b001${rawPart}4a10ec51`, created: true, didMismatch: false, activated: true })
   })
 
   it('scenario 1 — activated:false on create and never activates within the poll window', async () => {
@@ -41,7 +41,7 @@ describe('resolveHolder', () => {
     const out = await resolveHolder({ createAccount, signMessage, checkActivationStatus, sleep }, { hsmPassword: 'pw123456' })
 
     expect(checkActivationStatus).toHaveBeenCalledTimes(3)
-    expect(out).toEqual({ zetrixAddress: 'ZTX3New', holderDid: correctDid, created: true, didMismatch: false, activated: false })
+    expect(out).toEqual({ zetrixAddress: 'ZTX3New', holderDid: correctDid, publicKeyHex: `b001${rawPart}4a10ec51`, created: true, didMismatch: false, activated: false })
   })
 
   it('scenario 1 — activated:false on create and checkActivationStatus REJECTS during polling: still resolves with activated:false instead of rejecting', async () => {
@@ -52,7 +52,7 @@ describe('resolveHolder', () => {
 
     const out = await resolveHolder({ createAccount, signMessage, checkActivationStatus, sleep }, { hsmPassword: 'pw123456' })
 
-    expect(out).toEqual({ zetrixAddress: 'ZTX3New', holderDid: correctDid, created: true, didMismatch: false, activated: false })
+    expect(out).toEqual({ zetrixAddress: 'ZTX3New', holderDid: correctDid, publicKeyHex: `b001${rawPart}4a10ec51`, created: true, didMismatch: false, activated: false })
   })
 
   it('scenario 2a — existing user, holderDid supplied and correct: verifies via sign-message and keeps it, no mismatch', async () => {
@@ -70,7 +70,7 @@ describe('resolveHolder', () => {
     expect(signMessage).toHaveBeenCalledWith('ZTX3Existing', 'ZTX3Existing', 'pw123456')
     expect(checkActivationStatus).not.toHaveBeenCalled()
     expect(sleep).not.toHaveBeenCalled()
-    expect(out).toEqual({ zetrixAddress: 'ZTX3Existing', holderDid: correctDid, created: false, didMismatch: false })
+    expect(out).toEqual({ zetrixAddress: 'ZTX3Existing', holderDid: correctDid, publicKeyHex: `b001${rawPart}4a10ec51`, created: false, didMismatch: false })
   })
 
   it('scenario 2b — existing user, holderDid omitted: derives it via sign-message, no mismatch (nothing supplied to compare)', async () => {
@@ -85,7 +85,7 @@ describe('resolveHolder', () => {
     expect(signMessage).toHaveBeenCalledWith('ZTX3Existing', 'ZTX3Existing', 'pw123456')
     expect(checkActivationStatus).not.toHaveBeenCalled()
     expect(sleep).not.toHaveBeenCalled()
-    expect(out).toEqual({ zetrixAddress: 'ZTX3Existing', holderDid: correctDid, created: false, didMismatch: false })
+    expect(out).toEqual({ zetrixAddress: 'ZTX3Existing', holderDid: correctDid, publicKeyHex: `b001${rawPart}4a10ec51`, created: false, didMismatch: false })
   })
 
   it('scenario 2c — existing user, holderDid supplied but WRONG: overrides with the derived DID and flags didMismatch', async () => {
@@ -101,7 +101,7 @@ describe('resolveHolder', () => {
 
     expect(checkActivationStatus).not.toHaveBeenCalled()
     expect(sleep).not.toHaveBeenCalled()
-    expect(out).toEqual({ zetrixAddress: 'ZTX3Existing', holderDid: correctDid, created: false, didMismatch: true })
+    expect(out).toEqual({ zetrixAddress: 'ZTX3Existing', holderDid: correctDid, publicKeyHex: `b001${rawPart}4a10ec51`, created: false, didMismatch: true })
   })
 
   it('never generates/invents a password — always creates the account with exactly the caller-supplied hsmPassword', async () => {

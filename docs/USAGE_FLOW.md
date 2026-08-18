@@ -3,7 +3,7 @@
 A concrete prompt-by-prompt script for driving `agentic-wallet-mcp` through the same 4-phase
 flow shown in the "x402 Payment — VC Issuance via MBI & Pay-Per-Use" sequence diagrams
 (**P1** VC issuance, **P2** pay-per-use, **E2E** combined). Each phase there maps directly onto
-one of this MCP's 7 tools — nothing new to build, this is just the script for using what exists.
+one of this MCP's 9 tools — nothing new to build, this is just the script for using what exists.
 
 | Diagram phase | This MCP's tool |
 |---|---|

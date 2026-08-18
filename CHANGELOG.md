@@ -8,6 +8,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > Entries for 0.5.0 and earlier were reconstructed from commit history when this file was
 > introduced in 0.6.0, so they summarise each release rather than being exhaustive.
 
+## [0.8.0] — 17 August 2026
+
+### Added
+
+- **`request_ai_birthcert_verification` / `check_ai_birthcert_verification` tools** — a
+  **Verified** AI Birthcert flow via myid's SSIVC API, distinct from `subscribe_and_issue`'s
+  self-declared **Basic** AI Birthcert. `request_ai_birthcert_verification` starts a session and
+  returns a `verificationUrl` for the human owner to complete MyDigital ID verification;
+  `check_ai_birthcert_verification` polls that session and, once `status: "issued"`, fetches the
+  credential from MBI, verifies its subject against this wallet's `holderDid`, and caches it
+  locally (returned as `vc`, and from then on also visible via `wallet_status` and usable by
+  `prove_identity`) — a `cacheError` instead of `vc` means the credential was issued but could not
+  yet be fetched/verified/cached, which is not the same as issuance failing. Both tools are wired
+  whenever `SSIVC_BASE_URL` resolves — always on testnet; on mainnet only once set explicitly,
+  since the mainnet host was never actually confirmed reachable. `request_ai_birthcert_verification`'s
+  session creation is x402-payment-gated: the tool self-pays myid's 402 challenge, subject to the
+  wallet's `MAX_PAYMENT_AMOUNT` cap, the same as `pay_and_fetch`/`subscribe_and_issue`. A session
+  that goes terminal without minting a credential (owner never verifies, verification fails, etc.)
+  can be retried without paying again, since the payment stays valid until actually consumed —
+  concurrent requests are serialized so this can't double-pay, and switching to a different agent
+  name while a session is still pending is refused rather than silently losing track of it. New env
+  vars: `SSIVC_BASE_URL` (auto-derived on testnet only — `ssivc-api-uat.myegdev.com/api`; unset on
+  mainnet unless overridden) and `AI_BIRTHCERT_VERIFIED_TEMPLATE_ID` (same pattern — testnet only,
+  since the mainnet template id was never confirmed on-chain).
+
+### Fixed
+
+- **A malformed or unexpectedly-shaped response from MBI's credential-download endpoint no longer
+  crashes `check_ai_birthcert_verification` with a raw, undiagnosable error.** Found via live
+  testing against a real verification flow: MBI's response envelope turned out to be nested one
+  level deeper than expected. Both the crash and the actual envelope shape are now handled
+  correctly, confirmed end-to-end against a live credential issuance.
+- **A downloaded-but-not-yet-cached credential is no longer lost if it fails validation or the
+  process crashes before caching.** MBI's download is one-shot — a second attempt just fails — so
+  the raw response is now persisted immediately on arrival and re-validated from that copy on any
+  retry, instead of being discarded the moment a check (subject match, expiry) rejects it.
+- Fixed several smaller gaps found in the same review: an already-settled payment blob and an empty
+  payment-options response now return a clean error instead of an unhandled exception; a 409 with a
+  non-JSON body still reports the right error kind; an unrecognized session status is no longer
+  assumed safe to retry against; and switching agents no longer risks silently overwriting another
+  agent's still-unresolved payment.
+
 ## [0.7.0] — 4 August 2026
 
 **Read the breaking change before upgrading if you make x402 payments.** This release lets the wallet

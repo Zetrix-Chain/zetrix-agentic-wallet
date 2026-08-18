@@ -345,3 +345,37 @@ describe('get_template_schema', () => {
     expect(out.error).toMatch(/did:zid/)
   })
 })
+
+describe('createTools — AI Birthcert verification', () => {
+  it('request_ai_birthcert_verification delegates to deps.verifyAiBirthcert.request', async () => {
+    const { deps } = makeDeps()
+    const request = vi.fn().mockResolvedValue({ sessionId: 's-1', verificationUrl: 'https://zvg.test/verify/tok', expiresAt: '2026-08-13T09:30:00+00:00' })
+    const check = vi.fn()
+    const out = await createTools({ ...deps, verifyAiBirthcert: { request, check } }).request_ai_birthcert_verification({ agentName: 'Procurement Assistant' })
+
+    expect(request).toHaveBeenCalledWith({ agentName: 'Procurement Assistant' })
+    expect(out).toEqual({ sessionId: 's-1', verificationUrl: 'https://zvg.test/verify/tok', expiresAt: '2026-08-13T09:30:00+00:00' })
+  })
+
+  it('request_ai_birthcert_verification reports unconfigured when verifyAiBirthcert deps are absent', async () => {
+    const { deps } = makeDeps()
+    const out = await createTools(deps).request_ai_birthcert_verification({ agentName: 'Procurement Assistant' })
+    expect(out).toEqual({ error: expect.stringContaining('not configured') })
+  })
+
+  it('check_ai_birthcert_verification delegates to deps.verifyAiBirthcert.check', async () => {
+    const { deps } = makeDeps()
+    const request = vi.fn()
+    const check = vi.fn().mockResolvedValue({ sessionId: 's-1', status: 'pending', expiresAt: '2026-08-13T09:30:00+00:00' })
+    const out = await createTools({ ...deps, verifyAiBirthcert: { request, check } }).check_ai_birthcert_verification()
+
+    expect(check).toHaveBeenCalledTimes(1)
+    expect(out).toEqual({ sessionId: 's-1', status: 'pending', expiresAt: '2026-08-13T09:30:00+00:00' })
+  })
+
+  it('check_ai_birthcert_verification reports unconfigured when verifyAiBirthcert deps are absent', async () => {
+    const { deps } = makeDeps()
+    const out = await createTools(deps).check_ai_birthcert_verification()
+    expect(out).toEqual({ error: expect.stringContaining('not configured') })
+  })
+})

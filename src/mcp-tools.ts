@@ -1,17 +1,19 @@
 /**
- * createTools — the 7 agent-facing tools.
+ * createTools — the 9 agent-facing tools.
  *
  * Pure wiring: each tool composes an orchestrator + config. The concrete deps
  * (X401Wallet, x402 payer, MBI + Wallet-BE sign/pay) are built in index.ts
  * and injected here, so the tools unit-test without live services.
  *
- *   wallet_status        — holder DID/address/network + client-supplied held VCs
- *   prove_identity       — x401 PROOF-REQUEST → PROOF-RESPONSE
- *   pay_and_fetch        — x402 pay-per-use
- *   subscribe_and_issue  — MBI VC issuance (pay → settle → VC)
- *   create_holder_account — HSM onboarding: create the account if it doesn't exist yet
- *   get_template_schema  — free read of a template's declared attribute schema
- *   query_contract       — read-only contract/account query
+ *   wallet_status                       — holder DID/address/network + client-supplied held VCs
+ *   prove_identity                      — x401 PROOF-REQUEST → PROOF-RESPONSE
+ *   pay_and_fetch                       — x402 pay-per-use
+ *   subscribe_and_issue                 — MBI VC issuance (pay → settle → VC)
+ *   create_holder_account               — HSM onboarding: create the account if it doesn't exist yet
+ *   get_template_schema                 — free read of a template's declared attribute schema
+ *   query_contract                      — read-only contract/account query
+ *   request_ai_birthcert_verification   — start a myid SSIVC Verified AI Birthcert session
+ *   check_ai_birthcert_verification     — poll that session; fetches + caches the VC once issued
  */
 
 import type { X401Wallet } from 'x401-zetrix-client'
@@ -25,6 +27,7 @@ import type { CheckActivationStatus } from './orchestrator/wait-for-activation.j
 import { type VcCacheStore, isVcValid } from './clients/vc-cache.js'
 import { resolveTemplateAlias, deriveTemplateAttributes, validateTemplateAttributes, derivedAttributeKeys } from './template-aliases.js'
 import type { ContractQueryInput, ContractQueryResult } from './clients/contract-query-client.js'
+import type { RequestAiBirthcertVerificationInput, RequestVerificationResult, CheckVerificationResult } from './orchestrator/verify-ai-birthcert.js'
 
 export interface ToolDeps {
   config: { holderDid: string; zetrixAddress: string; network: string }
@@ -58,6 +61,15 @@ export interface ToolDeps {
    * credentials explicitly, matching the original client-held-only behaviour.
    */
   cache?: VcCacheStore
+  /**
+   * Drives myid's SSIVC AI Birthcert session API. Optional in this type only so tests can omit
+   * it — index.ts always wires it in practice; there is no config gate. Session creation is
+   * x402-payment-gated (self-pay, capped by MAX_PAYMENT_AMOUNT), not bearer-token-gated.
+   */
+  verifyAiBirthcert?: {
+    request: (input: RequestAiBirthcertVerificationInput) => Promise<RequestVerificationResult>
+    check: () => Promise<CheckVerificationResult>
+  }
 }
 
 export interface WalletStatusInput {
@@ -86,6 +98,12 @@ async function loadValidCachedCredentials(cache?: VcCacheStore) {
   const all = await cache.list()
   return all.filter((entry) => isVcValid(entry))
 }
+
+/** Shared by both AI Birthcert verification tools when verifyAiBirthcert isn't wired (see ToolDeps) — the live wallet (index.ts) wires it whenever SSIVC_BASE_URL resolves (always on testnet; on mainnet only once set explicitly, APP-M04). */
+const AI_BIRTHCERT_NOT_CONFIGURED_ERROR =
+  'AI Birthcert verification is not configured on this wallet. On mainnet this is expected until ' +
+  'SSIVC_BASE_URL is set explicitly (the mainnet host was never confirmed reachable — APP-M04); on ' +
+  'testnet it means verifyAiBirthcert was not wired at all.'
 
 export function createTools(deps: ToolDeps) {
   return {
@@ -206,6 +224,20 @@ export function createTools(deps: ToolDeps) {
         },
         input,
       )
+    },
+
+    request_ai_birthcert_verification(input: RequestAiBirthcertVerificationInput) {
+      if (!deps.verifyAiBirthcert) {
+        return { error: AI_BIRTHCERT_NOT_CONFIGURED_ERROR }
+      }
+      return deps.verifyAiBirthcert.request(input)
+    },
+
+    check_ai_birthcert_verification() {
+      if (!deps.verifyAiBirthcert) {
+        return { error: AI_BIRTHCERT_NOT_CONFIGURED_ERROR }
+      }
+      return deps.verifyAiBirthcert.check()
     },
   }
 }

@@ -25,6 +25,8 @@ describe('loadConfig', () => {
       zidResolverBaseUrl: 'https://zid-resolver-sandbox.zetrix.com',
       maxPaymentAmount: { '*': '0' },
       stateDir: join(homedir(), '.agentic-wallet-mcp'),
+      ssivcBaseUrl: 'https://ssivc-api-uat.myegdev.com/api',
+      aiBirthcertVerifiedTemplateId: 'did:zid:9641ee92552e9bcec672f300b071ff86d340ac78c83c225e95971cab8108fb80',
     })
   })
 
@@ -44,6 +46,26 @@ describe('loadConfig', () => {
     expect(
       loadConfig({ ...base, ZETRIX_TEMPLATE_REGISTRY_ADDRESS: 'ZTX3Custom' } as NodeJS.ProcessEnv).templateRegistryAddress,
     ).toBe('ZTX3Custom')
+  })
+
+  it('leaves the mainnet Verified AI Birthcert templateId undefined (unverified, APP-M04) unless explicitly overridden', () => {
+    // The mainnet id was never confirmed on-chain (a read at the registry address returned null) —
+    // auto-deriving it anyway would let a mainnet credential get cached under a possibly-wrong key
+    // that prove_identity might never find. Fail closed instead: require an explicit override.
+    expect(loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet' } as NodeJS.ProcessEnv).aiBirthcertVerifiedTemplateId).toBeUndefined()
+    expect(
+      loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet', AI_BIRTHCERT_VERIFIED_TEMPLATE_ID: 'did:zid:custom' } as NodeJS.ProcessEnv)
+        .aiBirthcertVerifiedTemplateId,
+    ).toBe('did:zid:custom')
+  })
+
+  it('still auto-derives the testnet Verified AI Birthcert templateId (confirmed on-chain)', () => {
+    expect(loadConfig(base).aiBirthcertVerifiedTemplateId).toBe(
+      'did:zid:9641ee92552e9bcec672f300b071ff86d340ac78c83c225e95971cab8108fb80',
+    )
+    expect(
+      loadConfig({ ...base, AI_BIRTHCERT_VERIFIED_TEMPLATE_ID: 'did:zid:custom' } as NodeJS.ProcessEnv).aiBirthcertVerifiedTemplateId,
+    ).toBe('did:zid:custom')
   })
 
   it('derives mainnet defaults for Wallet BE, MBI, node host + ZID resolver, and passes optional ZETRIX_ADDRESS/HOLDER_DID + node overrides through', () => {
@@ -87,6 +109,26 @@ describe('loadConfig', () => {
   it('allows overriding OID4VP_BASE_URL with a custom URL, stripping the trailing slash', () => {
     const cfg = loadConfig({ ...base, OID4VP_BASE_URL: 'https://verifier.custom.com/api/' } as NodeJS.ProcessEnv)
     expect(cfg.oid4vpBaseUrl).toBe('https://verifier.custom.com/api')
+  })
+
+  it('auto-derives the testnet SSIVC base URL, and honors an SSIVC_BASE_URL override (stripping a trailing slash)', () => {
+    expect(loadConfig(base).ssivcBaseUrl).toBe('https://ssivc-api-uat.myegdev.com/api')
+    const cfg = loadConfig({ ...base, SSIVC_BASE_URL: 'https://ssivc-custom.example.com/api/' } as NodeJS.ProcessEnv)
+    expect(cfg.ssivcBaseUrl).toBe('https://ssivc-custom.example.com/api')
+  })
+
+  it('leaves the mainnet SSIVC base URL undefined (unverified, APP-M04) unless explicitly overridden', () => {
+    // Only the testnet host was ever actually reached and confirmed; the mainnet URL was an
+    // assumption by analogy, never tested live. Fail closed rather than wire the whole AI
+    // Birthcert verification feature against an unconfirmed mainnet endpoint.
+    expect(loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet' } as NodeJS.ProcessEnv).ssivcBaseUrl).toBeUndefined()
+    const overridden = loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet', SSIVC_BASE_URL: 'https://ssivc.example.com/api' } as NodeJS.ProcessEnv)
+    expect(overridden.ssivcBaseUrl).toBe('https://ssivc.example.com/api')
+  })
+
+  it('SSIVC_ISSUANCE_TOKEN, if set, has no effect (the session API needs no bearer token)', () => {
+    const cfg = loadConfig({ ...base, SSIVC_ISSUANCE_TOKEN: 'tok-abc' } as NodeJS.ProcessEnv)
+    expect(cfg).not.toHaveProperty('ssivcIssuanceToken')
   })
 
   it('leaves zetrixAddress and holderDid undefined when unset (first-time user — see resolve-holder.ts)', () => {
