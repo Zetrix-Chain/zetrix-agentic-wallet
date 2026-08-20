@@ -28,9 +28,19 @@
  */
 
 export class PaymentCapError extends Error {
-  constructor(message: string) {
+  /**
+   * Set only when the failure is "requested amount exceeds the configured cap" — carries the raw
+   * asset identifier and raw base-unit amounts so a caller with symbol/decimals resolution (e.g.
+   * index.ts's `pay`) can rebuild a human-readable message without re-deriving these numbers.
+   * Undefined for configuration-shaped failures (missing cap entry, malformed input), which have
+   * no amount to render more legibly.
+   */
+  readonly detail?: { asset: string; requiredRaw: string; capRaw: string }
+
+  constructor(message: string, detail?: { asset: string; requiredRaw: string; capRaw: string }) {
     super(message)
     this.name = 'PaymentCapError'
+    this.detail = detail
   }
 }
 
@@ -94,6 +104,9 @@ export function assertWithinPaymentCap(accept: PaymentRequirement, caps: Record<
   const required = BigInt(requiredRaw)
   const cap = BigInt(capRaw)
   if (required > cap) {
-    throw new PaymentCapError(`payment blocked: requested ${required} ${asset || '(unknown asset)'} exceeds configured MAX_PAYMENT_AMOUNT ${cap}`)
+    throw new PaymentCapError(
+      `payment blocked: requested ${required} ${asset || '(unknown asset)'} exceeds configured MAX_PAYMENT_AMOUNT ${cap}`,
+      { asset, requiredRaw: required.toString(), capRaw: cap.toString() },
+    )
   }
 }

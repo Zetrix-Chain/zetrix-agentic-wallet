@@ -67,9 +67,9 @@ export interface AgenticWalletConfig {
    * myid's SSIVC "AI Birthcert" session API base URL — backs request_ai_birthcert_verification /
    * check_ai_birthcert_verification. Auto-derived on testnet only (the only host ever actually
    * reached and confirmed live); undefined on mainnet unless SSIVC_BASE_URL is set explicitly
-   * (APP-M04 — the mainnet host was an assumption by analogy, never tested). Unset means the AI
-   * Birthcert verification tools report themselves as not configured rather than being wired
-   * against an unconfirmed endpoint.
+   * (APP-M04 — the mainnet host, {@link UNVERIFIED_MAINNET_SSIVC_BASE_URL}, was an assumption by
+   * analogy, never tested). Unset means the AI Birthcert verification tools report themselves as
+   * not configured rather than being wired against an unconfirmed endpoint.
    */
   ssivcBaseUrl?: string
   /**
@@ -114,11 +114,20 @@ function deriveTemplateRegistryAddress(network: string): string {
 }
 
 /**
+ * The mainnet SSIVC host, by analogy with the other services' testnet/mainnet naming — but
+ * UNVERIFIED (APP-M04, 2026-08-17): nobody has actually reached it and gotten a real response.
+ * Kept as a named constant, not inlined, so confirming it later is a one-line change — flip
+ * deriveSsivcBaseUrl's mainnet branch to return this — instead of someone having to rediscover
+ * the URL from scratch. Do NOT wire this into deriveSsivcBaseUrl's return value until confirmed;
+ * SSIVC_BASE_URL is the correct way to opt in before that happens.
+ */
+export const UNVERIFIED_MAINNET_SSIVC_BASE_URL = 'https://verifyid-api.zetrix.com/api'
+
+/**
  * myid's SSIVC "AI Birthcert" session API. Testnet confirmed reachable (fetched and read in full
- * 2026-08-13). The mainnet host (`https://verifyid-api.zetrix.com/api`) was never actually reached
- * — an assumption by analogy with the other services' testnet/mainnet naming, not a confirmed
- * endpoint (APP-M04, 2026-08-17). Returns undefined on mainnet so the caller fails closed rather
- * than wiring the feature against an unverified host; set SSIVC_BASE_URL explicitly once confirmed.
+ * 2026-08-13). Returns undefined on mainnet so the caller fails closed rather than wiring the
+ * feature against {@link UNVERIFIED_MAINNET_SSIVC_BASE_URL}; set SSIVC_BASE_URL explicitly once
+ * that host is confirmed reachable.
  */
 function deriveSsivcBaseUrl(network: string): string | undefined {
   return network.includes('testnet') ? 'https://ssivc-api-uat.myegdev.com/api' : undefined

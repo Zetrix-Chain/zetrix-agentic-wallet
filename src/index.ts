@@ -22,7 +22,7 @@ import type { PayRequest as X402PayRequest, WalletConfigData, ZetrixNodeConfig }
 import { X401Wallet, type ZetrixNetwork } from 'x401-zetrix-client'
 import ZtxChainSDK from 'zetrix-sdk-nodejs'
 import { loadConfig, resolveTokenAddress } from './config.js'
-import { resolveAssetSymbol, type ContractQuery } from './clients/token-info-client.js'
+import { resolveAssetSymbol, resolveAssetInfo, formatHumanAmount, type ContractQuery } from './clients/token-info-client.js'
 import { queryContract as runContractQuery, type ContractQueryInput, type ContractQueryResult } from './clients/contract-query-client.js'
 import {
   parseNativeBalance,
@@ -39,7 +39,7 @@ import { ZidResolverClient } from './clients/zid-resolver-client.js'
 import { resolveIssuerProofKeys } from './clients/resolve-issuer-proof-keys.js'
 import { createTools, type ToolDeps } from './mcp-tools.js'
 import type { PayFetch } from './orchestrator/pay.js'
-import { assertWithinPaymentCap } from './payment-guard.js'
+import { assertWithinPaymentCap, PaymentCapError } from './payment-guard.js'
 import { payWithReadinessCheck, PaymentReadinessError } from './payment-readiness.js'
 import { resolveHolder } from './orchestrator/resolve-holder.js'
 import { resolveStartupEnv } from './startup-env.js'
@@ -430,17 +430,84 @@ async function main(): Promise<void> {
   // MBI's /vp/ext/* message-signing auth: sign the holder's own address (UTF-8), not a hex blob.
   const messageSigner = (message: string) => be.signMessage(message, zetrixAddress, hsmPassword)
 
+  // Render a raw base-unit amount as "raw (human SYMBOL)" for error messages — resolving a ZTP20
+  // contract address to its real symbol/decimals, same as pay_and_fetch's success path already
+  // does for `asset`. Falls back to "raw SYMBOL"/"(unknown asset)" when resolution fails or the
+  // human conversion is identical to the raw string (e.g. decimals unknown), so a payment amount
+  // is never hidden behind a failed lookup.
+  const formatAssetAmount = async (asset: string, raw: string): Promise<string> => {
+    const { symbol, decimals } = await resolveAssetInfo(asset, contractQuery)
+    const label = symbol || '(unknown asset)'
+    const human = formatHumanAmount(raw, decimals)
+    return human === raw ? `${raw} ${label}` : `${raw} (${human} ${label})`
+  }
+
   // x402 self-pay: build the X-PAYMENT header for a given accept. Shared by pay_and_fetch
   // (below) and subscribe_and_issue (subscribeDeps.pay), so the cap covers both
   // auto-pay tools from this one call site — a hard ceiling on maxAmountRequired, enforced
   // regardless of what the calling agent was told to do.
-  const pay = (accept: PayRequirement) => {
-    assertWithinPaymentCap(accept, config.maxPaymentAmount)
-    return payWithReadinessCheck(
-      String(accept.asset ?? ''),
-      () => PaymentEngine.pay(asPayRequest(accept), walletCfg, node, {}, walletBeSignerFn),
-      activated,
-    )
+  const pay = async (accept: PayRequirement): Promise<string> => {
+    const rawAsset = String(accept.asset ?? '')
+
+    try {
+      assertWithinPaymentCap(accept, config.maxPaymentAmount)
+    } catch (err) {
+      // Rebuild the "exceeds cap" message with a resolved symbol + human amount instead of a raw
+      // contract address and a bare integer — without this, a ZTP20 cap rejection reads as
+      // "10000 <address>" (or gets mislabeled "ZTX" by whatever relays it), when it's actually a
+      // tiny fraction of a real token. Config-shaped failures (no cap entry, malformed input) have
+      // no `.detail` and no amount to humanize, so they pass through unchanged.
+      if (err instanceof PaymentCapError && err.detail) {
+        const { asset, requiredRaw, capRaw } = err.detail
+        throw new PaymentCapError(
+          `payment blocked: requested ${await formatAssetAmount(asset, requiredRaw)} exceeds configured ` +
+            `MAX_PAYMENT_AMOUNT ${await formatAssetAmount(asset, capRaw)}`,
+          err.detail,
+        )
+      }
+      throw err
+    }
+
+    // Stopgap for a bug in x402-zetrix-client: its ZTX-gas balance check for a ZTP20
+    // payment runs AFTER an on-chain fee-estimation call, so a wallet holding the resource token
+    // but zero ZTX hits an opaque node error from that estimation instead of a clean
+    // insufficient-funds message (surfaces as a raw MCP -32603, not a readable result). Checking
+    // gas balance here — before ever calling PaymentEngine.pay — catches exactly that common case
+    // ("topped up the token, forgot gas") with our own clear message. A low-but-nonzero gas
+    // balance still reaches PaymentEngine.pay unchanged; its (later, but working) check catches that.
+    if (rawAsset !== '' && rawAsset !== 'ZTX') {
+      const gasBalance = await fetchNativeBalance(zetrixAddress).catch(() => null)
+      if (gasBalance === '0') {
+        const { symbol } = await resolveAssetInfo(rawAsset, contractQuery)
+        throw new PaymentReadinessError(
+          `this wallet has 0 ZTX to pay network gas — the ${symbol || rawAsset} balance is separate from ` +
+            `gas, and every transaction costs a small amount of ZTX regardless of which token is being ` +
+            `paid. Send some ZTX to ${zetrixAddress} first, then retry.`,
+          { asset: 'ZTX', required: 'unknown', available: '0', reason: 'gas' },
+        )
+      }
+    }
+
+    try {
+      return await payWithReadinessCheck(
+        rawAsset,
+        () => PaymentEngine.pay(asPayRequest(accept), walletCfg, node, {}, walletBeSignerFn),
+        activated,
+      )
+    } catch (err) {
+      // Same symbol/decimal enrichment for an insufficient-balance rejection — "gas" always means
+      // ZTX regardless of what asset was being paid; "resource_payment" means the paid asset itself.
+      if (err instanceof PaymentReadinessError && err.shortfall.reason !== 'not_activated') {
+        const { asset, required, available, reason } = err.shortfall
+        const label = reason === 'gas' ? 'ZTX for gas' : (await resolveAssetInfo(asset, contractQuery)).symbol || asset
+        throw new PaymentReadinessError(
+          `insufficient ${label} — required ${await formatAssetAmount(asset, required)}, ` +
+            `available ${await formatAssetAmount(asset, available)}`,
+          err.shortfall,
+        )
+      }
+      throw err
+    }
   }
 
   // AI Birthcert verification session (myid SSIVC) — persisted so check_ai_birthcert_verification

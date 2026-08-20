@@ -29,6 +29,34 @@ import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } 
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+// zetrix-sdk-nodejs's proto._buildOperation does `require(`./operation/${type}`)` with no
+// extension. esbuild bundles that dynamic require into a static glob-require map, but keys that
+// map with the resolved file names INCLUDING their extension (e.g. "./operation/payCoin.js").
+// At runtime the lookup is done with the extension-less string from the template literal, so it
+// never matches the map (unlike Node's real require, which tries appending .js on a miss) — every
+// on-chain operation build inside the bundle throws "Operation cannot be resolved".
+// Fix: rewrite the require call at load time so the string handed to esbuild's glob-require
+// already carries the .js extension the generated map key expects.
+const fixZetrixSdkGlobRequire = {
+  name: 'fix-zetrix-sdk-glob-require',
+  setup(pluginBuild) {
+    pluginBuild.onLoad({ filter: /zetrix-sdk-nodejs[\\/]lib[\\/]common[\\/]util\.js$/ }, ({ path }) => {
+      const original = readFileSync(path, 'utf8')
+      const patched = original.replace(
+        'require(`./operation/${type}`)(data);',
+        'require(`./operation/${type}.js`)(data);',
+      )
+      if (patched === original) {
+        throw new Error(
+          `fix-zetrix-sdk-glob-require: expected pattern not found in ${path} — ` +
+            'zetrix-sdk-nodejs may have changed; update this plugin.',
+        )
+      }
+      return { contents: patched, loader: 'js' }
+    })
+  },
+}
+
 const here = dirname(fileURLToPath(import.meta.url))
 const pluginRoot = join(here, '..')
 const walletRoot = join(pluginRoot, '..')
@@ -65,6 +93,7 @@ await build({
   target: 'node18',
   format: 'cjs',
   outfile: join(runtimeDir, 'server-bundle.cjs'),
+  plugins: [fixZetrixSdkGlobRequire],
 })
 
 // 3. Record what was vendored — name@version AND a content hash.

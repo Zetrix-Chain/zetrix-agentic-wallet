@@ -72,6 +72,31 @@ describe('assertWithinPaymentCap', () => {
     const caps = { ZTX: '0' }
     expect(() => assertWithinPaymentCap({ asset: 'ZTX' }, caps)).not.toThrow()
   })
+
+  // A caller with symbol/decimals resolution (index.ts's `pay`) reads `.detail` to rebuild a
+  // human-readable message instead of the raw asset + bare integer this module deliberately works in.
+  it('attaches structured detail (asset, requiredRaw, capRaw) when the cap is exceeded', () => {
+    const caps = { ZTX: '1000000000' }
+    try {
+      assertWithinPaymentCap({ asset: 'ZTX', maxAmountRequired: '1000000001' }, caps)
+      expect.unreachable('should have thrown')
+    } catch (err) {
+      expect(err).toBeInstanceOf(PaymentCapError)
+      expect((err as InstanceType<typeof PaymentCapError>).detail).toEqual({
+        asset: 'ZTX', requiredRaw: '1000000001', capRaw: '1000000000',
+      })
+    }
+  })
+
+  it('leaves detail undefined for a configuration-shaped failure (no cap entry, no amount to render)', () => {
+    const caps = { ZTX: '1000000000' }
+    try {
+      assertWithinPaymentCap({ asset: 'JMYR', maxAmountRequired: '1' }, caps)
+      expect.unreachable('should have thrown')
+    } catch (err) {
+      expect((err as InstanceType<typeof PaymentCapError>).detail).toBeUndefined()
+    }
+  })
 })
 
 describe('a universal-only cap', () => {

@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { loadConfig } from '../config'
+import { loadConfig, UNVERIFIED_MAINNET_SSIVC_BASE_URL } from '../config'
 
 const base = {
   ZETRIX_NETWORK: 'zetrix:testnet',
@@ -124,6 +124,16 @@ describe('loadConfig', () => {
     expect(loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet' } as NodeJS.ProcessEnv).ssivcBaseUrl).toBeUndefined()
     const overridden = loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet', SSIVC_BASE_URL: 'https://ssivc.example.com/api' } as NodeJS.ProcessEnv)
     expect(overridden.ssivcBaseUrl).toBe('https://ssivc.example.com/api')
+  })
+
+  it('keeps the known-but-unverified mainnet SSIVC host as a documented constant, not wired into loadConfig', () => {
+    // The URL is worth keeping on hand so enabling it later (once confirmed reachable) is a
+    // one-line change in deriveSsivcBaseUrl rather than someone having to rediscover it — but it
+    // must not be what a mainnet wallet actually gets by default; SSIVC_BASE_URL is the opt-in.
+    expect(UNVERIFIED_MAINNET_SSIVC_BASE_URL).toBe('https://verifyid-api.zetrix.com/api')
+    expect(loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet' } as NodeJS.ProcessEnv).ssivcBaseUrl).not.toBe(
+      UNVERIFIED_MAINNET_SSIVC_BASE_URL,
+    )
   })
 
   it('SSIVC_ISSUANCE_TOKEN, if set, has no effect (the session API needs no bearer token)', () => {

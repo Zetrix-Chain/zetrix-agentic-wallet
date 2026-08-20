@@ -64,3 +64,38 @@ export async function resolveAssetSymbol(asset: string, query: ContractQuery): P
   const info = await fetchTokenInfo(asset, query)
   return info?.symbol ?? asset
 }
+
+/** Native ZETRIX is quoted in ZETA: 1 ZTX = 1,000,000 ZETA — mirrors token-balance-client.ts's
+ * ZTX_DECIMALS. Duplicated rather than imported: that module already imports from this one, and
+ * importing back would create a cycle. */
+const ZTX_DECIMALS = 6
+
+/**
+ * Resolve an x402 asset's display symbol AND decimals, for rendering a human-readable amount in
+ * an error/status message. Unlike {@link resolveAssetSymbol}, always returns a `decimals` value —
+ * falls back to 0 (no conversion — the caller shows the raw integer) for an empty asset or a
+ * failed contract lookup, so a payment amount is never lost even when it can't be humanized.
+ */
+export async function resolveAssetInfo(asset: string, query: ContractQuery): Promise<TokenInfo> {
+  if (asset === 'ZTX') return { symbol: 'ZTX', decimals: ZTX_DECIMALS }
+  if (asset === '') return { symbol: '', decimals: 0 }
+  const info = await fetchTokenInfo(asset, query)
+  return info ?? { symbol: asset, decimals: 0 }
+}
+
+/**
+ * Render a raw base-unit integer string as a human decimal amount, using BigInt arithmetic
+ * throughout so a financial value never goes through floating point (same discipline as
+ * token-balance-client.ts's docblock describes). `decimals <= 0` (unknown, or genuinely
+ * integer-only) returns `raw` unchanged rather than guessing a conversion.
+ */
+export function formatHumanAmount(raw: string, decimals: number): string {
+  if (!/^\d+$/.test(raw) || decimals <= 0) return raw
+  const base = 10n ** BigInt(decimals)
+  const value = BigInt(raw)
+  const wholePart = value / base
+  const fracPart = value % base
+  if (fracPart === 0n) return wholePart.toString()
+  const fracStr = fracPart.toString().padStart(decimals, '0').replace(/0+$/, '')
+  return `${wholePart}.${fracStr}`
+}

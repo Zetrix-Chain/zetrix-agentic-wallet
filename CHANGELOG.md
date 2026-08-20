@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > Entries for 0.5.0 and earlier were reconstructed from commit history when this file was
 > introduced in 0.6.0, so they summarise each release rather than being exhaustive.
 
+## [0.8.1] — 19 August 2026
+
+### Fixed
+
+- **A payment blocked by the spending cap, or rejected for insufficient balance, now names the
+  real token and shows a human-readable amount** — e.g. `10000 (0.01 JMYR)` instead of a bare raw
+  integer that got mislabeled as ZTX once relayed. Affects `pay_and_fetch`, `subscribe_and_issue`,
+  and `request_ai_birthcert_verification`, since all three share the same payment step.
+- **A wallet holding a ZTP20 token (e.g. JMYR) but zero ZTX no longer fails with a raw, opaque
+  error when trying to pay.** The wallet now checks its own ZTX gas balance before attempting the
+  payment and reports a clear "send some ZTX first" message — working around a bug in
+  `x402-zetrix-client` where its own gas check runs after an on-chain call that can itself fail
+  unhelpfully on a zero-gas account.
+
+### Changed
+
+- The known-but-never-confirmed mainnet SSIVC host is now a named, exported constant
+  (`UNVERIFIED_MAINNET_SSIVC_BASE_URL`) instead of only living in a comment — still not wired in by
+  default (`SSIVC_BASE_URL` remains the way to enable it on mainnet), but easier to flip on once
+  confirmed reachable.
+
 ## [0.8.0] — 17 August 2026
 
 ### Added
