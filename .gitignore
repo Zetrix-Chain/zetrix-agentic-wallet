@@ -1,0 +1,17 @@
+node_modules/
+dist/
+*.log
+.env
+.env.*
+coverage/
+
+# filled-in MCP configs (may contain secrets)
+mcp.local.json
+mcp.*.local.json
+.mcp.json
+
+# local git worktrees
+.worktrees/
+
+# ClawHub Plugin Inspector reports — regenerate with: clawhub package validate .
+openclaw-plugin/reports/

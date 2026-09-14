@@ -1,0 +1,49 @@
+{
+  "id": "zetrix-agentic-wallet",
+  "name": "Zetrix Agentic Wallet",
+  "description": "Zetrix identity, verifiable-credential and pay-per-use wallet tools for agents.",
+  "version": "0.3.3",
+  "activation": {
+    "onStartup": true
+  },
+  "skills": [
+    "./skills/zetrix-agentic-wallet"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "network": {
+        "type": "string",
+        "enum": [
+          "zetrix:testnet",
+          "zetrix:mainnet"
+        ],
+        "default": "zetrix:testnet"
+      },
+      "maxPaymentAmount": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "zetrixAddress": {
+        "type": "string"
+      }
+    }
+  },
+  "configUiHints": {
+    "network": {
+      "label": "Zetrix network",
+      "help": "Testnet by default. Mainnet spends real funds."
+    },
+    "maxPaymentAmount": {
+      "label": "Maximum payment per call",
+      "help": "Maximum per payment, in the token's raw units. Simplest form is one limit for everything: {\"*\":\"1000000000\"}. To limit per token, use \"ZTX\" for the native coin and either the token ticker (e.g. \"JMYR\") or its contract address — if you write both, the contract address wins. Leave this EMPTY to use the wallet's own default, which allows exactly the AI Birthcert fee (1 JMYR) on both testnet and mainnet and refuses everything else. Note the limit applies per payment, not as a running total."
+    },
+    "zetrixAddress": {
+      "label": "Existing holder address (optional)",
+      "help": "Leave empty and the wallet creates its own account on first run."
+    }
+  }
+}

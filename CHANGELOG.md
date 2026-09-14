@@ -1,0 +1,365 @@
+# Changelog
+
+All notable changes to `agentic-wallet-mcp` are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+> Entries for 0.5.0 and earlier were reconstructed from commit history when this file was
+> introduced in 0.6.0, so they summarise each release rather than being exhaustive.
+
+## [0.10.0] — 14 September 2026
+
+### Added
+
+- **`credential_preflight` — a free readiness check to call before asking the user for anything.**
+  Reports the live fee and which side pays gas, the balances that matter, whether the spending
+  limit permits it, and (for a template credential) the attributes the template requires. Every
+  reason it is not ready is listed *together*, so one round of fixes is enough rather than
+  discovering a low balance and a too-low spending cap one failed payment at a time. It also
+  reports what it could **not** check, so a clean result is not mistaken for a guarantee — notably,
+  it cannot tell whether an agent name is still free, because that is decided at issuance.
+- **Quote-only mode for the Verified AI Birthcert**, so its price and gas model can be seen without
+  starting a session or paying.
+
+### Changed
+
+- **A dry run can no longer issue a credential.** `subscribe_and_issue({ dryRun: true })` now prices
+  through an endpoint that cannot issue, and stops before the call that can. Previously, against a
+  credential the issuer grants for free, asking what something cost *created it* — a real,
+  permanently-registered credential, which also displaced whatever the wallet already held for that
+  template. A dry run now signs nothing, issues nothing, and never touches the local credential
+  store.
+- **A credential that is currently free is no longer reported as unaffordable.** The issuer states
+  separately whether a quoted amount will actually be charged; both `credential_preflight` and the
+  dry run now read it. When issuance is free, the amount is reported as indicative rather than as a
+  charge, and neither the balance nor the spending cap blocks it. Network gas is unaffected and can
+  still block, because gas is not the credential fee.
+- **Where that answer is unknown it is reported as unknown, never as free** — an older issuer
+  deployment does not state it, and treating silence as "free" would under-report a real cost.
+- **The default spending cap now permits the credential fee on mainnet**, scoped to credential
+  issuance rather than widened generally.
+- **Balance reads during a preflight run concurrently**, so the fee balance and the native-gas
+  balance arrive together instead of one after the other.
+
+### Fixed
+
+- **The outbound `User-Agent` sent to payment facilitators no longer advertises a non-public
+  host.** It is transmitted to third parties on every prepare request; the underlying client
+  dependency has been updated to one that reports its public project URL.
+
+## [0.9.2] — 3 September 2026
+
+### Fixed
+
+- **`request_ai_birthcert_verification`'s sponsored-payment path no longer surfaces a facilitator
+  insufficient-funds rejection as an opaque, unhandled MCP tool error.** A `461407`
+  (`X402_INSUFFICIENT_FUNDS`) rejection from the facilitator's `/prepare` endpoint is now reshaped
+  into a clean `{ error }` result naming the asset and amount, instead of falling through every
+  error branch and throwing raw.
+- **That message now renders amounts in human units, not raw base units.** A raw base-unit count
+  next to a token symbol (e.g. "requires 1,000,000 of JMYR") reads as a million *whole* tokens —
+  for a 6-decimal asset the actual requirement was 1 JMYR, a 1,000,000x misreading that could lead
+  to a drastically oversized top-up. Amounts are now resolved through the same symbol/decimals
+  formatter the rest of the wallet already uses.
+- **The reported "current balance" is read from the facilitator's structured response field when
+  available**, falling back to parsing it out of the free-text error message only for an
+  older/unfixed facilitator — the free-text format was never a stable contract between the two
+  services.
+
+## [0.9.1] — 28 August 2026
+
+### Fixed
+
+- **`request_ai_birthcert_verification` no longer blocks retrying an expired session.** If the
+  owner never completed MyDigital ID verification before a Verified AI Birthcert session's TTL
+  elapsed (`status: "expired"`), retrying previously threw an "unrecognized prior session status"
+  error and left the flow stuck — even though the settlement receipt was already safely persisted
+  locally and unconsumed. Any confirmed terminal session status other than `"issued"` (the only
+  status that consumes the receipt) is now treated the same as the existing 404/"gone" handling:
+  the receipt is replayed and a fresh verification session is opened, with no new payment made.
+
+## [0.9.0] — 24 August 2026
+
+### Added
+
+- **Paymaster-sponsored gas for `request_ai_birthcert_verification`.** When the resource server
+  offers a sponsored payment option (`extra.gasModel: "facilitator"`), the wallet now prefers it by
+  default — the ms-zetrix paymaster covers network gas, so a wallet holding the payment token but
+  zero ZTX can still complete the flow. Handles the server's asynchronous `202 Accepted` settlement
+  response: the wallet retries with the returned payment receipt (never re-sending the original
+  payment header) until the settlement confirms or the retry budget is exhausted, without ever
+  losing the receipt to a mid-retry crash or transient error.
+- **Automatic self-pay fallback.** If sponsorship is refused before any money moved (the
+  paymaster pool is exhausted, rate-limited, or the network/asset isn't sponsorable), the wallet
+  falls back to self-pay automatically. It never falls back on an indeterminate outcome — a
+  payment that may still be settling is never retried as a fresh payment, which would risk paying
+  twice.
+- **`gasPayer` parameter** on `request_ai_birthcert_verification` (`"sponsored"` | `"self"`) —
+  overrides the deployment default for a single call. An unrecognised value is treated as absent
+  rather than silently forcing self-pay.
+- **`GAS_PREFERENCE`** env var (default `sponsored`) — deployment-wide default gas payer.
+- **`MAX_SETTLEMENT_ATTEMPTS`** env var (default `20`) — cap on retry attempts while polling a
+  queued sponsored settlement.
+
+### Changed
+
+- Existing self-pay behaviour is unchanged — a resource server that only quotes self-pay (no
+  sponsored option) behaves identically to before this release.
+
+## [0.8.1] — 19 August 2026
+
+### Fixed
+
+- **A payment blocked by the spending cap, or rejected for insufficient balance, now names the
+  real token and shows a human-readable amount** — e.g. `10000 (0.01 JMYR)` instead of a bare raw
+  integer that got mislabeled as ZTX once relayed. Affects `pay_and_fetch`, `subscribe_and_issue`,
+  and `request_ai_birthcert_verification`, since all three share the same payment step.
+- **A wallet holding a ZTP20 token (e.g. JMYR) but zero ZTX no longer fails with a raw, opaque
+  error when trying to pay.** The wallet now checks its own ZTX gas balance before attempting the
+  payment and reports a clear "send some ZTX first" message — working around a bug in
+  `x402-zetrix-client` where its own gas check runs after an on-chain call that can itself fail
+  unhelpfully on a zero-gas account.
+
+### Changed
+
+- The known-but-never-confirmed mainnet SSIVC host is now a named, exported constant
+  (`UNVERIFIED_MAINNET_SSIVC_BASE_URL`) instead of only living in a comment — still not wired in by
+  default (`SSIVC_BASE_URL` remains the way to enable it on mainnet), but easier to flip on once
+  confirmed reachable.
+
+## [0.8.0] — 17 August 2026
+
+### Added
+
+- **`request_ai_birthcert_verification` / `check_ai_birthcert_verification` tools** — a
+  **Verified** AI Birthcert flow via myid's SSIVC API, distinct from `subscribe_and_issue`'s
+  self-declared **Basic** AI Birthcert. `request_ai_birthcert_verification` starts a session and
+  returns a `verificationUrl` for the human owner to complete MyDigital ID verification;
+  `check_ai_birthcert_verification` polls that session and, once `status: "issued"`, fetches the
+  credential from MBI, verifies its subject against this wallet's `holderDid`, and caches it
+  locally (returned as `vc`, and from then on also visible via `wallet_status` and usable by
+  `prove_identity`) — a `cacheError` instead of `vc` means the credential was issued but could not
+  yet be fetched/verified/cached, which is not the same as issuance failing. Both tools are wired
+  whenever `SSIVC_BASE_URL` resolves — always on testnet; on mainnet only once set explicitly,
+  since the mainnet host was never actually confirmed reachable. `request_ai_birthcert_verification`'s
+  session creation is x402-payment-gated: the tool self-pays myid's 402 challenge, subject to the
+  wallet's `MAX_PAYMENT_AMOUNT` cap, the same as `pay_and_fetch`/`subscribe_and_issue`. A session
+  that goes terminal without minting a credential (owner never verifies, verification fails, etc.)
+  can be retried without paying again, since the payment stays valid until actually consumed —
+  concurrent requests are serialized so this can't double-pay, and switching to a different agent
+  name while a session is still pending is refused rather than silently losing track of it. New env
+  vars: `SSIVC_BASE_URL` (auto-derived on testnet only — `ssivc-api-uat.myegdev.com/api`; unset on
+  mainnet unless overridden) and `AI_BIRTHCERT_VERIFIED_TEMPLATE_ID` (same pattern — testnet only,
+  since the mainnet template id was never confirmed on-chain).
+
+### Fixed
+
+- **A malformed or unexpectedly-shaped response from MBI's credential-download endpoint no longer
+  crashes `check_ai_birthcert_verification` with a raw, undiagnosable error.** Found via live
+  testing against a real verification flow: MBI's response envelope turned out to be nested one
+  level deeper than expected. Both the crash and the actual envelope shape are now handled
+  correctly, confirmed end-to-end against a live credential issuance.
+- **A downloaded-but-not-yet-cached credential is no longer lost if it fails validation or the
+  process crashes before caching.** MBI's download is one-shot — a second attempt just fails — so
+  the raw response is now persisted immediately on arrival and re-validated from that copy on any
+  retry, instead of being discarded the moment a check (subject match, expiry) rejects it.
+- Fixed several smaller gaps found in the same review: an already-settled payment blob and an empty
+  payment-options response now return a clean error instead of an unhandled exception; a 409 with a
+  non-JSON body still reports the right error kind; an unrecognized session status is no longer
+  assumed safe to retry against; and switching agents no longer risks silently overwriting another
+  agent's still-unresolved payment.
+
+## [0.7.0] — 4 August 2026
+
+**Read the breaking change before upgrading if you make x402 payments.** This release lets the wallet
+provision itself, so it can start with no configuration at all — which is what makes an OpenClaw plugin
+install possible, and also why the payment cap now has to default to zero.
+
+### Changed (breaking)
+
+- **`MAX_PAYMENT_AMOUNT` now defaults to `{"*":"0"}` instead of being unset.** An unconfigured wallet
+  refuses every x402 payment rather than allowing any amount. Previously an unset cap disabled the
+  ceiling entirely, which was defensible only while every install required hand-written environment
+  variables; a wallet that can now start with no configuration must not be able to auto-pay a hostile
+  challenge. To keep paying, set the cap explicitly, e.g.
+  `MAX_PAYMENT_AMOUNT={"ZTX":"1000000000","*":"0"}`.
+
+- **`create_holder_account` no longer takes a `password` parameter.** The wallet uses the password
+  already active for the session, so a model can neither be asked for one nor supply one. A
+  `password` still passed by an old caller is **silently ignored** rather than rejected, because the
+  tool schema permits extra properties. Consequence: a newly minted account now inherits the session
+  password instead of taking a different one.
+
+### Added
+
+- **The wallet provisions itself.** `HSM_PASSWORD` and `ZETRIX_NETWORK` are both optional now.
+  With neither set, the wallet defaults to testnet, generates a random HSM password, creates a
+  holder account, and stores address, DID and password in its own state directory — so it starts
+  with no configuration at all. An explicit env var still wins over every other source, so an
+  existing `.mcp.json` behaves exactly as before.
+- **`npx agentic-wallet-mcp export-credentials`** prints the address, DID and HSM password for
+  backup. A generated password is the only thing that can authorize signing for the account, so
+  losing the state directory means losing the account. Interactive terminals only, and deliberately
+  not an MCP tool, so an agent can never read it.
+- **`--config <path>`** reads settings from a JSON file instead of the environment, for hosts that
+  cannot set env vars. It carries no secret: a `hsmPassword` key is a hard error, and so is any
+  unknown key, so a typo cannot silently start the wallet on the wrong network.
+- **`ZETRIX_WALLET_STATE_DIR`** moves `account.json` and the VC cache out of the home directory.
+  The default is unchanged.
+- `pay_and_fetch` and `subscribe_and_issue` now report a `not_activated` shortfall when the holder
+  address is not yet on chain, instead of reporting it as a low balance — the remedy is to send it
+  gas, not to top up a token.
+
+### Fixed
+
+- **A zero ZTX balance no longer reports `query_failed`.** The node omits the `balance` field
+  entirely when it is zero, and `wallet_status({ token: "ZTX" })` treated its absence as a failed
+  read — so every account holding no ZTX looked like a broken lookup. A successful RPC that omits a
+  zero-valued field is now read as `0`. A non-zero `errorCode`, or a response with no `result` at
+  all, still fails loudly rather than reporting a fabricated zero.
+
+## [0.6.1] — 2026-07-29
+
+**Upgrade if you use testnet.** The testnet Wallet BE and MBI endpoints have moved to the Zetrix
+sandbox hosts. No API, tool or config surface changed — this is an endpoint migration only.
+
+### Changed
+
+- **Testnet default endpoints moved to the Zetrix sandbox hosts.** `ZETRIX_NETWORK=zetrix:testnet`
+  now derives `https://wallet-api-sandbox.zetrix.com/server` (was
+  `https://wallet-api.myegdev.com/server`) and `https://mbi-vc-sandbox.zetrix.com` (was
+  `https://mbi-vc.myegdev.com`). Anyone on testnet relying on the built-in defaults should upgrade
+  to follow the platform; mainnet defaults are unchanged, and an explicit `WALLET_BE_URL` /
+  `MBI_BASE_URL` still wins over the network default, so anyone pinning those is unaffected.
+  Note the Wallet BE base keeps its `/server` path suffix — verified against the new host, which
+  returns nginx `404` without it.
+
+## [0.6.0] — 2026-07-28
+
+This release is about the wallet never misstating what a call cost. Four reporting defects were
+found during live use, in each case the wallet told the caller something untrue about money.
+
+### Changed — BREAKING
+
+- **`amountPaid` is now `undefined` on a cache hit.** Previously a cache hit replayed the original
+  issuance's `txHash`/`paidAsset`/`amountPaid` at the top level, so a **free** call was
+  indistinguishable from a fresh charge and anything summing `amountPaid` across calls
+  double-counted. Those values now appear under `originalPayment: { txHash, asset, amount }`
+  instead, and are omitted entirely when the cached credential was issued free. Any consumer
+  reading top-level `amountPaid` to track spend needs updating.
+
+### Added
+
+- **`get_template_schema` tool** — a free read of a credential template's declared attribute
+  schema (`{ required, optional }`), taking a `did:zid:...` id or a known template name. No
+  payment, no signing, no issuer call. Previously the only way to ask what a template required was
+  `subscribe_and_issue` with `dryRun` — a tool whose name reads as "this charges money" — so an
+  agent had no obvious reason to reach for it and would discover a newly-required attribute by
+  failing an issuance first. A template that cannot be read returns `{ error }` rather than an
+  empty schema, so "needs nothing" is never confused with "could not look it up".
+- **`staleAttributes` on a cache hit** — `{ missing, dropped }` when a held credential no longer
+  matches the template it came from. Validity checks only ever asked whether a credential had
+  expired, never whether its fields still fit the template, so an issuer changing a template left
+  holders with a credential that looked valid and wasn't. The cached credential is still returned;
+  this reports, it does not re-issue or charge.
+- **`decimals` on `wallet_status({ token })`** — the raw base-unit balance stays canonical (it is
+  the unit x402 quotes `maxAmountRequired` in, so cap checks and comparisons remain integer-only),
+  but callers no longer need a second contract call to know whether `"473999900"` means 474 or
+  474 million.
+- **`paymentAttempted: { asset, amount, paymentId }`** on any failure occurring after the x402
+  payment has settled on chain. The issuer's error body carries neither the amount nor a
+  transaction reference, so such a debit was previously invisible in the response and discoverable
+  only by comparing `balanceOf` before and after. `paymentId` is the handle the issuer's idempotent
+  recovery endpoint takes.
+- **Indeterminate-settlement recovery.** The issuer distinguishes a definitive facilitator
+  rejection from an outcome that is *unknown* — where the payment may well have landed and the
+  record is deliberately left recoverable. On the indeterminate code the wallet now polls the
+  issuer's status endpoint (bounded) and reports `recovery: { status, txHash?, vcId?, polls }`,
+  rather than discarding a credential already paid for. `status: "ISSUED"` means it exists after
+  all; note the status endpoint returns only its id, not the credential body.
+- **`MbiError.mbiStatus`** — the issuer's own numeric status code, parsed from the error body.
+  Previously only the HTTP status and an opaque message string were available, so the two
+  post-payment failures could be told apart only by substring-matching or by trusting an HTTP 502
+  that any gateway can emit.
+- **Explicit HTTP deadline** on the issuer client (90s, overridable), above the issuer's own 60s
+  facilitator timeout. Previously the runtime default applied, which happened to be longer but was
+  not a deliberate choice — a deadline at or below the issuer's would abort a settlement still
+  legitimately in progress.
+
+### Fixed
+
+- **Failed balance lookups no longer report a fabricated zero.** Any failure — non-zero
+  `errorCode`, missing field, malformed payload — previously collapsed to `{ balance: '0' }`,
+  making an unreachable node indistinguishable from an empty wallet. Worse, because the
+  underlying helpers returned *normally*, a caller's `try`/`catch` never fired. Now surfaced as
+  `{ error: 'query_failed' }`. Both the ZTP20 and the native ZTX path had the same defect; both
+  are fixed.
+- `originalPayment` is omitted for a cached credential that was issued free, rather than reported
+  as `{ asset: 'none', amount: '0' }` — matching the documented behaviour.
+
+### Documentation
+
+- `query_contract` documented for the first time. It shipped in 0.5.0 but was never added to the
+  tool list. The documentation now also states plainly that it is a pass-through with no ABI or
+  method list — the contract decides what it understands, and an unknown method returns the same
+  shape as a typo.
+- The `subscribe_and_issue` description previously claimed `schema` is returned on *every*
+  response; the cache path returns before the chain lookup, so it never did. Corrected, and the
+  cache path now performs the lookup so the claim holds.
+
+## [0.5.0] — 2026-07-27
+
+### Added
+
+- Wallet BE account-activation checking: `activated`/`activationTxHash` fields,
+  `checkActivationStatus`, a bounded `waitForActivation` polling helper, and polling wired into
+  both first-run account creation and `create_holder_account`.
+- x402 payment readiness — `pay_and_fetch` and `subscribe_and_issue` surface an insufficient-funds
+  shortfall as a structured result instead of throwing.
+- Per-network JMYR token registry (`resolveTokenAddress`) and token-balance lookup on
+  `wallet_status`.
+- `query_contract` — general-purpose read-only contract/account query, exposed as an agent tool.
+- Template attribute validation and derivation, with the full declared schema surfaced.
+
+### Fixed
+
+- A `resolveHolder` polling failure degrades instead of crashing startup.
+- The `hsmPassword` is persisted alongside address/DID on account override, not dropped.
+
+## [0.4.0] — 2026-07-24
+
+### Added
+
+- Local cache of issued credentials, keyed by template, so `subscribe_and_issue` does not pay and
+  re-issue for a credential already held.
+- Named-template alias resolution (e.g. `"AI Birthcert"`), and an `agentDid` auto-fill gated on the
+  template's declared schema.
+
+### Fixed
+
+- `revealAttributes` ordering to match the credential's signed field order, which was breaking BBS+
+  presentation verification.
+- Free-template synchronous issuance handled in the issuer's phase 1.
+
+## [0.3.0] — 0.3.1
+
+### Added
+
+- Live x401 proof integration: OID4VP submit authentication, DCQL reveal mapping, and an issuer-key
+  override for when the resolver is unreachable.
+- Integration guide, presentation-submission fix, and the switch to the published
+  `x401-zetrix-client` package.
+
+## [0.2.0]
+
+### Added
+
+- Optional `ZETRIX_ADDRESS`/`HOLDER_DID` onboarding, with `HSM_PASSWORD` guaranteed present.
+- x402 asset symbol resolved from a ZTP20 contract's `contractInfo`.
+
+## [0.1.0]
+
+Initial release — the five agent-facing tools (`wallet_status`, `prove_identity`, `pay_and_fetch`,
+`subscribe_and_issue`, `create_holder_account`) over x401, x402, and issuer-side credential
+issuance, with all signing through Wallet BE's HSM.

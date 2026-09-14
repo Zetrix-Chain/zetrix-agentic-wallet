@@ -1,0 +1,783 @@
+#!/usr/bin/env node
+/**
+ * agentic-wallet-mcp — stdio MCP server entry + live dependency wiring.
+ *
+ * `buildToolList()` is unit-tested; `main()` is the live wiring (the integration seam).
+ * It constructs Wallet BE + signer, the x402 self-pay payer, and the MBI client (used both for
+ * x402 VC issuance and VP creation/submission), then registers the 9 tools. Run the
+ * esbuild bundle for the bin (x401-zetrix-client's ESM uses extensionless imports).
+ */
+
+import { Buffer } from 'node:buffer'
+import { createHash } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import packageJson from '../package.json' with { type: 'json' }
+import { Server } from '@modelcontextprotocol/sdk/server/index.js'
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
+import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
+import { PaymentEngine } from 'x402-zetrix-client'
+import type { PayRequest as X402PayRequest, WalletConfigData, ZetrixNodeConfig } from 'x402-zetrix-client'
+import { X401Wallet, type ZetrixNetwork } from 'x401-zetrix-client'
+import ZtxChainSDK from 'zetrix-sdk-nodejs'
+import { loadConfig, resolveTokenAddress } from './config.js'
+import { resolveAssetSymbol, resolveAssetInfo, formatHumanAmount, type ContractQuery } from './clients/token-info-client.js'
+import { queryContract as runContractQuery, type ContractQueryInput, type ContractQueryResult } from './clients/contract-query-client.js'
+import {
+  parseNativeBalance,
+  queryTokenBalance as runTokenBalanceQuery,
+  type TokenBalanceDeps,
+  type TokenBalanceResult,
+} from './clients/token-balance-client.js'
+import { fetchTemplateFields, type NodeMetaQuery } from './clients/template-info-client.js'
+import { WalletBeClient } from './clients/wallet-be-client.js'
+import { WalletBeSigner } from './signer.js'
+import { MbiVpAdapter, type VcPresentInput } from './clients/mbi-vp-adapter.js'
+import { MbiClient, type PayRequirement } from './clients/mbi-client.js'
+import { ZidResolverClient } from './clients/zid-resolver-client.js'
+import { resolveIssuerProofKeys } from './clients/resolve-issuer-proof-keys.js'
+import { createTools, type ToolDeps } from './mcp-tools.js'
+import type { PayFetch } from './orchestrator/pay.js'
+import { assertWithinPaymentCap, PaymentCapError, formatCapRefusal } from './payment-guard.js'
+import { payWithReadinessCheck, PaymentReadinessError } from './payment-readiness.js'
+import { resolveHolder } from './orchestrator/resolve-holder.js'
+import { resolveStartupEnv } from './startup-env.js'
+import { loadConfigFileEnv } from './config-file.js'
+import { generateHsmPassword } from './hsm-password.js'
+import { exportCredentials } from './export-credentials.js'
+import { createFsVcCache } from './clients/vc-cache.js'
+import { createFsAccountStore } from './clients/account-store.js'
+import { SsivcClient } from './clients/ssivc-client.js'
+import { createFsSsivcSessionStore } from './clients/ssivc-session-store.js'
+import { createFsDownloadQuarantineStore } from './clients/ssivc-download-quarantine-store.js'
+import { requestAiBirthcertVerification, checkAiBirthcertVerification } from './orchestrator/verify-ai-birthcert.js'
+import { needsNativeGasCheck, prepareBaseUrl } from './accept-selection.js'
+
+// esbuild resolves this JSON import at build time and inlines it into the bundle, so the
+// reported version always matches whatever package.json said when this bundle was built.
+const packageVersion = packageJson.version
+
+export function buildToolList() {
+  return [
+    {
+      name: 'wallet_status',
+      description: 'Report the holder DID/address/network and the client-supplied held credentials.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          heldCredentials: { type: 'array', items: { type: 'object' }, description: 'VCs the client holds. Omit to report whatever the wallet has cached locally from prior subscribe_and_issue calls instead.' },
+          token: { type: 'string', description: 'Optional token symbol (e.g. "ZTX", "JMYR") OR a ZTP20 contract address, to check its balance for the active network alongside the usual status fields. Returns { balance, decimals, display } — `balance` is in the asset\'s raw base units and `display` is the same amount in whole tokens with its symbol (e.g. balance "473999900", decimals 6, display "473.9999 JMYR"). Quote a `display` value to the user, never a bare `balance`. A failed lookup reports { error: "query_failed" } rather than a zero balance; an unrecognised name reports { error: "unknown_token" }.' },
+          tokens: { type: 'array', items: { type: 'string' }, description: 'Several tokens (symbols and/or ZTP20 contract addresses) in one call, returned as `tokenBalances` in the order asked. Prefer this over repeated single-token calls when checking affordability: a credential fee and the native ZTX needed for gas are separate balances, and asking one at a time is how "you hold the token but no gas" is discovered only after the first shortfall was already fixed. Each entry carries its own result or error, so one failure does not hide the rest.' },
+        },
+      },
+    },
+    {
+      name: 'prove_identity',
+      description: 'Answer an x401 PROOF-REQUEST and return the PROOF-RESPONSE header to replay to the resource server.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          proofRequest: { type: 'string', description: 'The PROOF-REQUEST header value from the 401 challenge.' },
+          vc: { type: 'object', description: 'The VerifiableCredential to present. Omit to use the wallet\'s single locally-cached credential, if there is exactly one — the call fails with a clear error if none or several are cached.' },
+          revealAttribute: { type: 'array', items: { type: 'string' }, description: 'Dotted disclosure paths to reveal. Omit to reveal exactly the claims the challenge (DCQL) requests; a challenge naming no claims reveals all.' },
+          issuerKeys: {
+            type: 'object',
+            properties: {
+              bbsPublicKey: { type: 'string', description: "Issuer's BBS+ publicKeyMultibase (matches the VC's BbsBlsSignature2020 proof)." },
+              ed25519PublicKey: { type: 'string', description: "Issuer's Ed25519 publicKeyHex (matches the VC's Ed25519Signature2020 proof)." },
+            },
+            description: 'Optional issuer verification keys to bypass the ZID resolver when it is unreachable (e.g. Cloudflare-gated). When set, resolution is skipped.',
+          },
+        },
+        required: ['proofRequest'],
+      },
+    },
+    {
+      name: 'pay_and_fetch',
+      description:
+        'Fetch a URL, auto-paying with x402 (self-pay via Wallet BE) if the server returns 402. The asset ' +
+        "charged is whatever the server's 402 challenge demands — the native ZETRIX token or a ZTP20 token " +
+        "(e.g. JMYR) — never assume it's ZETRIX; the result's `asset` field reports what was actually paid.",
+      inputSchema: {
+        type: 'object',
+        properties: {
+          url: { type: 'string' },
+          method: { type: 'string' },
+          headers: { type: 'object' },
+          body: { type: 'string' },
+        },
+        required: ['url'],
+      },
+    },
+    {
+      name: 'get_template_schema',
+      description:
+        "Read a VC template's declared attribute schema from chain — FREE, no payment, no signing, " +
+        'no MBI issuance. Call this BEFORE subscribe_and_issue to find out which attributes a ' +
+        'template requires, rather than discovering a missing one by attempting an issuance and ' +
+        'being rejected. Accepts a did:zid:... credential-definition id or a known template name ' +
+        '(e.g. "AI Birthcert"). Returns { templateId, schema: { required, optional } }; attributes ' +
+        'the wallet fills in itself (agentDid, alias-derived keys) are omitted since you never supply ' +
+        'them. A template that cannot be read reports { error } rather than an empty schema, so ' +
+        '"needs nothing" is never confused with "could not look it up".',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          templateId: {
+            type: 'string',
+            description: 'The MBI credential-definition id (did:zid:...) or a known template name, e.g. "AI Birthcert".',
+          },
+        },
+        required: ['templateId'],
+      },
+    },
+    {
+      name: 'query_contract',
+      description:
+        'Read-only query against a Zetrix contract or account — call an arbitrary contract method ' +
+        '(e.g. "balanceOf", "contractInfo") and return its raw result. No signing, no state change.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          contractAddress: { type: 'string', description: 'Zetrix contract address to query.' },
+          method: { type: 'string', description: 'Contract method name, e.g. "balanceOf", "contractInfo".' },
+          params: { type: 'object', description: 'Method parameters, e.g. { "address": "ZTX..." } for balanceOf.' },
+        },
+        required: ['contractAddress', 'method'],
+      },
+    },
+    {
+      name: 'subscribe_and_issue',
+      description:
+        'Obtain a VC from MBI: build the signed payload, pay x402, and return the issued credential. If a ' +
+        'still-valid credential for this templateId is already cached locally, it is returned directly with ' +
+        'no payment (fromCache: true) — pass forceReissue:true to pay and issue fresh regardless. Payment ' +
+        "is asset-agnostic — MBI's 402 challenge may quote the native ZETRIX token or a ZTP20 token (e.g. " +
+        'JMYR); pass dryRun:true first to see the quoted asset/amount for free before committing to pay. ' +
+        'What a call actually cost is reported precisely: paidAsset/amountPaid are set ONLY when this call ' +
+        'paid, a cache hit reports the earlier charge under originalPayment instead (never as amountPaid, so ' +
+        'summing spend cannot double-count), and any failure after the payment has settled on chain reports ' +
+        'paymentAttempted: { asset, amount, paymentId }. Two such failures exist and mean different things: ' +
+        'MBI 4006 is a definitive facilitator rejection, while 4012 (HTTP 502) means the outcome is ' +
+        'INDETERMINATE — the payment may well have landed. On 4012 the wallet automatically polls MBI\'s ' +
+        'recovery endpoint and reports recovery: { status, txHash?, vcId?, polls }, where status is ISSUED ' +
+        '(the credential exists after all — fetch it by vcId, since recovery returns no VC body), FAILED, or ' +
+        'REQUIRED/SETTLED (still unresolved) / UNKNOWN (recovery itself unreachable). NEVER retry a payment ' +
+        'after either failure: the funds may already be gone, and a retry charges the full amount again — ' +
+        'look the paymentId up instead. ' +
+        'Every response except a cache hit also includes { schema: { required, optional } } — the ' +
+        "template's full declared attribute schema read from chain — so you see the complete field list, " +
+        'not just what went wrong; a cache hit skips the chain lookup and omits it. ' +
+        'For the AI Birthcert specifically: this issues the BASIC one — self-declared by the agent, ' +
+        'agent-paid via x402, owner identity NOT identity-verified. If the user asked for a "verified" AI ' +
+        'birthcert (owner identity confirmed via MyDigital ID), use request_ai_birthcert_verification ' +
+        'instead — this tool cannot produce that credential.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          templateId: {
+            type: 'string',
+            description:
+              'The MBI credential-definition id to issue, e.g. "did:zid:...". Take this from the x401 ' +
+              "challenge's credential_requirements.query.credentials[].id — NOT from requirementsId " +
+              '(that\'s just a label for the requirement set, e.g. "agent-identity"). A known template\'s ' +
+              'natural-language name (e.g. "AI Birthcert") is also accepted and resolved to the right ' +
+              'did:zid:... for the configured network. ' +
+              'This resolves to the BASIC (self-declared, non-verified) template — for the Verified ' +
+              'AI Birthcert, use request_ai_birthcert_verification, not this tool.',
+          },
+          attributes: {
+            type: 'object',
+            description:
+              'Claim values for the credential (schema varies by template — check what the issuer requires ' +
+              'before guessing). "agentDid" does not need to be supplied: it is auto-filled with this wallet\'s ' +
+              "own holder DID (the credential's self-referential subject) unless you explicitly override it.",
+          },
+          expirationDate: { type: 'string' },
+          dryRun: {
+            type: 'boolean',
+            description:
+              'Price the credential without paying, signing, or issuing anything. Returns ' +
+              '{ quote: { asset, maxAmountRequired, payTo, gasModel, paymentRequired? }, schema: { required, optional } }. ' +
+              'Priced via MBI\'s /quote endpoint, which cannot issue — so this is safe even on a template that ' +
+              'issues for free (such a template mints synchronously on the real path, which is why pricing never ' +
+              'goes through it). Never writes the VC cache, so it cannot displace a credential you already hold. ' +
+              '`quote.paymentRequired` is the authoritative free-vs-paid answer: false means issuance is currently ' +
+              'free and `maxAmountRequired` will not be charged. When the field is ABSENT the MBI predates it and ' +
+              'the amount is unconfirmed — report it as a possible charge, never as certainly free. ' +
+              'Still validates required attributes locally first — a missing one blocks before any MBI call.',
+          },
+          forceReissue: {
+            type: 'boolean',
+            description: 'Skip the local cache and pay + issue a fresh credential regardless of what is already cached.',
+          },
+        },
+        required: ['templateId', 'attributes'],
+      },
+    },
+    {
+      name: 'request_ai_birthcert_verification',
+      description:
+        'Start a Verified AI Birthcert issuance session with myid (MyDigital ID owner verification). ' +
+        'Returns { sessionId, verificationUrl, expiresAt } — show verificationUrl to the human owner ' +
+        'and ask them to open it and complete MyDigital ID verification (typically finishes in ' +
+        'seconds). Once they confirm they are done, call check_ai_birthcert_verification to see ' +
+        'whether the credential was issued. IMPORTANT: agentName must be unique — if this exact name ' +
+        'has already been used to request a Verified AI Birthcert, issuance will fail. Before calling, ' +
+        'ask the human owner whether they want to supply any of the optional fields — agentPurpose, ' +
+        'evidenceAssuranceLevel, ownerType, ownerVerified — do not silently omit them; they only need ' +
+        'to say no. Calling this ' +
+        'again with the SAME agentName while a prior session is still pending returns that same ' +
+        'session unchanged — no new session is started and nothing is paid again. This tool spends ' +
+        'real funds: it self-pays an x402 challenge, subject to the same credential-issuance payment ' +
+        'cap as subscribe_and_issue — a separate, narrower cap than pay_and_fetch\'s, which defaults ' +
+        'to refusing everything on mainnet. Set MAX_PAYMENT_AMOUNT to override either. It can return ' +
+        '{ error: "..." } instead of a session if that payment fails (insufficient funds, or the ' +
+        'payment cap blocked it) — nothing is created in that case. ' +
+        'If the user did NOT ask for a "verified" credential specifically, they most likely want the ' +
+        'self-declared, non-verified Basic AI Birthcert instead — use subscribe_and_issue for that.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          agentName: {
+            type: 'string',
+            description: 'A unique, human-readable name for this agent. Must not already be in use for a Verified AI Birthcert, or issuance will fail.',
+          },
+          agentPurpose: { type: 'string', description: 'Optional — what this agent does, e.g. "Negotiate and settle supplier invoices".' },
+          evidenceAssuranceLevel: { type: 'string', description: 'Optional — assurance level of the identity evidence, e.g. "high".' },
+          ownerType: { type: 'string', description: 'Optional — the owner\'s type, e.g. "Individual".' },
+          ownerVerified: { type: 'string', description: 'Optional — whether the owner is already verified, as the string "true" or "false".' },
+          gasPayer: {
+            type: 'string',
+            enum: ['sponsored', 'self'],
+            description:
+              'Who pays network gas. "sponsored" (default) asks the platform paymaster to cover gas, ' +
+              'so this wallet needs no ZTX. "self" pays gas from this wallet\'s own ZTX balance. ' +
+              'Omit to use the configured default.',
+          },
+          dryRun: {
+            type: 'boolean',
+            description:
+              'Ask the price WITHOUT paying. Returns { quote: { asset, maxAmountRequired, payTo, gasModel } } ' +
+              'and spends nothing, creates no session, and starts no verification — so you can tell the user ' +
+              'the cost before collecting anything. `maxAmountRequired` is in the asset\'s RAW base units; ' +
+              'resolve decimals (wallet_status returns `display`) before quoting a figure to a human. ' +
+              'A quote does NOT reserve the name and does NOT check whether it is already taken — myid checks ' +
+              'uniqueness only at issuance, so a name already in use still quotes cleanly. `agentName` is still ' +
+              'required because the server rejects a request without one, but the fee does not depend on it.',
+          },
+        },
+        required: ['agentName'],
+      },
+    },
+    {
+      name: 'credential_preflight',
+      description:
+        'FREE readiness check — call this FIRST, before collecting ANY application detail from the user, ' +
+        'whenever they ask for a credential. Spends nothing, signs no transaction, creates no session. ' +
+        'Returns { ready, fee, balances, cap, schema?, blockers, notChecked }: the live fee and which side ' +
+        'pays gas, the balances that matter, whether the spending limit permits it, and — for a template ' +
+        'credential — the attributes it requires. `blockers` lists EVERY reason it is not ready at once ' +
+        '(a low balance and a too-low spending limit are different problems and both appear together), so ' +
+        'one round of fixes is enough rather than discovering them one failed payment at a time. ' +
+        'ALWAYS relay `notChecked` too: a clean result is not a guarantee. In particular it does NOT ' +
+        'check whether an agent name is free — myid decides that at issuance, after payment. ' +
+        'Report `fee.display` and each balance\'s `display` to the user, never the raw base-unit numbers. ' +
+        '`fee.paymentRequired: false` means issuance is currently FREE — `fee.display` is then only what it ' +
+        'WOULD cost if payment were switched back on, so do not ask the user to fund it and do not present ' +
+        'that amount as a charge. Gas is separate and can still block a free credential. When the field is ' +
+        'ABSENT the cost is unknown (an older MBI), and it is treated as chargeable — never report absent as free.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          credential: {
+            type: 'string',
+            description:
+              'Which credential to price: "verified_ai_birthcert" for the MyDigital-ID-verified AI Birthcert, ' +
+              'or a template id (did:zid:...) / known template name (e.g. "AI Birthcert") for a template-issued one.',
+          },
+          agentName: {
+            type: 'string',
+            description:
+              'Optional, and only used for "verified_ai_birthcert". The fee does not depend on it, so omit it ' +
+              'when pricing before the user has chosen a name — the wallet substitutes a placeholder purely to ' +
+              'satisfy the server. Never present that placeholder as the name that will be used.',
+          },
+        },
+        required: ['credential'],
+      },
+    },
+    {
+      name: 'check_ai_birthcert_verification',
+      description:
+        'Check the status of the most recently requested Verified AI Birthcert session (see ' +
+        'request_ai_birthcert_verification). FREE — spends nothing and starts nothing. Use this, not ' +
+        'request_ai_birthcert_verification, whenever the user asks where their verification link is, ' +
+        'what happened to their session, or whether their credential is ready. While the session is ' +
+        'still open the result carries `verificationUrl` (the same link issued at creation) and ' +
+        '`expiresAt` — give the user both, so they know how long it is good for. ' +
+        'Returns { status: "pending" } while the owner has not ' +
+        'yet completed MyDigital ID verification, or { status: "issued", vcId } once myid has minted ' +
+        'the credential — myid returns vcId ONLY when status is "issued", never otherwise. On ' +
+        '{ status: "issued" }, the wallet also fetches the credential from MBI, verifies it, and caches ' +
+        'it locally, returning it as `vc` — it is then also visible via wallet_status and usable by ' +
+        'prove_identity without any further call. If `cacheError` is present instead of `vc`, the ' +
+        'credential WAS issued successfully but could not be fetched/verified/cached yet (e.g. a ' +
+        'transient MBI error) — this is NOT the same as issuance failing, so do not retry ' +
+        'request_ai_birthcert_verification; call check_ai_birthcert_verification again instead. Returns ' +
+        '{ status: "no_session" } if request_ai_birthcert_verification has never been called.',
+      inputSchema: { type: 'object', properties: {} },
+    },
+    {
+      name: 'create_holder_account',
+      description:
+        'Create a new holder HSM account on Wallet BE (onboarding). ALWAYS check first: if an account ' +
+        'already exists for this session, this returns { alreadyExists: true, existing: {...} } WITHOUT ' +
+        'creating anything — ask the user whether to keep using the existing account or create a new one, ' +
+        'then call again with confirmNew:true only if they choose new. The wallet manages its own ' +
+        'credentials; you neither need nor can supply any. A freshly created account is saved to this ' +
+        "MCP's local account store and reused automatically on the next restart; an explicit " +
+        'ZETRIX_ADDRESS in the MCP config still overrides it.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          label: { type: 'string' },
+          purpose: { type: 'string' },
+          confirmNew: {
+            type: 'boolean',
+            description: 'Set true to mint a new account even though one already exists for this session — only after the user has confirmed they want a new one.',
+          },
+        },
+      },
+    },
+  ]
+}
+
+// --- wiring helpers (integration seam) ---
+
+type Payer = (accept: PayRequirement) => Promise<string>
+
+/**
+ * Builds every consumer of the two payment-cap maps in one place — the auto-pay closures AND the
+ * read-only map `credential_preflight` reports against — so no line in `main()` (istanbul-ignored,
+ * live-wiring-only) ever pairs a cap with a payer on its own. `pay_and_fetch` pays whatever an
+ * ARBITRARY url demands, so it must keep the refuse-all-by-default map; credential issuance pays a
+ * known issuer, so it gets the (possibly more permissive) issuance map, and preflight must report
+ * against that same map or it and the guard enforcing it could disagree.
+ *
+ * `makePay` is injected rather than called directly so this is testable without the live
+ * dependencies (contract queries, Wallet BE) `makePay` itself closes over in `main()`.
+ *
+ * See R2-M01: an earlier version of this (`resolvePaymentCapWiring`) pinned which map was which,
+ * but `main()` still separately wrote `makePay(payCaps)` / `makePay(payForCredentialCaps)` at the
+ * call site — an unguarded pairing a swap there could still flip with every test green. Folding
+ * the `makePay(...)` calls in here removes that call site entirely.
+ */
+export function buildPayers(
+  config: { maxPaymentAmount: Record<string, string>; credentialIssuanceCaps: Record<string, string> },
+  makePay: (caps: Record<string, string>) => Payer,
+): { pay: Payer; payForCredential: Payer; preflightCaps: Record<string, string> } {
+  return {
+    pay: makePay(config.maxPaymentAmount),
+    payForCredential: makePay(config.credentialIssuanceCaps),
+    preflightCaps: config.credentialIssuanceCaps,
+  }
+}
+
+/** MBI's accepts[] lack gasModel; x402 self-pay needs extra.gasModel = 'client'. */
+export function asPayRequest(accept: PayRequirement): X402PayRequest {
+  const extra = (accept.extra ?? {}) as Record<string, unknown>
+  const prepareEndpoint = extra.prepareEndpoint
+  const normalizedExtra =
+    typeof prepareEndpoint === 'string' && prepareEndpoint !== ''
+      ? { ...extra, prepareEndpoint: prepareBaseUrl(prepareEndpoint) }
+      : extra
+  return { ...(accept as Record<string, unknown>), extra: { gasModel: 'client', ...normalizedExtra } } as unknown as X402PayRequest
+}
+
+/* istanbul ignore next — live wiring, exercised by the 4.5 integration/manual smoke test. */
+async function main(): Promise<void> {
+  // Local store for a holder account created via create_holder_account or first-run
+  // auto-create — lets the account (address, DID, AND its password) survive a restart
+  // without requiring the user to hand-edit their MCP host's config file (whose path this
+  // stdio-spawned process can't reliably discover). Read BEFORE resolveStartupEnv so a
+  // stored value can fill in for an unset env var; see startup-env.ts for full precedence.
+  // The config file is read first because it can set the state directory, and the store must be
+  // read before resolveStartupEnv/loadConfig run — a stored account is one of their inputs. Env
+  // still wins over the file here, matching the precedence resolveStartupEnv applies.
+  const fileEnv = loadConfigFileEnv(process.argv, (p) => readFileSync(p, 'utf8'))
+  const stateDir = (
+    process.env.ZETRIX_WALLET_STATE_DIR ??
+    fileEnv.ZETRIX_WALLET_STATE_DIR ??
+    join(homedir(), '.agentic-wallet-mcp')
+  ).replace(/\/+$/, '')
+  const accountStore = createFsAccountStore(join(stateDir, 'account.json'))
+
+  // Backup path for a self-provisioned wallet, before any server setup: it needs no password,
+  // no network and no Wallet BE. Writing to stdout is safe here precisely because this branch
+  // never starts the MCP server, so there is no protocol stream to corrupt.
+  if (process.argv[2] === 'export-credentials') {
+    const { exitCode } = await exportCredentials({
+      getAccount: () => accountStore.get(),
+      isTty: Boolean(process.stdout.isTTY),
+      write: (s) => process.stdout.write(s),
+      writeErr: (s) => process.stderr.write(s),
+    })
+    process.exit(exitCode)
+  }
+
+  const storedAccount = process.env.ZETRIX_ADDRESS ? null : await accountStore.get()
+  const { env, passwordGenerated } = resolveStartupEnv({
+    processEnv: process.env,
+    storedAccount,
+    fileEnv,
+    generatePassword: generateHsmPassword,
+  })
+
+  const config = loadConfig(env)
+  const hsmPassword = config.hsmPassword
+
+  const be = new WalletBeClient(config.walletBeUrl)
+  const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+
+  // Scenario 1 (no ZETRIX_ADDRESS, no stored account either): create a new HSM account.
+  // Scenario 2 (ZETRIX_ADDRESS resolved from env or the local store): always derive + verify
+  // the DID from the account's actual public key — a supplied HOLDER_DID is never trusted
+  // blindly. See resolve-holder.ts.
+  const { zetrixAddress, holderDid, publicKeyHex, created, didMismatch, activated } = await resolveHolder(
+    {
+      createAccount: (password) => be.createAccount(password),
+      signMessage: (message, address, password) => be.signMessage(message, address, password),
+      checkActivationStatus: (address) => be.checkActivationStatus(address),
+      sleep,
+    },
+    { zetrixAddress: config.zetrixAddress, holderDid: config.holderDid, hsmPassword },
+  )
+  if (created) {
+    await accountStore.set({ zetrixAddress, holderDid, hsmPassword, createdAt: new Date().toISOString() })
+    process.stderr.write(
+      `agentic-wallet-mcp: no ZETRIX_ADDRESS was set — created a new HSM account and saved it to ` +
+        `~/.agentic-wallet-mcp/account.json; it will be reused automatically next run. ` +
+        `ZETRIX_ADDRESS=${zetrixAddress} (HOLDER_DID=${holderDid} is optional; it re-derives automatically).` +
+        (passwordGenerated
+          ? ` An HSM password was generated for this account — you never need to enter it, but it is the ` +
+            `ONLY thing that can authorize signing for this wallet. If this file is lost the account cannot ` +
+            `be recovered. Back it up with: npx agentic-wallet-mcp export-credentials\n`
+          : `\n`),
+    )
+  } else if (storedAccount && config.zetrixAddress === storedAccount.zetrixAddress) {
+    process.stderr.write(
+      `agentic-wallet-mcp: using the holder account saved in ~/.agentic-wallet-mcp/account.json ` +
+        `(ZETRIX_ADDRESS=${zetrixAddress}) — no ZETRIX_ADDRESS/HSM_PASSWORD was set in the MCP config.\n`,
+    )
+  }
+  if (didMismatch) {
+    process.stderr.write(
+      `agentic-wallet-mcp: configured HOLDER_DID=${config.holderDid} does not match the account's ` +
+        `actual public key — using the derived HOLDER_DID=${holderDid} instead. Update your MCP config.\n`,
+    )
+  }
+  if (created && !activated) {
+    process.stderr.write(
+      `agentic-wallet-mcp: the newly created HSM account (ZETRIX_ADDRESS=${zetrixAddress}) has not completed ` +
+        `on-chain activation yet — balance/on-chain calls for this address may fail until it does.\n`,
+    )
+  }
+
+  const signer = new WalletBeSigner(be, zetrixAddress, hsmPassword)
+  const walletBeSignerFn = (blob: string) => be.signBlob(blob, zetrixAddress, hsmPassword)
+
+  const walletCfg: WalletConfigData = { privateKey: '', address: zetrixAddress, network: config.network }
+  const node: ZetrixNodeConfig = { host: config.nodeHost, port: config.nodePort }
+
+  // Read-only on-chain contract query (same node + call path x402 uses for balance lookups),
+  // used to resolve an x402 asset's real token symbol from its ZTP20 `contractInfo`.
+  const sdk = new ZtxChainSDK({ host: config.nodeHost, port: config.nodePort })
+  const contractQuery: ContractQuery = (a) => sdk.contract.call(a)
+  const resolveSymbol = (asset: string) => resolveAssetSymbol(asset, contractQuery)
+
+  // Token balance lookup backing wallet_status({ token }). Reads go through the SDK directly
+  // rather than PaymentEngine.fetchAccountInfo/fetchZTP20Balance: those return `{ balance: '0' }`
+  // on any failure, which reports an unreachable node as an empty wallet. Here a failed read
+  // throws and surfaces as `query_failed`.
+  // parseNativeBalance handles the node omitting `balance` when it is zero — see its docblock.
+  const fetchNativeBalance = async (address: string): Promise<string> =>
+    parseNativeBalance(await sdk.account.getInfo(address))
+  const tokenBalanceDeps: TokenBalanceDeps = {
+    address: zetrixAddress,
+    fetchNativeBalance,
+    resolveTokenAddress: (symbol) => resolveTokenAddress(symbol, config.network) ?? null,
+    query: contractQuery,
+  }
+  const queryTokenBalance = (token: string): Promise<TokenBalanceResult> =>
+    runTokenBalanceQuery(tokenBalanceDeps, token)
+
+  // Read-only node metadata GET (getAccountMetaData) against the same node, used by
+  // subscribe_and_issue to check a template's declared attributes before paying — both to gate
+  // the agentDid auto-fill and to catch a missing required field. Fail-open (required-fields
+  // check)/fail-closed (agentDid auto-fill): any fetch/parse error resolves to null inside the
+  // client (see template-info-client).
+  const nodeBaseUrl = `https://${config.nodeHost}${config.nodePort ? `:${config.nodePort}` : ''}`
+  const nodeMetaQuery: NodeMetaQuery = (url) => fetch(url, { headers: { Accept: 'application/json' } }).then((r) => r.json())
+  const resolveTemplateFields = (templateId: string) =>
+    fetchTemplateFields(templateId, config.templateRegistryAddress, nodeBaseUrl, nodeMetaQuery)
+
+  // Local cache of issued VCs, so subscribe_and_issue can skip paying + re-issuing for a
+  // credential the holder already has. Scoped by network + holder so different identities
+  // or networks (e.g. testnet vs mainnet) never share a cache directory.
+  const cacheScope = createHash('sha256').update(`${config.network}:${zetrixAddress}`).digest('hex')
+  const vcCache = createFsVcCache(join(config.stateDir, 'vc-cache', cacheScope))
+
+  const mbi = new MbiClient(config.mbiBaseUrl)
+  // MBI's /vp/ext/* message-signing auth: sign the holder's own address (UTF-8), not a hex blob.
+  const messageSigner = (message: string) => be.signMessage(message, zetrixAddress, hsmPassword)
+
+  // Render a raw base-unit amount as "raw (human SYMBOL)" for error messages — resolving a ZTP20
+  // contract address to its real symbol/decimals, same as pay_and_fetch's success path already
+  // does for `asset`. Falls back to "raw SYMBOL"/"(unknown asset)" when resolution fails or the
+  // human conversion is identical to the raw string (e.g. decimals unknown), so a payment amount
+  // is never hidden behind a failed lookup.
+  const formatAssetAmount = async (asset: string, raw: string): Promise<string> => {
+    const { symbol, decimals } = await resolveAssetInfo(asset, contractQuery)
+    const label = symbol || '(unknown asset)'
+    const human = formatHumanAmount(raw, decimals)
+    return human === raw ? `${raw} ${label}` : `${raw} (${human} ${label})`
+  }
+
+  // x402 self-pay: build the X-PAYMENT header for a given accept — a hard ceiling on
+  // maxAmountRequired, enforced regardless of what the calling agent was told to do.
+  //
+  // Built per-caps rather than shared, because the two auto-pay surfaces do not deserve the same
+  // default. `pay_and_fetch` pays whatever an ARBITRARY url demands, so its default stays
+  // refuse-all on mainnet; credential issuance pays a known issuer for a known credential, so it
+  // may carry the credential-fee allowance there. An explicit MAX_PAYMENT_AMOUNT collapses the two
+  // back into one identical ceiling (see config.ts). Which map goes to which closure/consumer is
+  // decided entirely inside buildPayers below — see R2-M01 for why that pairing must not be
+  // written out again at this call site.
+  const makePay = (caps: Record<string, string>) => async (accept: PayRequirement): Promise<string> => {
+    const rawAsset = String(accept.asset ?? '')
+
+    try {
+      assertWithinPaymentCap(accept, caps)
+    } catch (err) {
+      // Rebuild the "exceeds cap" message with a resolved symbol + human amount instead of a raw
+      // contract address and a bare integer — without this, a ZTP20 cap rejection reads as
+      // "10000 <address>" (or gets mislabeled "ZTX" by whatever relays it), when it's actually a
+      // tiny fraction of a real token. Config-shaped failures (no cap entry, malformed input) have
+      // no `.detail` and no amount to humanize, so they pass through unchanged.
+      //
+      // Only the AMOUNTS are substituted — the explanation itself comes from formatCapRefusal, so
+      // the "which key applied" wording cannot drift from the raw-unit message the guard threw.
+      if (err instanceof PaymentCapError && err.detail) {
+        const { asset, requiredRaw, capRaw } = err.detail
+        throw new PaymentCapError(
+          formatCapRefusal(
+            err.detail,
+            await formatAssetAmount(asset, requiredRaw),
+            await formatAssetAmount(asset, capRaw),
+          ),
+          err.detail,
+        )
+      }
+      throw err
+    }
+
+    // Stopgap for a bug in x402-zetrix-client: its ZTX-gas balance check for a ZTP20
+    // payment runs AFTER an on-chain fee-estimation call, so a wallet holding the resource token
+    // but zero ZTX hits an opaque node error from that estimation instead of a clean
+    // insufficient-funds message (surfaces as a raw MCP -32603, not a readable result). Checking
+    // gas balance here — before ever calling PaymentEngine.pay — catches exactly that common case
+    // ("topped up the token, forgot gas") with our own clear message. A low-but-nonzero gas
+    // balance still reaches PaymentEngine.pay unchanged; its (later, but working) check catches that.
+    if (needsNativeGasCheck(accept)) {
+      const gasBalance = await fetchNativeBalance(zetrixAddress).catch(() => null)
+      if (gasBalance === '0') {
+        const { symbol } = await resolveAssetInfo(rawAsset, contractQuery)
+        throw new PaymentReadinessError(
+          `this wallet has 0 ZTX to pay network gas — the ${symbol || rawAsset} balance is separate from ` +
+            `gas, and every transaction costs a small amount of ZTX regardless of which token is being ` +
+            `paid. Send some ZTX to ${zetrixAddress} first, then retry.`,
+          { asset: 'ZTX', required: 'unknown', available: '0', reason: 'gas' },
+        )
+      }
+    }
+
+    try {
+      return await payWithReadinessCheck(
+        rawAsset,
+        () => PaymentEngine.pay(asPayRequest(accept), walletCfg, node, {}, walletBeSignerFn),
+        activated,
+      )
+    } catch (err) {
+      // Same symbol/decimal enrichment for an insufficient-balance rejection — "gas" always means
+      // ZTX regardless of what asset was being paid; "resource_payment" means the paid asset itself.
+      if (err instanceof PaymentReadinessError && err.shortfall.reason !== 'not_activated') {
+        const { asset, required, available, reason } = err.shortfall
+        const label = reason === 'gas' ? 'ZTX for gas' : (await resolveAssetInfo(asset, contractQuery)).symbol || asset
+        throw new PaymentReadinessError(
+          `insufficient ${label} — required ${await formatAssetAmount(asset, required)}, ` +
+            `available ${await formatAssetAmount(asset, available)}`,
+          err.shortfall,
+        )
+      }
+      throw err
+    }
+  }
+
+  // `pay` (pay_and_fetch, arbitrary URLs — refuse-all by default on mainnet), `payForCredential`
+  // (a known issuer — carries the credential-fee allowance on both networks) and `preflightCaps`
+  // (the read-only map credential_preflight reports against) all come from one call so nothing
+  // else in main() pairs a cap map with what consumes it.
+  const { pay, payForCredential, preflightCaps } = buildPayers(config, makePay)
+
+  // AI Birthcert verification session (myid SSIVC) — persisted so check_ai_birthcert_verification
+  // survives a restart. As of 2026-08-17 the session-create call needs no bearer token — it's
+  // gated by x402 instead (see docs/verified-birthcert-vc/SPEC.md §5.0), so payment readiness/cap
+  // checks (this same `pay` closure) are what gate spending. Wiring itself is gated on
+  // `config.ssivcBaseUrl` being set: it's undefined on mainnet unless explicitly overridden
+  // (APP-M04 — the mainnet host was never actually confirmed reachable), so the feature reports
+  // itself as not configured there rather than being wired against an unverified endpoint.
+  const verifyAiBirthcert = config.ssivcBaseUrl
+    ? (() => {
+        const ssivcSessionStore = createFsSsivcSessionStore(join(config.stateDir, 'ssivc-session.json'))
+        // R2-M01: a DIRECTORY, not a single file — one quarantine file per vcId, so a later
+        // download can never overwrite an earlier, still-needed preserved credential.
+        const downloadQuarantine = createFsDownloadQuarantineStore(join(config.stateDir, 'ssivc-download-quarantine'))
+        const ssivc = new SsivcClient(config.ssivcBaseUrl!)
+        const verifyAiBirthcertDeps = {
+          ssivc,
+          signHexBlob: walletBeSignerFn,
+          messageSigner,
+          mbi,
+          pay: payForCredential,
+          publicKeyHex,
+          address: zetrixAddress,
+          holderDid,
+          now: () => new Date(),
+          sessionStore: ssivcSessionStore,
+          verifiedTemplateId: config.aiBirthcertVerifiedTemplateId,
+          cache: vcCache,
+          quarantine: downloadQuarantine,
+          gasPreference: config.gasPreference,
+          maxSettlementAttempts: config.maxSettlementAttempts,
+          formatAssetAmount,
+        }
+        return {
+          request: (input: Parameters<typeof requestAiBirthcertVerification>[1]) => requestAiBirthcertVerification(verifyAiBirthcertDeps, input),
+          check: () => checkAiBirthcertVerification(verifyAiBirthcertDeps),
+        }
+      })()
+    : undefined
+
+  // pay_and_fetch: fetch → on 402, pay → retry.
+  const payer: PayFetch = async (req) => {
+    const init: RequestInit = { method: req.method ?? 'GET', headers: req.headers, body: req.body }
+    const res = await fetch(req.url, init)
+    if (res.status !== 402) {
+      return { status: res.status, body: await res.text(), paymentMade: false, amountPaid: '', amountPaidHuman: '', asset: '' }
+    }
+    const parsed = (await res.json()) as { accepts?: PayRequirement[] }
+    const accept = parsed.accepts?.[0]
+    if (!accept) throw new Error('pay_and_fetch: 402 had no accepts[]')
+    let xPayment: string
+    try {
+      xPayment = await pay(accept)
+    } catch (err) {
+      if (err instanceof PaymentReadinessError) {
+        return { status: 402, body: '', paymentMade: false, amountPaid: '', amountPaidHuman: '', asset: '', insufficientFunds: err.shortfall }
+      }
+      throw err
+    }
+    const retry = await fetch(req.url, { ...init, headers: { ...(req.headers ?? {}), 'x-payment': xPayment } })
+    // Report the real token symbol (resolved from the ZTP20 contract's contractInfo),
+    // not the raw contract address the 402 challenge carries in `asset`.
+    const asset = await resolveSymbol(String(accept.asset ?? ''))
+    return {
+      status: retry.status, body: await retry.text(), paymentMade: true,
+      amountPaid: String(accept.maxAmountRequired ?? ''), amountPaidHuman: '', asset,
+    }
+  }
+
+  // subscribe: holder-sign the VC payload via Wallet BE.
+  // The `data` field MBI receives is the raw canonical JSON string.
+  // subscribeAndIssue computes the exact bytes MBI verifies — HexFormat.hexStringToBytes(data), a
+  // lenient decode of the raw JSON (see src/zetrix-hex.ts) — and passes their canonical hex as the
+  // `blob`. Wallet BE `/sign-blob` decodes that hex and Ed25519-signs those bytes. Forward verbatim.
+  const subscribeSign = (blob: string) => be.signBlob(blob, zetrixAddress, hsmPassword)
+
+  // The VC's *issuer* BBS+/Ed25519 keys, for the OID4VP submit body — see mbi-vp-adapter.ts.
+  const zidResolver = new ZidResolverClient(config.zidResolverBaseUrl)
+  const resolveIssuerKeys = (vc: unknown) => resolveIssuerProofKeys(vc, zidResolver)
+
+  // Per-request X401Wallet bound to the client's held VC. oid4vpBaseUrl is an optional
+  // override — when unset, the x401 SDK derives it from `network` itself.
+  // OID4VP submit wallet-auth (verifier's WalletAuthenticationFilter): the holder signs their
+  // own address (UTF-8) — same message-signing scheme as MBI /vp/ext/*. Sent as
+  // X-Wallet-Public-Key / X-Wallet-Signed-Data on POST /v1/presentation/submit.
+  const submitAuth = async () => {
+    const { signBlob, publicKey } = await messageSigner(zetrixAddress)
+    return { publicKey, signedData: signBlob }
+  }
+
+  const makeWallet = (present: VcPresentInput): X401Wallet =>
+    new X401Wallet(
+      { oid4vpBaseUrl: config.oid4vpBaseUrl, network: config.network as ZetrixNetwork },
+      { signer, vc: new MbiVpAdapter(mbi, walletBeSignerFn, messageSigner, zetrixAddress, resolveIssuerKeys, present), submitAuth },
+    )
+
+  const deps: ToolDeps = {
+    config: { holderDid, zetrixAddress, network: config.network },
+    makeWallet,
+    payer,
+    subscribeDeps: { mbi, sign: subscribeSign, pay: payForCredential, resolveSymbol, holderDid, resolveTemplateFields, cache: vcCache },
+    queryContract: (input: ContractQueryInput): Promise<ContractQueryResult> => runContractQuery(input, contractQuery),
+    queryTokenBalance,
+    // Read-only, for credential_preflight's cap headroom. Preflight only ever prices credentials,
+    // so it must report against the issuance cap — the same map payForCredential enforces, or
+    // preflight and the guard would disagree about what is permitted.
+    paymentCaps: preflightCaps,
+    // The session password is bound here, in the wiring, so it never crosses into the tool
+    // layer — create_holder_account has no password parameter for a model to be asked for.
+    createAccount: (label, purpose) => be.createAccount(hsmPassword, label, purpose),
+    saveAccount: (account) => accountStore.set({ ...account, hsmPassword, createdAt: new Date().toISOString() }),
+    checkActivationStatus: (address: string) => be.checkActivationStatus(address),
+    sleep,
+    cache: vcCache,
+    verifyAiBirthcert,
+  }
+  const tools = createTools(deps) as unknown as Record<string, (a: unknown) => Promise<unknown> | unknown>
+
+  const server = new Server({ name: 'agentic-wallet-mcp', version: packageVersion }, { capabilities: { tools: {} } })
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: buildToolList() }))
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params
+    const fn = tools[name]
+    if (!fn) throw new Error(`Unknown tool: ${name}`)
+    try {
+      const result = await fn((args as unknown) ?? {})
+      return { content: [{ type: 'text', text: JSON.stringify(result) }] }
+    } catch (err) {
+      // Wrapped SDK errors (e.g. VP_BUILD_FAILED) carry the real MBI/Wallet-BE failure on
+      // `.cause`; the MCP transport keeps only the top message. Flatten the whole chain so
+      // the caller sees the actionable root cause instead of a generic wrapper message.
+      const chain: string[] = []
+      let e: unknown = err
+      while (e instanceof Error && chain.length < 8) {
+        const code = (e as { code?: string }).code
+        chain.push(code ? `${code}: ${e.message}` : e.message)
+        e = (e as { cause?: unknown }).cause
+      }
+      throw new Error(chain.length ? chain.join(' <- ') : String(err))
+    }
+  })
+
+  await server.connect(new StdioServerTransport())
+}
+
+if (process.env.NODE_ENV !== 'test') {
+  main().catch((err: Error) => {
+    process.stderr.write(`agentic-wallet-mcp: fatal — ${err.message}\n`)
+    process.exit(1)
+  })
+}
