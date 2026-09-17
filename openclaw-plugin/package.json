@@ -1,6 +1,6 @@
 {
   "name": "zetrix-agentic-wallet",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "OpenClaw plugin: Zetrix identity, verifiable-credential and pay-per-use wallet tools for agents",
   "license": "MIT",
   "author": "MyEG Services Berhad",

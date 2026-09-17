@@ -2,7 +2,7 @@
   "id": "zetrix-agentic-wallet",
   "name": "Zetrix Agentic Wallet",
   "description": "Zetrix identity, verifiable-credential and pay-per-use wallet tools for agents.",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "activation": {
     "onStartup": true
   },
