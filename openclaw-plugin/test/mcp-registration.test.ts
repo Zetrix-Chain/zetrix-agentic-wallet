@@ -250,3 +250,68 @@ describe('security fixes', () => {
     expect(marker.serverName).toBe(SERVER_NAME)
   })
 })
+
+/**
+ * Plugin <=0.3.2 wrote `MAX_PAYMENT_AMOUNT: {"*":"0"}` into the entry and declared the same value as
+ * a manifest default, so OpenClaw materialised it into subscriber config. Both were dropped in
+ * 0.3.3, but neither goes away on upgrade: the stored value keeps arriving as real config, and the
+ * stale entry survives because its fingerprint no longer matches. The wallet then reads an explicit
+ * refuse-all cap and its own network-aware default never applies — a 0 JMYR limit nobody chose,
+ * unfixable by a hosted subscriber who cannot edit openclaw.json. Found on a live gateway.
+ */
+describe('legacy refuse-all cap (0.3.2 leftovers)', () => {
+  const legacy = { '*': '0' }
+
+  it('does not forward the legacy refuse-all cap, so the wallet default applies', () => {
+    const e = buildServerEntry(BUNDLE, { network: 'zetrix:testnet', maxPaymentAmount: legacy }, STATE)
+    expect('MAX_PAYMENT_AMOUNT' in e.env).toBe(false)
+  })
+
+  it('does not forward an empty cap either — it refuses everything just as silently', () => {
+    const e = buildServerEntry(BUNDLE, { maxPaymentAmount: {} }, STATE)
+    expect('MAX_PAYMENT_AMOUNT' in e.env).toBe(false)
+  })
+
+  it('still forwards a refuse-all cap that names an asset — that one was written deliberately', () => {
+    const e = buildServerEntry(BUNDLE, { maxPaymentAmount: { '*': '0', JMYR: '0' } }, STATE)
+    expect(e.env.MAX_PAYMENT_AMOUNT).toBe('{"*":"0","JMYR":"0"}')
+  })
+
+  it('repairs a stale entry of ours that still carries the legacy cap, even though we no longer own it', () => {
+    const stale = {
+      command: 'node',
+      args: [BUNDLE],
+      env: { ZETRIX_NETWORK: 'zetrix:testnet', MAX_PAYMENT_AMOUNT: '{"*":"0"}', ZETRIX_WALLET_STATE_DIR: STATE },
+    }
+    const { files, deps, logs } = fakeFs({ '/cfg/openclaw.json': JSON.stringify({ mcp: { servers: { [SERVER_NAME]: stale } } }) })
+    const clean = buildServerEntry(BUNDLE, {}, STATE)
+    registerServer(deps, clean)
+    const written = JSON.parse(files['/cfg/openclaw.json']).mcp.servers[SERVER_NAME]
+    expect('MAX_PAYMENT_AMOUNT' in written.env).toBe(false)
+    expect(files['/plugin/.mcp-registration.json']).toBeDefined()
+    expect(logs.join(' ')).toMatch(/spending limit/i)
+  })
+
+  it('leaves a stale entry alone when its cap is a real limit the subscriber chose', () => {
+    const theirs = {
+      command: 'node',
+      args: [BUNDLE],
+      env: { ZETRIX_NETWORK: 'zetrix:testnet', MAX_PAYMENT_AMOUNT: '{"*":"5000000"}', ZETRIX_WALLET_STATE_DIR: STATE },
+    }
+    const { files, deps } = fakeFs({ '/cfg/openclaw.json': JSON.stringify({ mcp: { servers: { [SERVER_NAME]: theirs } } }) })
+    registerServer(deps, buildServerEntry(BUNDLE, {}, STATE))
+    expect(JSON.parse(files['/cfg/openclaw.json']).mcp.servers[SERVER_NAME]).toEqual(theirs)
+  })
+
+  it('leaves an entry pointing at someone else\u2019s wallet alone, legacy cap or not', () => {
+    const theirs = {
+      command: 'node',
+      args: ['/their/own/wallet.cjs'],
+      env: { MAX_PAYMENT_AMOUNT: '{"*":"0"}' },
+    }
+    const { files, deps, logs } = fakeFs({ '/cfg/openclaw.json': JSON.stringify({ mcp: { servers: { [SERVER_NAME]: theirs } } }) })
+    registerServer(deps, buildServerEntry(BUNDLE, {}, STATE))
+    expect(JSON.parse(files['/cfg/openclaw.json']).mcp.servers[SERVER_NAME]).toEqual(theirs)
+    expect(logs.join(' ')).toMatch(/already present/i)
+  })
+})

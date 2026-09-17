@@ -8,8 +8,8 @@ any configuration.
 
 - The wallet **creates its own account and password**. You never type either. That also means the
   credentials exist only on this machine — [back them up](#backing-up-your-wallet).
-- It **will not pay for anything** until you [set a spending limit](#setting-your-spending-limit).
-  That is deliberate, not a fault.
+- Out of the box it will pay **exactly one thing**: the AI Birthcert credential fee of 1 JMYR, per
+  payment. Anything else is declined until you [set a spending limit](#setting-your-spending-limit).
 
 ---
 
@@ -71,8 +71,18 @@ The three paid actions are refused until you set a limit.
 
 ## Setting your spending limit
 
-The wallet starts at **zero** — every payment is declined. This is on purpose: a wallet that could
-spend whatever a website asked for, straight out of the box, is not a safe default.
+Leave this empty and the wallet uses its own default: it allows **exactly the AI Birthcert fee of
+1 JMYR per payment**, and declines everything else. That is enough to get your first credential
+without configuring anything, and not enough for a wallet that could spend whatever a website asked
+for straight out of the box — which is not a safe default. (On mainnet the allowance covers credential
+issuance only; paying an arbitrary URL still needs a limit you set yourself.)
+
+Set a limit here when you want the wallet to pay for more than that.
+
+> **Upgrading from an older version?** Versions before 0.3.3 shipped a "refuse everything" limit and
+> asked you to replace it. If you still have that value — a limit of `{"*":"0"}` and nothing else —
+> the plugin now clears it for you on startup and falls back to the default above. You do not need to
+> do anything. To genuinely refuse every payment, name a token as well, e.g. `{"*":"0","JMYR":"0"}`.
 
 ### Through the dashboard
 

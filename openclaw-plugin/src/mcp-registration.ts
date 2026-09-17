@@ -60,6 +60,28 @@ interface OwnershipRecord {
 }
 
 /**
+ * Is this cap the refuse-all value plugin <=0.3.2 planted, rather than a limit anyone chose?
+ *
+ * That version defaulted the cap to `{"*":"0"}` in two places — the value written into the entry, and
+ * a `configSchema` default OpenClaw materialises into subscriber config (SPIKE-0.4-FINDINGS.md §2.1).
+ * Both were dropped in 0.3.3, but an upgrade removes neither from a gateway that already has them, and
+ * an explicit cap — even one that permits nothing — shadows the wallet's own network-aware default.
+ * The result was a 0 JMYR limit nobody set, on the current plugin, with no way for a hosted subscriber
+ * to clear it. Observed on a live gateway, September 2026.
+ *
+ * An empty object counts too: it is "configured" as far as the wallet is concerned, and refuses
+ * everything for the same reason.
+ *
+ * A refuse-all cap that NAMES an asset (`{"*":"0","JMYR":"0"}`) is still forwarded — nothing ever
+ * generated that shape, so it can only have been typed deliberately. That is how to express "refuse
+ * everything" now that the bare value is read as a leftover.
+ */
+function isLegacyRefuseAllCap(caps: Record<string, string>): boolean {
+  const keys = Object.keys(caps)
+  return keys.length === 0 || (keys.length === 1 && keys[0] === '*' && caps['*'] === '0')
+}
+
+/**
  * Build the `mcp.servers` entry.
  *
  * `stateDir` must be OUTSIDE the plugin directory. The wallet stores its holder identity and its
@@ -87,7 +109,9 @@ export function buildServerEntry(walletBundlePath: string, config: PluginConfig,
       // The manifest declares no `default` for the same reason: OpenClaw materialises configSchema
       // defaults into plugin config with no operator action (SPIKE-0.4-FINDINGS.md §2.1), so a
       // declared default would arrive here as a real value and never reach this branch.
-      ...(config.maxPaymentAmount ? { MAX_PAYMENT_AMOUNT: JSON.stringify(config.maxPaymentAmount) } : {}),
+      ...(config.maxPaymentAmount && !isLegacyRefuseAllCap(config.maxPaymentAmount)
+        ? { MAX_PAYMENT_AMOUNT: JSON.stringify(config.maxPaymentAmount) }
+        : {}),
       ZETRIX_WALLET_STATE_DIR: stateDir,
       ...(config.zetrixAddress ? { ZETRIX_ADDRESS: config.zetrixAddress } : {}),
     },
@@ -153,6 +177,26 @@ function weOwnIt(deps: RegistrationDeps, existing: McpServerEntry | undefined): 
   return JSON.stringify(record.entry) === JSON.stringify(existing)
 }
 
+/**
+ * Is `existing` an entry THIS plugin wrote in an older version, still carrying the legacy refuse-all
+ * cap? Both halves matter: the entry must launch the wallet runtime we manage (so it cannot be a
+ * subscriber's own server that happens to share the name), and its cap must be the exact value
+ * `isLegacyRefuseAllCap` describes. A real limit is left alone whatever its fingerprint says — a
+ * subscriber's ceiling is theirs, and silently raising one is the failure direction that matters.
+ */
+function carriesLegacyCap(existing: McpServerEntry, ours: McpServerEntry): boolean {
+  if (existing.command !== ours.command || existing.args?.[0] !== ours.args[0]) return false
+  const raw = existing.env?.MAX_PAYMENT_AMOUNT
+  if (typeof raw !== 'string') return false
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return false
+    return isLegacyRefuseAllCap(parsed as Record<string, string>)
+  } catch {
+    return false
+  }
+}
+
 function writeOwnership(deps: RegistrationDeps, entry: McpServerEntry): void {
   const record: OwnershipRecord = {
     serverName: SERVER_NAME,
@@ -178,11 +222,22 @@ export function registerServer(deps: RegistrationDeps, entry: McpServerEntry): v
 
   const existing = config.mcp?.servers?.[SERVER_NAME] as McpServerEntry | undefined
   if (existing && !weOwnIt(deps, existing)) {
+    if (!carriesLegacyCap(existing, entry)) {
+      deps.log(
+        `mcp.servers["${SERVER_NAME}"] is already present and was not created by this plugin (or was ` +
+          `changed since) — leaving it untouched. Remove it if you want the plugin to manage the server.`,
+      )
+      return
+    }
+    // The one exception to "never touch an entry we do not own". This entry IS ours — it launches the
+    // wallet runtime this plugin installs — and the only reason ownership stopped matching is that an
+    // older version wrote it with a different fingerprint. Declining to touch it is exactly what left
+    // upgraded subscribers pinned to a 0 JMYR limit, unfixable on a gateway they cannot shell into.
     deps.log(
-      `mcp.servers["${SERVER_NAME}"] is already present and was not created by this plugin (or was ` +
-        `changed since) — leaving it untouched. Remove it if you want the plugin to manage the server.`,
+      `mcp.servers["${SERVER_NAME}"] still carried the refuse-all spending limit an older version of ` +
+        `this plugin wrote. Removing it so the wallet's own default applies — set a limit in plugin ` +
+        `config if you want a different one.`,
     )
-    return
   }
 
   // Nothing to do when the live entry is already exactly what we would write. This is the common case

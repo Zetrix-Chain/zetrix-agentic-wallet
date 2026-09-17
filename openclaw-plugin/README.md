@@ -36,11 +36,14 @@ Set by the subscriber, through the gateway's plugin config UI or `plugins.entrie
 | Field | Default | Meaning |
 |---|---|---|
 | `network` | `zetrix:testnet` | Mainnet spends real funds |
-| `maxPaymentAmount` | `{"*":"0"}` | Per-asset ceiling in raw units. **Refuses every payment until set** |
+| `maxPaymentAmount` | *(unset)* | Per-asset ceiling in raw units. Unset means the wallet's own default: the 1 JMYR credential fee, nothing else |
 | `zetrixAddress` | *(unset)* | Pin an existing holder account instead of creating one |
 
-These defaults apply with no action from the subscriber, so a fresh install is safe but **cannot pay**
-until a cap is set. Changing config takes effect without a gateway restart:
+These defaults apply with no action from the subscriber, so a fresh install can obtain its first
+credential and nothing more. A bare `{"*":"0"}` — the refuse-all value plugin ≤0.3.2 planted, in config
+and in the entry alike — is treated as a leftover and ignored, because leaving it in force pinned
+upgraded subscribers to a 0 JMYR limit they never chose. Name an asset (`{"*":"0","JMYR":"0"}`) to
+refuse everything deliberately. Changing config takes effect without a gateway restart:
 
 ```bash
 openclaw config set plugins.entries.zetrix-agentic-wallet.config.maxPaymentAmount \
