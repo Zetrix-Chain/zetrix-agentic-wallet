@@ -167,6 +167,44 @@ describe('createTools', () => {
     expect(sentData[0].templateId).toBe('did:zid:t')
   })
 
+  it('subscribe_and_issue includes the Basic Birthcert passDesignId (testnet) when issuing the birthcert alias', async () => {
+    const { deps, mbi } = makeDeps()
+    await createTools(deps).subscribe_and_issue({ templateId: 'AI Birthcert', attributes: { name: 'x' } })
+    const sentData = JSON.parse((mbi.applyChallenge.mock.calls[0][0] as { data: string }).data)
+    expect(sentData[0].passDesignId).toBe('did:zid:992e1e18985ba36a09ba0fbfeb601ddeb449f5e4e882ed69d0d620085f399818')
+  })
+
+  it('subscribe_and_issue includes the Basic Birthcert passDesignId (mainnet) when configured for mainnet', async () => {
+    const { deps, mbi } = makeDeps()
+    deps.config.network = 'zetrix:mainnet'
+    await createTools(deps).subscribe_and_issue({ templateId: 'birth cert', attributes: { name: 'x' } })
+    const sentData = JSON.parse((mbi.applyChallenge.mock.calls[0][0] as { data: string }).data)
+    expect(sentData[0].passDesignId).toBe('did:zid:915955cb71c6fd2a256d04344f57381084903cb6a85a1c9ddb71c746f08932ab')
+  })
+
+  it('subscribe_and_issue omits passDesignId entirely for a template that is not the Basic Birthcert', async () => {
+    const { deps, mbi } = makeDeps()
+    await createTools(deps).subscribe_and_issue({ templateId: 'did:zid:t', attributes: { name: 'x' } })
+    const sentData = JSON.parse((mbi.applyChallenge.mock.calls[0][0] as { data: string }).data)
+    expect(sentData[0]).not.toHaveProperty('passDesignId')
+  })
+
+  // Code review (APP-L02): `{ ...deps.subscribeDeps, ...(passDesignId ? { passDesignId } : {}) }`
+  // can only ADD the key, never clear it — an inherited passDesignId already sitting on
+  // subscribeDeps would leak into an unrelated template's signed data, contradicting the comment's
+  // "never a wallet-wide default" guarantee. Not live in the shipped wiring (index.ts sets no base
+  // value), but the object must be built so an unresolved id explicitly clears one.
+  it('subscribe_and_issue does not let an inherited subscribeDeps.passDesignId leak into an unrelated template', async () => {
+    const { deps, mbi } = makeDeps()
+    const out = await createTools({
+      ...deps,
+      subscribeDeps: { ...deps.subscribeDeps, passDesignId: 'did:zid:stale-inherited-pass-design' } as never,
+    }).subscribe_and_issue({ templateId: 'did:zid:t', attributes: { name: 'x' } })
+    const sentData = JSON.parse((mbi.applyChallenge.mock.calls[0][0] as { data: string }).data)
+    expect(sentData[0]).not.toHaveProperty('passDesignId')
+    expect(out.issued).toBe(true)
+  })
+
   it('subscribe_and_issue derives the birthcert id attribute from agentUsername when id is not supplied', async () => {
     const { deps, mbi } = makeDeps()
     await createTools(deps).subscribe_and_issue({ templateId: 'AI Birthcert', attributes: { agentUsername: 'agent-007' } })

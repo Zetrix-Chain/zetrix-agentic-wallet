@@ -37,6 +37,15 @@ export interface DownloadQuarantineStore {
   set(entry: QuarantinedDownload): Promise<void>
   /** The concrete on-disk path a given vcId's raw response lives at — surfaced in operator-facing error messages. */
   filePathFor(vcId: string): string
+  /**
+   * Serializes callers racing on the same vcId's check-then-fetch (APP-L03): both the verified and
+   * basic-birthcert paths do `get` then, on a miss, download-and-`set` — two concurrent calls for
+   * the same vcId can both miss and both hit MBI's one-shot `/v1/vc/ext/download`, and one gets a
+   * 404. `withLock` runs `fn` exclusively per vcId within this process; a caller still does its own
+   * `get` first inside `fn` so the second (now-serialized) caller sees the first one's `set`.
+   * Cross-process races are unaffected — this is one process's in-memory queue, not a file lock.
+   */
+  withLock<T>(vcId: string, fn: () => Promise<T>): Promise<T>
 }
 
 /** sha256 of the vcId — see the module docstring on why the raw vcId can't be a filename. */
@@ -52,8 +61,24 @@ function isQuarantinedDownloadShape(value: unknown): value is QuarantinedDownloa
 
 export function createFsDownloadQuarantineStore(baseDir: string): DownloadQuarantineStore {
   const pathFor = (vcId: string) => join(baseDir, quarantineFileName(vcId))
+  // One chain per vcId, not a single global chain — locking on an unrelated vcId must not make
+  // one agent's download wait behind another's.
+  const locks = new Map<string, Promise<unknown>>()
+
   return {
     filePathFor: pathFor,
+
+    withLock(vcId, fn) {
+      const previous = locks.get(vcId) ?? Promise.resolve()
+      const next = previous.then(fn, fn)
+      // Swallow so a rejection doesn't poison the chain for the next caller queued on this vcId —
+      // the caller of withLock still observes the real rejection via the returned promise.
+      locks.set(
+        vcId,
+        next.catch(() => undefined),
+      )
+      return next
+    },
 
     async get(vcId) {
       try {

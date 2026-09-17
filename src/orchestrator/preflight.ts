@@ -167,7 +167,7 @@ export async function credentialPreflight(deps: PreflightDeps, input: PreflightI
   // The cap limits what may be SPENT, so it cannot stand in the way of spending nothing. Still
   // described in the result (headroom is worth seeing) — it just raises no blocker when free.
   const cap = describePaymentCap(asset, requiredRaw, deps.caps)
-  if (!cap.wouldPass && !isFree) blockers.push(renderCapBlocker(cap, requiredRaw))
+  if (!cap.wouldPass && !isFree) blockers.push(renderCapBlocker(cap, requiredRaw, feeBalance))
 
   return {
     credential: input.credential,
@@ -197,14 +197,24 @@ function renderAmount(raw: string, balance: TokenBalanceResult): string {
   return `${whole}${frac ? `.${frac}` : ''} ${balance.token}`
 }
 
-function renderCapBlocker(cap: PaymentCapDescription, requiredRaw: string): string {
+/**
+ * `feeBalance` came from a query FOR `cap.asset` (`requiredRaw`'s asset), so its `decimals`/`token`
+ * apply equally to `cap.capRaw` — same asset, just a different raw amount. Rendering both through
+ * it (like the balance blocker above) is what keeps this message consistent with the rest of
+ * preflight's output — reported live: a caller relaying "the fee is 1 JMYR, wallet holds 0 JMYR"
+ * alongside "issuance requires 1,000,000" (this function, unrendered) had no way to tell that
+ * second number was already the same unit, not a distinct raw count needing its own conversion.
+ */
+function renderCapBlocker(cap: PaymentCapDescription, requiredRaw: string, feeBalance: TokenBalanceResult): string {
+  const requiredHuman = renderAmount(requiredRaw, feeBalance)
   if (cap.capRaw === null) {
     return `No spending limit applies to ${cap.asset}, and limits are configured — so this payment would be refused. Set a limit keyed by "${cap.asset}".`
   }
+  const capHuman = renderAmount(cap.capRaw, feeBalance)
   const misKeyed = cap.matchedKey !== cap.asset
   return misKeyed
-    ? `The spending limit that applies is ${cap.capRaw} (from the "*" fallback — no limit is set for ${cap.asset}), and this needs ${requiredRaw}.`
-    : `The spending limit for ${cap.asset} is ${cap.capRaw}, and this needs ${requiredRaw}.`
+    ? `The spending limit that applies is ${capHuman} (from the "*" fallback — no limit is set for ${cap.asset}), and this needs ${requiredHuman}.`
+    : `The spending limit for ${cap.asset} is ${capHuman}, and this needs ${requiredHuman}.`
 }
 
 /**

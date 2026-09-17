@@ -11,6 +11,7 @@
 import { Buffer } from 'node:buffer'
 import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import packageJson from '../package.json' with { type: 'json' }
@@ -48,6 +49,7 @@ import { generateHsmPassword } from './hsm-password.js'
 import { exportCredentials } from './export-credentials.js'
 import { createFsVcCache } from './clients/vc-cache.js'
 import { createFsAccountStore } from './clients/account-store.js'
+import { buildToolContent } from './tool-result.js'
 import { SsivcClient } from './clients/ssivc-client.js'
 import { createFsSsivcSessionStore } from './clients/ssivc-session-store.js'
 import { createFsDownloadQuarantineStore } from './clients/ssivc-download-quarantine-store.js'
@@ -631,6 +633,19 @@ async function main(): Promise<void> {
   // else in main() pairs a cap map with what consumes it.
   const { pay, payForCredential, preflightCaps } = buildPayers(config, makePay)
 
+  // MBI's pass-design PNG(s) for an issued VC (extraData.vcPassBase64 from /v1/vc/ext/download).
+  // Shared across both the Verified AI Birthcert flow and basic subscribe_and_issue — the download
+  // is one-shot per vcId (SEC-11/APP-C01, see ssivc-download-quarantine-store.ts), so both paths
+  // must guard against re-downloading the same vcId through the same quarantine store.
+  // R2-M01: a DIRECTORY, not a single file — one quarantine file per vcId, so a later download can
+  // never overwrite an earlier, still-needed preserved credential.
+  const downloadQuarantine = createFsDownloadQuarantineStore(join(config.stateDir, 'ssivc-download-quarantine'))
+  const passImagesDir = join(config.stateDir, 'vc-pass-images')
+  const mbiAuth = async () => {
+    const { signBlob, publicKey } = await messageSigner(zetrixAddress)
+    return { signedData: signBlob, publicKey }
+  }
+
   // AI Birthcert verification session (myid SSIVC) — persisted so check_ai_birthcert_verification
   // survives a restart. As of 2026-08-17 the session-create call needs no bearer token — it's
   // gated by x402 instead (see docs/verified-birthcert-vc/SPEC.md §5.0), so payment readiness/cap
@@ -641,9 +656,6 @@ async function main(): Promise<void> {
   const verifyAiBirthcert = config.ssivcBaseUrl
     ? (() => {
         const ssivcSessionStore = createFsSsivcSessionStore(join(config.stateDir, 'ssivc-session.json'))
-        // R2-M01: a DIRECTORY, not a single file — one quarantine file per vcId, so a later
-        // download can never overwrite an earlier, still-needed preserved credential.
-        const downloadQuarantine = createFsDownloadQuarantineStore(join(config.stateDir, 'ssivc-download-quarantine'))
         const ssivc = new SsivcClient(config.ssivcBaseUrl!)
         const verifyAiBirthcertDeps = {
           ssivc,
@@ -662,6 +674,7 @@ async function main(): Promise<void> {
           gasPreference: config.gasPreference,
           maxSettlementAttempts: config.maxSettlementAttempts,
           formatAssetAmount,
+          passImagesDir,
         }
         return {
           request: (input: Parameters<typeof requestAiBirthcertVerification>[1]) => requestAiBirthcertVerification(verifyAiBirthcertDeps, input),
@@ -730,7 +743,19 @@ async function main(): Promise<void> {
     config: { holderDid, zetrixAddress, network: config.network },
     makeWallet,
     payer,
-    subscribeDeps: { mbi, sign: subscribeSign, pay: payForCredential, resolveSymbol, holderDid, resolveTemplateFields, cache: vcCache },
+    subscribeDeps: {
+      mbi,
+      sign: subscribeSign,
+      pay: payForCredential,
+      resolveSymbol,
+      holderDid,
+      resolveTemplateFields,
+      cache: vcCache,
+      auth: mbiAuth,
+      address: zetrixAddress,
+      quarantine: downloadQuarantine,
+      passImagesDir,
+    },
     queryContract: (input: ContractQueryInput): Promise<ContractQueryResult> => runContractQuery(input, contractQuery),
     queryTokenBalance,
     // Read-only, for credential_preflight's cap headroom. Preflight only ever prices credentials,
@@ -756,7 +781,7 @@ async function main(): Promise<void> {
     if (!fn) throw new Error(`Unknown tool: ${name}`)
     try {
       const result = await fn((args as unknown) ?? {})
-      return { content: [{ type: 'text', text: JSON.stringify(result) }] }
+      return { content: await buildToolContent(result, (p) => readFile(p)) }
     } catch (err) {
       // Wrapped SDK errors (e.g. VP_BUILD_FAILED) carry the real MBI/Wallet-BE failure on
       // `.cause`; the MCP transport keeps only the top message. Flatten the whole chain so

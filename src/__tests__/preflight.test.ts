@@ -65,7 +65,7 @@ describe('credentialPreflight — know before you pay (R1)', () => {
     expect(out.fee).toMatchObject({ asset: JMYR, maxAmountRequired: '1000000', paymentRequired: false })
   })
 
-  // APP-L01 (!83). paymentRequired is a service-wide MBI setting, not a property of this template,
+  // paymentRequired is a service-wide MBI setting, not a property of this template,
   // and suppressing the blockers on it is what lets preflight answer ready:true for an empty
   // wallet. If payment is switched back on between this quote and the apply, that answer was wrong
   // and the user finds out at issuance. The tool's contract is to always relay notChecked, so the
@@ -153,6 +153,44 @@ describe('credentialPreflight — know before you pay (R1)', () => {
     expect(out.ready).toBe(false)
     expect(out.cap).toMatchObject({ matchedKey: '*', wouldPass: false })
     expect(out.blockers.join(' ')).toMatch(/limit|cap/i)
+  })
+
+  // Reported live: the balance blocker read "the fee is 1 JMYR" while the cap blocker in the same
+  // response read "issuance requires 1,000,000" — a raw base-unit number with no symbol, which a
+  // caller summarizing both blockers together has no way to tell apart from an already-human amount.
+  it('renders the cap blocker in human units (symbol + decimals), not raw base units', async () => {
+    const d = deps({ caps: { [JMYR]: '200000', '*': '0' } })
+    const out = await credentialPreflight(d as never, { credential: VERIFIED_AI_BIRTHCERT })
+    expect(out.ready).toBe(false)
+    const capBlocker = out.blockers.join(' ')
+    expect(capBlocker).toMatch(/0\.2 JMYR/)
+    expect(capBlocker).toMatch(/1 JMYR/)
+    expect(capBlocker).not.toMatch(/200000/)
+    expect(capBlocker).not.toMatch(/\b1000000\b/)
+  })
+
+  it('renders the mis-keyed cap blocker in human units too', async () => {
+    const d = deps({ caps: { JMYR: '5000000', '*': '300000' } })
+    const out = await credentialPreflight(d as never, { credential: VERIFIED_AI_BIRTHCERT })
+    expect(out.ready).toBe(false)
+    const capBlocker = out.blockers.join(' ')
+    expect(capBlocker).toMatch(/0\.3 JMYR/)
+    expect(capBlocker).toMatch(/1 JMYR/)
+    expect(capBlocker).not.toMatch(/300000/)
+    expect(capBlocker).not.toMatch(/\b1000000\b/)
+  })
+
+  // Code review (APP-L01): renderCapBlocker's call to renderAmount is the one call site with
+  // no guard against an errored balance read — the balance-blocker call sites at :155/:180 are both
+  // provably non-errored. renderAmount's own `'error' in balance` fallback catches it and degrades to
+  // raw units, but that fallback was previously unreachable dead code; this pins it as load-bearing.
+  it('degrades the cap blocker to raw units instead of throwing when the fee balance read errored', async () => {
+    const d = deps({ queryTokenBalance: balances({ ZTX: '2000000' }), caps: { '*': '0' } })
+    const out = await credentialPreflight(d as never, { credential: VERIFIED_AI_BIRTHCERT })
+    expect(out.ready).toBe(false)
+    const blockerText = out.blockers.join(' ')
+    expect(blockerText).toMatch(/Could not read the .* balance/)
+    expect(blockerText).toMatch(/\b1000000\b/)
   })
 
   it('reports BOTH a balance and a cap blocker at once, not one at a time', async () => {

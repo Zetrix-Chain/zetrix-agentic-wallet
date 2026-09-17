@@ -25,7 +25,7 @@ import type { TokenBalanceResult } from './clients/token-balance-client.js'
 import { createHolderAccount, type CreateAccount, type CreateHolderAccountInput, type ExistingAccount } from './orchestrator/onboard.js'
 import type { CheckActivationStatus } from './orchestrator/wait-for-activation.js'
 import { type VcCacheStore, isVcValid } from './clients/vc-cache.js'
-import { resolveTemplateAlias, deriveTemplateAttributes, validateTemplateAttributes, derivedAttributeKeys } from './template-aliases.js'
+import { resolveTemplateAlias, deriveTemplateAttributes, validateTemplateAttributes, derivedAttributeKeys, resolvePassDesignId } from './template-aliases.js'
 import type { ContractQueryInput, ContractQueryResult } from './clients/contract-query-client.js'
 import type { RequestAiBirthcertVerificationInput, RequestVerificationResult, CheckVerificationResult } from './orchestrator/verify-ai-birthcert.js'
 import { credentialPreflight, VERIFIED_AI_BIRTHCERT, type PreflightInput } from './orchestrator/preflight.js'
@@ -178,7 +178,17 @@ export function createTools(deps: ToolDeps) {
       if (errors.length > 0) {
         return { issued: false, reason: errors.join('; ') }
       }
-      const result = await subscribeAndIssue(deps.subscribeDeps, { ...input, templateId, attributes })
+      // passDesignId is per-template (only the Basic Birthcert has one configured so far — see
+      // template-aliases.ts), never a wallet-wide default: resolved fresh per call so an unrelated
+      // template's issuance never carries along a mismatched pass-design id. Explicitly setting the
+      // key to undefined (rather than a conditional spread) matters if deps.subscribeDeps ever
+      // carries an inherited value of its own — a spread can only add the key, never clear it
+      // (APP-L02), which would otherwise let a stale id leak into the signed data payload.
+      const passDesignId = resolvePassDesignId(templateId, deps.config.network)
+      const result = await subscribeAndIssue(
+        { ...deps.subscribeDeps, passDesignId },
+        { ...input, templateId, attributes },
+      )
       if (!result.schema) return result
       // The caller never needs to know about a key the wallet fills in for them — agentDid is
       // always auto-filled from the wallet's own holderDid when a template declares it, and a

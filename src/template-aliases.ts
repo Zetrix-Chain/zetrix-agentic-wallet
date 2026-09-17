@@ -28,6 +28,13 @@ export interface TemplateAliasEntry {
    * attributes are optional; an absent value is never validated.
    */
   validateAttributes?: Record<string, (value: unknown) => string | undefined>
+  /**
+   * MBI "pass design" id for this template's issuance, per network — sent as `passDesignId` in
+   * `subscribe_and_issue`'s signed `data` payload (see subscribe.ts's `passDesignId` dep). Only the
+   * Basic Birthcert has one confirmed so far (2026-09-15); other templates simply omit this key,
+   * so `resolvePassDesignId` returns undefined for them rather than sending a mismatched id.
+   */
+  passDesignId?: { testnet: string; mainnet: string }
 }
 
 function validateDob(value: unknown): string | undefined {
@@ -53,6 +60,10 @@ const TEMPLATE_ALIASES: TemplateAliasEntry[] = [
     mainnet: 'did:zid:19091d19049abb8869b4b8e2f4a887bd1d1d86e5f5ebd0c8297000255f67765b',
     deriveAttributes: { id: 'agentUsername' },
     validateAttributes: { dob: validateDob, countryOfOrigin: validateCountryOfOrigin },
+    passDesignId: {
+      testnet: 'did:zid:992e1e18985ba36a09ba0fbfeb601ddeb449f5e4e882ed69d0d620085f399818',
+      mainnet: 'did:zid:915955cb71c6fd2a256d04344f57381084903cb6a85a1c9ddb71c746f08932ab',
+    },
   },
 ]
 
@@ -138,4 +149,16 @@ export function validateTemplateAttributes(templateId: string, network: string, 
     if (error) errors.push(error)
   }
   return errors
+}
+
+/**
+ * Resolve the confirmed MBI "pass design" id for whichever form of templateId the caller passed
+ * (alias or raw did:zid:...). Returns undefined for any template with no configured pass design —
+ * currently only the Basic Birthcert has one — so subscribe_and_issue never sends a mismatched
+ * passDesignId alongside an unrelated template's issuance.
+ */
+export function resolvePassDesignId(templateId: string, network: string): string | undefined {
+  const entry = findEntry(templateId, network)
+  if (!entry?.passDesignId) return undefined
+  return network.includes('testnet') ? entry.passDesignId.testnet : entry.passDesignId.mainnet
 }

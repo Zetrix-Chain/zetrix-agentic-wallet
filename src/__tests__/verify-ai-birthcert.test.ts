@@ -1,8 +1,19 @@
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { requestAiBirthcertVerification, checkAiBirthcertVerification } from '../orchestrator/verify-ai-birthcert'
 import { PaymentReadinessError } from '../payment-readiness'
 import { PaymentCapError } from '../payment-guard'
 import { SsivcError } from '../clients/ssivc-client'
+
+let passImagesDir: string
+beforeEach(() => {
+  passImagesDir = mkdtempSync(join(tmpdir(), 'verify-ai-birthcert-vc-pass-image-test-'))
+})
+afterEach(() => {
+  rmSync(passImagesDir, { recursive: true, force: true })
+})
 
 const SAMPLE_ACCEPT = { scheme: 'exact', network: 'zetrix:testnet', asset: 'ZTX', payTo: 'ZTX3Pay', maxAmountRequired: '1000', extra: [] }
 
@@ -44,6 +55,7 @@ function makeDeps(overrides: Partial<Record<string, unknown>> = {}) {
       get: vi.fn().mockResolvedValue(null),
       set: vi.fn(),
       filePathFor: vi.fn((vcId: string) => `/state/ssivc-download-quarantine/${vcId}.json`),
+      withLock: vi.fn((_vcId: string, fn: () => Promise<unknown>) => fn()),
     },
     ...overrides,
   }
@@ -431,6 +443,7 @@ async function runRequest(overrides: Partial<Record<string, unknown>> = {}) {
       get: vi.fn().mockResolvedValue(null),
       set: vi.fn(),
       filePathFor: vi.fn((vcId: string) => `/state/ssivc-download-quarantine/${vcId}.json`),
+      withLock: vi.fn((_vcId: string, fn: () => Promise<unknown>) => fn()),
     },
     ...overrides,
   }
@@ -464,7 +477,7 @@ describe('structured payment failures, matching subscribe_and_issue (R11)', () =
         holderDid: 'did:zid:owner123',
         now: () => new Date('2026-09-04T00:00:00Z'),
         sessionStore,
-        quarantine: { get: vi.fn(), set: vi.fn(), filePathFor: vi.fn() },
+        quarantine: { get: vi.fn(), set: vi.fn(), filePathFor: vi.fn(), withLock: vi.fn((_vcId: string, fn: () => Promise<unknown>) => fn()) },
       } as never,
       { agentName: 'Structured Failure Probe' },
     )) as Record<string, unknown>
@@ -987,6 +1000,60 @@ describe('checkAiBirthcertVerification', () => {
     expect(deps.cache.set).toHaveBeenCalled()
   })
 
+  it('on issued: writes the pass image and returns/caches vcPassImagePaths when extraData.vcPassBase64 is present', async () => {
+    const { deps, sessionStore, getSession } = makeDeps({ passImagesDir })
+    await sessionStore.set({ sessionId: 's-1', agentName: 'Procurement Assistant', createdAt: '2026-08-13T09:00:00.000Z' })
+    getSession.mockResolvedValue({ sessionId: 's-1', status: 'issued', expiresAt: '2026-08-13T09:30:00+00:00', vcId: 'did:zid:vc-1' })
+    const vc = { id: 'did:zid:vc-1', credentialSubject: { id: 'did:zid:owner123' }, validUntil: '2028-08-13T00:00:00Z' }
+    deps.mbi.downloadVcs = vi.fn().mockResolvedValue([
+      { vc, extraData: { vcPassBase64: [Buffer.from('verified-pass-bytes').toString('base64')] } },
+    ])
+
+    const out = await checkAiBirthcertVerification(deps as never)
+
+    expect(out.vcPassImagePaths).toHaveLength(1)
+    expect(readFileSync(out.vcPassImagePaths![0], 'utf8')).toBe('verified-pass-bytes')
+    expect(deps.cache.set).toHaveBeenCalledWith(
+      'did:zid:verified-template',
+      expect.objectContaining({ vcPassImagePaths: expect.arrayContaining([expect.stringContaining(passImagesDir)]) }),
+    )
+  })
+
+  // Code review (APP-M01): the writeVcPassImages call here was an unguarded IIFE — a
+  // filesystem failure rejected checkAiBirthcertVerification and turned an already-validated,
+  // already-paid-for credential into a reported failure instead of degrading vcPassImagePaths to
+  // undefined as the surrounding docblock promises.
+  it('on issued: still returns the credential when writing the pass image to disk fails', async () => {
+    // A file, not a directory, at passImagesDir — mkdir/writeFile inside writeVcPassImages must fail.
+    rmSync(passImagesDir, { recursive: true, force: true })
+    writeFileSync(passImagesDir, 'not a directory')
+    const { deps, sessionStore, getSession } = makeDeps({ passImagesDir })
+    await sessionStore.set({ sessionId: 's-1', agentName: 'Procurement Assistant', createdAt: '2026-08-13T09:00:00.000Z' })
+    getSession.mockResolvedValue({ sessionId: 's-1', status: 'issued', expiresAt: '2026-08-13T09:30:00+00:00', vcId: 'did:zid:vc-1' })
+    const vc = { id: 'did:zid:vc-1', credentialSubject: { id: 'did:zid:owner123' }, validUntil: '2028-08-13T00:00:00Z' }
+    deps.mbi.downloadVcs = vi.fn().mockResolvedValue([
+      { vc, extraData: { vcPassBase64: [Buffer.from('verified-pass-bytes').toString('base64')] } },
+    ])
+
+    const out = await checkAiBirthcertVerification(deps as never)
+
+    expect(out.status).toBe('issued')
+    expect((out as { vcId?: string }).vcId).toBe('did:zid:vc-1')
+    expect(out.vcPassImagePaths).toBeUndefined()
+  })
+
+  it('on issued: does not set vcPassImagePaths when the downloaded entry carries no extraData.vcPassBase64', async () => {
+    const { deps, sessionStore, getSession } = makeDeps({ passImagesDir })
+    await sessionStore.set({ sessionId: 's-1', agentName: 'Procurement Assistant', createdAt: '2026-08-13T09:00:00.000Z' })
+    getSession.mockResolvedValue({ sessionId: 's-1', status: 'issued', expiresAt: '2026-08-13T09:30:00+00:00', vcId: 'did:zid:vc-1' })
+    const vc = { id: 'did:zid:vc-1', credentialSubject: { id: 'did:zid:owner123' }, validUntil: '2028-08-13T00:00:00Z' }
+    deps.mbi.downloadVcs = vi.fn().mockResolvedValue([{ vc, extraData: null }])
+
+    const out = await checkAiBirthcertVerification(deps as never)
+
+    expect(out.vcPassImagePaths).toBeUndefined()
+  })
+
   // R2-M01: the store is keyed by vcId, so an OTHER vcId's quarantined entry is simply not returned
   // for this vcId — and quarantining this one must not disturb it.
   it('on issued: downloads fresh when only a DIFFERENT vcId has been quarantined', async () => {
@@ -1391,6 +1458,7 @@ describe('per-call gasPayer override', () => {
         get: vi.fn().mockResolvedValue(null),
         set: vi.fn(),
         filePathFor: vi.fn((vcId: string) => `/state/ssivc-download-quarantine/${vcId}.json`),
+        withLock: vi.fn((_vcId: string, fn: () => Promise<unknown>) => fn()),
       },
       // Deployment default says sponsored — the per-call gasPayer below must win over this.
       gasPreference: 'sponsored' as const,
@@ -1442,6 +1510,7 @@ describe('per-call gasPayer override', () => {
         get: vi.fn().mockResolvedValue(null),
         set: vi.fn(),
         filePathFor: vi.fn((vcId: string) => `/state/ssivc-download-quarantine/${vcId}.json`),
+        withLock: vi.fn((_vcId: string, fn: () => Promise<unknown>) => fn()),
       },
       gasPreference: 'sponsored' as const,
     }

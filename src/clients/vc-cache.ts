@@ -24,6 +24,8 @@ export interface CachedVc {
   issuedAt: string
   /** From the VC's own `validUntil`, or the `expirationDate` requested at issuance. Absent = no known expiry. */
   validUntil?: string
+  /** Local file paths of the MBI pass-design PNG(s) for this VC, when fetched. See subscribe.ts's `resolveVcPassImagePaths`. */
+  vcPassImagePaths?: string[]
 }
 
 export interface VcCacheStore {

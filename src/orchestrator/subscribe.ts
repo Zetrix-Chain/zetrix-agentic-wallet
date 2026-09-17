@@ -43,6 +43,8 @@ import {
   MBI_SETTLEMENT_INDETERMINATE,
   type MbiClient,
   type MbiApplyBody,
+  type MbiVcEntry,
+  type MbiVpAuth,
   type PayRequirement,
 } from '../clients/mbi-client.js'
 import { isSponsored } from '../accept-selection.js'
@@ -50,6 +52,8 @@ import { zetrixHexStringToBytes } from '../zetrix-hex.js'
 import { type VcCacheStore, isVcValid, extractValidUntil, extractAttributeKeys } from '../clients/vc-cache.js'
 import type { TemplateFields } from '../clients/template-info-client.js'
 import { PaymentReadinessError, type PaymentShortfall } from '../payment-readiness.js'
+import type { DownloadQuarantineStore } from '../clients/ssivc-download-quarantine-store.js'
+import { extractVcPassBase64, writeVcPassImages } from '../clients/vc-pass-image.js'
 
 export interface SubscribeDeps {
   /**
@@ -61,7 +65,7 @@ export interface SubscribeDeps {
    * `quote` is optional and is NOT used by the issuance flow — `credential_preflight` reads it to
    * price a template without the risk `applyChallenge` carries (a free template issues there).
    */
-  mbi: Pick<MbiClient, 'applyChallenge' | 'applySettle'> & Partial<Pick<MbiClient, 'getStatus' | 'quote'>>
+  mbi: Pick<MbiClient, 'applyChallenge' | 'applySettle'> & Partial<Pick<MbiClient, 'getStatus' | 'quote' | 'downloadVcs'>>
   /** Holder-signs the canonical VC-payload `data` (Ed25519 via Wallet BE). */
   sign: (data: string) => Promise<{ signBlob: string; publicKey: string }>
   /** Self-pay the x402 challenge and return the `X-PAYMENT` header value. */
@@ -100,6 +104,26 @@ export interface SubscribeDeps {
   cache?: VcCacheStore
   /** Delay between recovery polls. Injectable so tests don't wait in real time. */
   sleep?: (ms: number) => Promise<void>
+  /**
+   * MBI "pass design" id to request for this issuance, sent as `passDesignId` in the signed
+   * `data` payload right after `templateId`. Optional — when unset, `passDesignId` is omitted
+   * from `data` entirely rather than sent as null/empty, which would change the exact bytes the
+   * holder signs (see the `data` construction below). See config.ts's `passDesignId` for the
+   * confirmed per-network default.
+   */
+  passDesignId?: string
+  /**
+   * VC pass image (extraData.vcPassBase64), fetched from `/v1/vc/ext/download` after a successful
+   * basic issuance and written to disk as PNG(s). All four of `auth`/`address`/`quarantine`/
+   * `passImagesDir` and `mbi.downloadVcs` must be wired for this to run; when any is missing the
+   * step is skipped silently — the VC issuance itself never depends on it. See mbi-client.ts's
+   * `downloadVcs` docstring: this download is one-shot per vcId, so `quarantine` guards against a
+   * retry burning it (mirrors verify-ai-birthcert.ts's use of the same store).
+   */
+  auth?: () => Promise<MbiVpAuth>
+  address?: string
+  quarantine?: DownloadQuarantineStore
+  passImagesDir?: string
 }
 
 export interface SubscribeOpts {
@@ -198,6 +222,13 @@ export interface SubscribeResult {
   schema?: TemplateSchema
   /** The HTTP status MBI returned, set when `reason` comes from a caught MbiError (e.g. 404 template not found/inactive, 400 validation). */
   httpStatus?: number
+  /**
+   * Local file paths of the MBI "pass design" PNG(s) for this VC, when available — see
+   * `SubscribeDeps.passImagesDir`. Absent when the pass-image deps aren't wired, MBI reported no
+   * `extraData.vcPassBase64` for this template, or the (best-effort) fetch failed; never blocks or
+   * fails the issuance itself.
+   */
+  vcPassImagePaths?: string[]
 }
 
 /**
@@ -254,6 +285,58 @@ async function pollSettlementOutcome(
     if (polls < RECOVERY_MAX_POLLS) await sleep(RECOVERY_POLL_DELAY_MS)
   }
   return { ...last!, polls: RECOVERY_MAX_POLLS }
+}
+
+/**
+ * Best-effort fetch of the MBI "pass design" PNG(s) for a just-issued VC. Never throws — a
+ * download failure or a template with no configured pass design must not turn an already-paid,
+ * already-issued credential into a reported failure. Returns undefined whenever there's nothing to
+ * show (feature unwired, no vcPassBase64, or the download errored).
+ *
+ * `deps.quarantine` is checked first (SEC-11/REQ-25): `/v1/vc/ext/download` is one-shot per vcId, so
+ * re-hitting MBI for a vcId this process already downloaded (e.g. a retried subscribe_and_issue
+ * call) would 404 instead of returning the credential again.
+ */
+async function resolveVcPassImagePaths(deps: SubscribeDeps, vcId: string): Promise<string[] | undefined> {
+  const downloadVcs = deps.mbi.downloadVcs
+  const auth = deps.auth
+  const address = deps.address
+  const quarantine = deps.quarantine
+  const passImagesDir = deps.passImagesDir
+  if (!downloadVcs || !auth || !address || !quarantine || !passImagesDir) return undefined
+
+  // Everything below this point runs after the one-shot download may already have been consumed,
+  // so a failure here (a full quarantine store, an unwritable pass-images dir) must degrade to
+  // undefined rather than reject — the docblock's "never throws" promise covers the whole body,
+  // not just the network call, or a filesystem error turns an already-paid issuance into a
+  // reported failure (APP-M01).
+  try {
+    // Locked per vcId (APP-L03): without this, two concurrent calls for the same vcId can both miss
+    // the quarantine `get` below and both hit MBI's one-shot download, so one gets a 404. Serializing
+    // here means the second (now-queued) caller's `get` sees the first caller's `set`.
+    const entries = await quarantine.withLock(vcId, async (): Promise<MbiVcEntry[] | undefined> => {
+      const quarantined = await quarantine.get(vcId)
+      if (quarantined) return quarantined.entries as MbiVcEntry[]
+
+      let downloaded: MbiVcEntry[]
+      try {
+        downloaded = await downloadVcs({ address }, await auth())
+      } catch {
+        return undefined
+      }
+      await quarantine.set({ vcId, entries: downloaded, downloadedAt: new Date().toISOString() })
+      return downloaded
+    })
+    if (!entries) return undefined
+
+    const match = entries.find((e) => typeof e.vc === 'object' && e.vc !== null && (e.vc as Record<string, unknown>).id === vcId)
+    if (!match) return undefined
+    const base64Images = extractVcPassBase64(match.extraData)
+    if (!base64Images) return undefined
+    return await writeVcPassImages(passImagesDir, vcId, base64Images)
+  } catch {
+    return undefined
+  }
 }
 
 export async function subscribeAndIssue(deps: SubscribeDeps, opts: SubscribeOpts): Promise<SubscribeResult> {
@@ -405,7 +488,14 @@ export async function subscribeAndIssue(deps: SubscribeDeps, opts: SubscribeOpts
   }
 
   // `data` on the wire is the raw canonical JSON (MBI JSON-parses it during issuance).
-  const data = JSON.stringify([{ templateId: opts.templateId, metadata: attributes }])
+  // passDesignId sits between templateId and metadata only when configured — key order here must
+  // match MBI's own constructSignData exactly, and omitting the key (rather than sending it as
+  // null) keeps the signed bytes unchanged for every deployment that hasn't been given an id yet.
+  const data = JSON.stringify([
+    deps.passDesignId
+      ? { templateId: opts.templateId, passDesignId: deps.passDesignId, metadata: attributes }
+      : { templateId: opts.templateId, metadata: attributes },
+  ])
   // MBI verifies the holder signature over HexFormat.hexStringToBytes(data). /sign-blob signs
   // hexStringToBytes(blob), so blob = canonical hex of those exact bytes → HSM signs what MBI checks.
   const blob = zetrixHexStringToBytes(data).toString('hex')
@@ -435,6 +525,7 @@ export async function subscribeAndIssue(deps: SubscribeDeps, opts: SubscribeOpts
   // those return from the `/quote` branch above, well before applyChallenge.
   if (challenge.issued) {
     const issued = challenge.issued
+    const vcPassImagePaths = issued.vcId ? await resolveVcPassImagePaths(deps, issued.vcId) : undefined
     if (deps.cache) {
       await deps.cache.set(opts.templateId, {
         templateId: opts.templateId,
@@ -445,6 +536,7 @@ export async function subscribeAndIssue(deps: SubscribeDeps, opts: SubscribeOpts
         amountPaid: '0',
         issuedAt: new Date().toISOString(),
         validUntil: extractValidUntil(issued.verifiableCredential, opts.expirationDate),
+        ...(vcPassImagePaths ? { vcPassImagePaths } : {}),
       })
     }
     return {
@@ -455,6 +547,7 @@ export async function subscribeAndIssue(deps: SubscribeDeps, opts: SubscribeOpts
       paidAsset: 'none',
       amountPaid: '0',
       ...(schema ? { schema } : {}),
+      ...(vcPassImagePaths ? { vcPassImagePaths } : {}),
     }
   }
 
@@ -506,6 +599,8 @@ export async function subscribeAndIssue(deps: SubscribeDeps, opts: SubscribeOpts
     throw err
   }
 
+  const vcPassImagePaths = issued.vcId ? await resolveVcPassImagePaths(deps, issued.vcId) : undefined
+
   if (deps.cache) {
     await deps.cache.set(opts.templateId, {
       templateId: opts.templateId,
@@ -516,6 +611,7 @@ export async function subscribeAndIssue(deps: SubscribeDeps, opts: SubscribeOpts
       amountPaid,
       issuedAt: new Date().toISOString(),
       validUntil: extractValidUntil(issued.verifiableCredential, opts.expirationDate),
+      ...(vcPassImagePaths ? { vcPassImagePaths } : {}),
     })
   }
 
@@ -527,5 +623,6 @@ export async function subscribeAndIssue(deps: SubscribeDeps, opts: SubscribeOpts
     paidAsset,
     amountPaid,
     ...(schema ? { schema } : {}),
+    ...(vcPassImagePaths ? { vcPassImagePaths } : {}),
   }
 }

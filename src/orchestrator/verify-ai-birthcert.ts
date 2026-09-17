@@ -26,6 +26,7 @@ import type { SsivcSessionStore } from '../clients/ssivc-session-store.js'
 import type { DownloadQuarantineStore } from '../clients/ssivc-download-quarantine-store.js'
 import type { MbiClient, MbiVcEntry, MbiVpAuth } from '../clients/mbi-client.js'
 import { type VcCacheStore, extractValidUntil, isVcValid } from '../clients/vc-cache.js'
+import { extractVcPassBase64, writeVcPassImages } from '../clients/vc-pass-image.js'
 import { PaymentReadinessError, type PaymentShortfall } from '../payment-readiness.js'
 import { PaymentCapError, type PaymentCapDetail } from '../payment-guard.js'
 
@@ -84,6 +85,12 @@ export interface VerifyAiBirthcertDeps {
    * fallback, same as before this existed.
    */
   formatAssetAmount?: (asset: string, raw: string) => Promise<string>
+  /**
+   * Directory to write the MBI pass-design PNG(s) into, decoded from `extraData.vcPassBase64` on
+   * the matched download entry. Optional — when unset, the pass image is simply not written
+   * (`vcPassImagePaths` stays absent); caching/returning the VC itself is unaffected either way.
+   */
+  passImagesDir?: string
 }
 
 export interface RequestAiBirthcertVerificationInput {
@@ -147,7 +154,7 @@ export type RequestVerificationResult = SsivcSessionCreated | RequestVerificatio
 
 export type CheckVerificationResult =
   | { status: 'no_session'; message: string }
-  | (SsivcSessionStatus & { vc?: unknown; cacheError?: string; verificationUrl?: string })
+  | (SsivcSessionStatus & { vc?: unknown; cacheError?: string; verificationUrl?: string; vcPassImagePaths?: string[] })
 
 /** True iff `entry.vc.credentialSubject.id` equals `holderDid`. */
 function subjectMatches(vc: unknown, holderDid: string): boolean {
@@ -821,7 +828,10 @@ async function requestAiBirthcertVerificationLocked(
 }
 
 export async function checkAiBirthcertVerification(
-  deps: Pick<VerifyAiBirthcertDeps, 'ssivc' | 'sessionStore' | 'mbi' | 'messageSigner' | 'address' | 'holderDid' | 'verifiedTemplateId' | 'cache' | 'quarantine'>,
+  deps: Pick<
+    VerifyAiBirthcertDeps,
+    'ssivc' | 'sessionStore' | 'mbi' | 'messageSigner' | 'address' | 'holderDid' | 'verifiedTemplateId' | 'cache' | 'quarantine' | 'passImagesDir'
+  >,
 ): Promise<CheckVerificationResult> {
   const stored = await deps.sessionStore.get()
   if (!stored) {
@@ -856,6 +866,7 @@ export async function checkAiBirthcertVerification(
     return { ...status, verificationUrl: stored.verificationUrl }
   }
   if (status.status !== 'issued' || !status.vcId) return status
+  const vcId = status.vcId
 
   // Already fetched and cached by an earlier call — no need to hit MBI again, as long as that
   // cached entry hasn't since expired (an expired cache hit falls through to re-fetch below).
@@ -874,25 +885,33 @@ export async function checkAiBirthcertVerification(
   // fresh call at this point would just fail, permanently, for no reason.
   // R2-M01: the store is keyed by vcId, so this lookup either returns THIS vcId's quarantined
   // download or null — it can never hand back some other agent's entry.
-  const quarantined = await deps.quarantine.get(status.vcId)
-  const quarantineFilePath = deps.quarantine.filePathFor(status.vcId)
-  let entries: MbiVcEntry[]
-  if (quarantined) {
-    entries = quarantined.entries as MbiVcEntry[]
-  } else {
+  //
+  // Locked per vcId (APP-L03): a bare get-then-download-then-set here lets two concurrent
+  // check_ai_birthcert_verification calls for the same vcId both miss the `get` and both hit MBI's
+  // one-shot download — one gets a 404. withLock serializes them so the second (now-queued) caller's
+  // `get` sees the first caller's `set`.
+  const quarantineFilePath = deps.quarantine.filePathFor(vcId)
+  const locked = await deps.quarantine.withLock(vcId, async (): Promise<{ entries: MbiVcEntry[] } | { error: string }> => {
+    const quarantined = await deps.quarantine.get(vcId)
+    if (quarantined) return { entries: quarantined.entries as MbiVcEntry[] }
+
     const auth: MbiVpAuth = await deps.messageSigner(deps.address).then((r) => ({ signedData: r.signBlob, publicKey: r.publicKey }))
+    let downloaded: MbiVcEntry[]
     try {
-      entries = await deps.mbi.downloadVcs({ address: deps.address }, auth)
+      downloaded = await deps.mbi.downloadVcs({ address: deps.address }, auth)
     } catch (err) {
-      // APP-L02: this is exactly the "transient MBI error" the tool description already promises
-      // becomes a cacheError, not a throw — so a caller can safely retry check_ai_birthcert_verification.
-      return { ...status, cacheError: `failed to fetch credential from MBI: ${err instanceof Error ? err.message : String(err)}` }
+      // APP-L02 (prior review): this is exactly the "transient MBI error" the tool description already
+      // promises becomes a cacheError, not a throw — so a caller can safely retry check_ai_birthcert_verification.
+      return { error: `failed to fetch credential from MBI: ${err instanceof Error ? err.message : String(err)}` }
     }
     // Persist BEFORE any validation below — a rejection or a crash from here on must never destroy
     // a credential that was already paid for and fetched (SEC-11). Every entry is quarantined, not
     // just the one matching this vcId, since a single download response can carry more than one VC.
-    await deps.quarantine.set({ vcId: status.vcId, entries, downloadedAt: new Date().toISOString() })
-  }
+    await deps.quarantine.set({ vcId, entries: downloaded, downloadedAt: new Date().toISOString() })
+    return { entries: downloaded }
+  })
+  if ('error' in locked) return { ...status, cacheError: locked.error }
+  const entries = locked.entries
 
   const match = entries.find((e) => typeof e.vc === 'object' && e.vc !== null && (e.vc as Record<string, unknown>).id === status.vcId)
 
@@ -936,13 +955,28 @@ export async function checkAiBirthcertVerification(
     }
   }
 
+  // Best-effort: MBI's pass-design PNG(s) for this VC, when configured and present. Never blocks
+  // or fails the (already-validated, already-paid-for) credential above it — a write failure
+  // (e.g. an unwritable pass-images dir) must degrade to undefined rather than reject (APP-M01).
+  const vcPassImagePaths = deps.passImagesDir
+    ? await (async () => {
+        try {
+          const base64Images = extractVcPassBase64(match.extraData)
+          return base64Images ? await writeVcPassImages(deps.passImagesDir!, status.vcId!, base64Images) : undefined
+        } catch {
+          return undefined
+        }
+      })()
+    : undefined
+
   await deps.cache.set(deps.verifiedTemplateId, {
     templateId: deps.verifiedTemplateId,
     vc: match.vc,
     vcId: status.vcId,
     issuedAt: new Date().toISOString(),
     validUntil,
+    ...(vcPassImagePaths ? { vcPassImagePaths } : {}),
   })
 
-  return { ...status, vc: match.vc }
+  return { ...status, vc: match.vc, ...(vcPassImagePaths ? { vcPassImagePaths } : {}) }
 }

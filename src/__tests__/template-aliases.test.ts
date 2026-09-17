@@ -1,8 +1,10 @@
 import { describe, it, expect } from 'vitest'
-import { resolveTemplateAlias, deriveTemplateAttributes, validateTemplateAttributes } from '../template-aliases'
+import { resolveTemplateAlias, deriveTemplateAttributes, validateTemplateAttributes, resolvePassDesignId } from '../template-aliases'
 
 const TESTNET_ID = 'did:zid:3c0fb79adff08e14e06dcd6e3243205010dd65f533434a3d96c55575d1d3d959'
 const MAINNET_ID = 'did:zid:19091d19049abb8869b4b8e2f4a887bd1d1d86e5f5ebd0c8297000255f67765b'
+const BIRTHCERT_TESTNET_PASS_DESIGN_ID = 'did:zid:992e1e18985ba36a09ba0fbfeb601ddeb449f5e4e882ed69d0d620085f399818'
+const BIRTHCERT_MAINNET_PASS_DESIGN_ID = 'did:zid:915955cb71c6fd2a256d04344f57381084903cb6a85a1c9ddb71c746f08932ab'
 
 describe('resolveTemplateAlias', () => {
   it('resolves "AI Birthcert" to the testnet id on a testnet network', () => {
@@ -35,6 +37,29 @@ describe('resolveTemplateAlias', () => {
 
   it('treats a network string without "testnet" as mainnet', () => {
     expect(resolveTemplateAlias('AI Birthcert', 'zetrix:mainnet')).toBe(MAINNET_ID)
+  })
+})
+
+describe('resolvePassDesignId', () => {
+  it('resolves the Basic Birthcert testnet pass design id from the alias name', () => {
+    expect(resolvePassDesignId('AI Birthcert', 'zetrix:testnet')).toBe(BIRTHCERT_TESTNET_PASS_DESIGN_ID)
+  })
+
+  it('resolves the Basic Birthcert mainnet pass design id from the alias name', () => {
+    expect(resolvePassDesignId('AI Birthcert', 'zetrix:mainnet')).toBe(BIRTHCERT_MAINNET_PASS_DESIGN_ID)
+  })
+
+  it('resolves it from the already-resolved raw testnet templateId too', () => {
+    expect(resolvePassDesignId(TESTNET_ID, 'zetrix:testnet')).toBe(BIRTHCERT_TESTNET_PASS_DESIGN_ID)
+  })
+
+  it('resolves it from the already-resolved raw mainnet templateId too', () => {
+    expect(resolvePassDesignId(MAINNET_ID, 'zetrix:mainnet')).toBe(BIRTHCERT_MAINNET_PASS_DESIGN_ID)
+  })
+
+  it('returns undefined for a templateId that is not the Basic Birthcert (no passDesignId for other templates)', () => {
+    expect(resolvePassDesignId('did:zid:someOtherTemplate', 'zetrix:testnet')).toBeUndefined()
+    expect(resolvePassDesignId('agent-identity', 'zetrix:testnet')).toBeUndefined()
   })
 })
 

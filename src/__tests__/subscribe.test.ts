@@ -1,8 +1,12 @@
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { subscribeAndIssue } from '../orchestrator/subscribe'
 import { zetrixHexStringToBytes } from '../zetrix-hex'
 import { PaymentReadinessError } from '../payment-readiness'
 import { MbiError } from '../clients/mbi-client'
+import type { DownloadQuarantineStore } from '../clients/ssivc-download-quarantine-store'
 
 const holderDid = 'did:zid:holder-self-1'
 const opts = { templateId: 'did:zid:t-1', attributes: { agentName: 'Jak Sparrow', purpose: 'x401+x402' } }
@@ -46,6 +50,38 @@ describe('subscribeAndIssue', () => {
       paidAsset: 'JMYR', amountPaid: '1000000',
       schema: { required: [], optional: ['agentDid', 'agentName', 'purpose'] },
     })
+  })
+
+  it('includes passDesignId in the signed data payload, right after templateId, when deps.passDesignId is configured', async () => {
+    const mbi = {
+      applyChallenge: vi.fn().mockResolvedValue({ x402Version: 2, accepts: [accept], paymentId: 'pid-1' }),
+      applySettle: vi.fn().mockResolvedValue({ vcId: 'did:zid:vc', paymentId: 'pid-1', txHash: '0xabc', verifiableCredential: { id: 'vc' } }),
+    }
+    const sign = vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' })
+    const pay = vi.fn().mockResolvedValue('X-PAYMENT-B64')
+    const resolveTemplateFields = vi.fn().mockResolvedValue(fieldsWithAgentDid)
+    const dataWithPassDesignId = JSON.stringify([
+      { templateId: 'did:zid:t-1', passDesignId: 'pd-123', metadata: { agentDid: holderDid, agentName: 'Jak Sparrow', purpose: 'x401+x402' } },
+    ])
+
+    await subscribeAndIssue({ mbi, sign, pay, holderDid, resolveTemplateFields, passDesignId: 'pd-123' }, opts)
+
+    expect(mbi.applyChallenge).toHaveBeenCalledWith({ data: dataWithPassDesignId, signData: 'sig', publicKey: 'pk' })
+    expect(sign).toHaveBeenCalledWith(zetrixHexStringToBytes(dataWithPassDesignId).toString('hex'))
+  })
+
+  it('omits passDesignId entirely from the data payload when deps.passDesignId is not configured (unchanged wire shape)', async () => {
+    const mbi = {
+      applyChallenge: vi.fn().mockResolvedValue({ x402Version: 2, accepts: [accept], paymentId: 'pid-1' }),
+      applySettle: vi.fn().mockResolvedValue({ vcId: 'did:zid:vc', paymentId: 'pid-1', txHash: '0xabc', verifiableCredential: { id: 'vc' } }),
+    }
+    const sign = vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' })
+    const pay = vi.fn().mockResolvedValue('X-PAYMENT-B64')
+    const resolveTemplateFields = vi.fn().mockResolvedValue(fieldsWithAgentDid)
+
+    await subscribeAndIssue({ mbi, sign, pay, holderDid, resolveTemplateFields }, opts)
+
+    expect(mbi.applyChallenge).toHaveBeenCalledWith({ data: expectedData, signData: 'sig', publicKey: 'pk' })
   })
 
   it('reports the raw asset string when no resolveSymbol is provided', async () => {
@@ -999,5 +1035,192 @@ describe('subscribeAndIssue — stale cached attributes', () => {
     expect(out.fromCache).toBe(true)
     expect(out.schema).toBeUndefined()
     expect(out.staleAttributes).toBeUndefined()
+  })
+})
+
+describe('subscribeAndIssue — VC pass image (extraData.vcPassBase64 from /v1/vc/ext/download)', () => {
+  let passImagesDir: string
+
+  const mkQuarantine = (): DownloadQuarantineStore & { store: Map<string, unknown> } => {
+    const store = new Map<string, unknown>()
+    const locks = new Map<string, Promise<unknown>>()
+    return {
+      store,
+      get: vi.fn(async (vcId: string) => (store.has(vcId) ? (store.get(vcId) as never) : null)),
+      set: vi.fn(async (entry: { vcId: string }) => {
+        store.set(entry.vcId, entry)
+      }),
+      filePathFor: (vcId: string) => `/quarantine/${vcId}`,
+      withLock: vi.fn((vcId: string, fn: () => Promise<unknown>) => {
+        const previous = locks.get(vcId) ?? Promise.resolve()
+        const next = previous.then(fn, fn)
+        locks.set(
+          vcId,
+          next.catch(() => undefined),
+        )
+        return next
+      }),
+    }
+  }
+
+  const passImageDeps = (overrides: Record<string, unknown> = {}) => ({
+    mbi: {
+      applyChallenge: vi.fn().mockResolvedValue({ x402Version: 2, accepts: [accept], paymentId: 'pid-1' }),
+      applySettle: vi.fn().mockResolvedValue({ vcId: 'did:zid:vc-1', paymentId: 'pid-1', txHash: '0xabc', verifiableCredential: { id: 'did:zid:vc-1' } }),
+      downloadVcs: vi.fn().mockResolvedValue([
+        { vc: { id: 'did:zid:vc-1' }, extraData: { vcPassBase64: [Buffer.from('pass-png-bytes').toString('base64')] } },
+      ]),
+    },
+    sign: vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' }),
+    pay: vi.fn().mockResolvedValue('X-PAYMENT-B64'),
+    holderDid,
+    auth: vi.fn().mockResolvedValue({ signedData: 'addr-sig', publicKey: 'authpk' }),
+    address: 'ZTX3Holder',
+    quarantine: mkQuarantine(),
+    passImagesDir,
+    ...overrides,
+  })
+
+  beforeEach(() => {
+    passImagesDir = mkdtempSync(join(tmpdir(), 'subscribe-vc-pass-image-test-'))
+  })
+
+  afterEach(() => {
+    rmSync(passImagesDir, { recursive: true, force: true })
+  })
+
+  it('downloads and writes the pass image, returning its path, when extraData.vcPassBase64 is present', async () => {
+    const deps = passImageDeps()
+
+    const out = await subscribeAndIssue(deps as never, opts)
+
+    expect(deps.mbi.downloadVcs).toHaveBeenCalledWith({ address: 'ZTX3Holder' }, { signedData: 'addr-sig', publicKey: 'authpk' })
+    expect(out.vcPassImagePaths).toHaveLength(1)
+    expect(readFileSync(out.vcPassImagePaths![0], 'utf8')).toBe('pass-png-bytes')
+  })
+
+  it('caches vcPassImagePaths alongside the issued VC', async () => {
+    const cache = { get: vi.fn().mockResolvedValue(null), set: vi.fn(), list: vi.fn() }
+    const deps = passImageDeps({ cache })
+
+    await subscribeAndIssue(deps as never, opts)
+
+    expect(cache.set).toHaveBeenCalledWith(
+      'did:zid:t-1',
+      expect.objectContaining({ vcPassImagePaths: expect.arrayContaining([expect.stringContaining(passImagesDir)]) }),
+    )
+  })
+
+  it('does not set vcPassImagePaths when the downloaded entry carries no extraData.vcPassBase64 (null case)', async () => {
+    const deps = passImageDeps({
+      mbi: {
+        applyChallenge: vi.fn().mockResolvedValue({ x402Version: 2, accepts: [accept], paymentId: 'pid-1' }),
+        applySettle: vi.fn().mockResolvedValue({ vcId: 'did:zid:vc-1', paymentId: 'pid-1', txHash: '0xabc', verifiableCredential: { id: 'did:zid:vc-1' } }),
+        downloadVcs: vi.fn().mockResolvedValue([{ vc: { id: 'did:zid:vc-1' }, extraData: null }]),
+      },
+    })
+
+    const out = await subscribeAndIssue(deps as never, opts)
+
+    expect(out.vcPassImagePaths).toBeUndefined()
+  })
+
+  it('skips the pass-image fetch entirely when the feature is not wired (downloadVcs unset)', async () => {
+    const out = await subscribeAndIssue(
+      { mbi: { applyChallenge: vi.fn().mockResolvedValue({ x402Version: 2, accepts: [accept], paymentId: 'pid-1' }), applySettle: vi.fn().mockResolvedValue({ vcId: 'did:zid:vc-1', verifiableCredential: { id: 'vc' } }) }, sign: vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' }), pay: vi.fn().mockResolvedValue('X'), holderDid },
+      opts,
+    )
+    expect(out.vcPassImagePaths).toBeUndefined()
+  })
+
+  it('reuses a quarantined download for the same vcId instead of hitting MBI again (one-shot download)', async () => {
+    const deps = passImageDeps()
+    await subscribeAndIssue(deps as never, opts)
+    expect(deps.mbi.downloadVcs).toHaveBeenCalledTimes(1)
+
+    // Second issuance of the SAME vcId (e.g. a retry) must read the quarantined copy, not re-download —
+    // MBI's /v1/vc/ext/download returns 404 on a second live call for the same vcId (SEC-11/REQ-25).
+    await subscribeAndIssue(deps as never, opts)
+    expect(deps.mbi.downloadVcs).toHaveBeenCalledTimes(1)
+  })
+
+  // Code review (APP-L03): a bare get-then-download-then-set let two concurrent calls for the
+  // SAME vcId both miss the quarantine `get` and both hit MBI's one-shot download — one of them gets
+  // a 404 and the wallet loses the credential body entirely on that branch. withLock serializes them.
+  it('serializes two concurrent issuances of the SAME vcId so only one downloads', async () => {
+    const deps = passImageDeps()
+    await Promise.all([subscribeAndIssue(deps as never, opts), subscribeAndIssue(deps as never, opts)])
+    expect(deps.mbi.downloadVcs).toHaveBeenCalledTimes(1)
+  })
+
+  it('still returns the successfully issued VC (without vcPassImagePaths) when downloadVcs fails', async () => {
+    const deps = passImageDeps({
+      mbi: {
+        applyChallenge: vi.fn().mockResolvedValue({ x402Version: 2, accepts: [accept], paymentId: 'pid-1' }),
+        applySettle: vi.fn().mockResolvedValue({ vcId: 'did:zid:vc-1', paymentId: 'pid-1', txHash: '0xabc', verifiableCredential: { id: 'did:zid:vc-1' } }),
+        downloadVcs: vi.fn().mockRejectedValue(new Error('MBI vc/ext/download failed — HTTP 503')),
+      },
+    })
+
+    const out = await subscribeAndIssue(deps as never, opts)
+
+    expect(out.issued).toBe(true)
+    expect(out.vcId).toBe('did:zid:vc-1')
+    expect(out.vcPassImagePaths).toBeUndefined()
+  })
+
+  // Code review (APP-M01): resolveVcPassImagePaths's docblock promises it never throws, but
+  // only the downloadVcs call was wrapped — a failure in quarantine.set or the filesystem write was
+  // not, so it rejected subscribeAndIssue and the already-paid, already-issued VC was reported as a
+  // failure. Two probes, mirroring the review's own.
+  it('still returns the successfully issued VC when the quarantine store write fails', async () => {
+    const deps = passImageDeps({
+      quarantine: {
+        get: vi.fn().mockResolvedValue(null),
+        set: vi.fn().mockRejectedValue(new Error('ENOSPC: no space left on device')),
+        filePathFor: (vcId: string) => `/quarantine/${vcId}`,
+        withLock: (_vcId: string, fn: () => Promise<unknown>) => fn(),
+      },
+    })
+
+    const out = await subscribeAndIssue(deps as never, opts)
+
+    expect(out.issued).toBe(true)
+    expect(out.vcId).toBe('did:zid:vc-1')
+    expect(out.vcPassImagePaths).toBeUndefined()
+  })
+
+  it('still returns the successfully issued VC when writing the pass image to disk fails', async () => {
+    // A file, not a directory, at passImagesDir — mkdir/writeFile inside writeVcPassImages must fail.
+    rmSync(passImagesDir, { recursive: true, force: true })
+    writeFileSync(passImagesDir, 'not a directory')
+    const deps = passImageDeps()
+
+    const out = await subscribeAndIssue(deps as never, opts)
+
+    expect(out.issued).toBe(true)
+    expect(out.vcId).toBe('did:zid:vc-1')
+    expect(out.vcPassImagePaths).toBeUndefined()
+  })
+
+  it('also fetches the pass image on a FREE-template synchronous issuance (challenge.issued)', async () => {
+    const deps = passImageDeps({
+      mbi: {
+        applyChallenge: vi.fn().mockResolvedValue({
+          x402Version: 1,
+          accepts: [],
+          issued: { vcId: 'did:zid:vc-1', verifiableCredential: { id: 'did:zid:vc-1' } },
+        }),
+        applySettle: vi.fn(),
+        downloadVcs: vi.fn().mockResolvedValue([
+          { vc: { id: 'did:zid:vc-1' }, extraData: { vcPassBase64: [Buffer.from('free-pass-bytes').toString('base64')] } },
+        ]),
+      },
+    })
+
+    const out = await subscribeAndIssue(deps as never, opts)
+
+    expect(out.vcPassImagePaths).toHaveLength(1)
+    expect(readFileSync(out.vcPassImagePaths![0], 'utf8')).toBe('free-pass-bytes')
   })
 })

@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > Entries for 0.5.0 and earlier were reconstructed from commit history when this file was
 > introduced in 0.6.0, so they summarise each release rather than being exhaustive.
 
+## [0.11.0] — 17 September 2026
+
+### Added
+
+- **VC pass-design images are now surfaced for basic and verified birthcert issuance.** When the
+  issuer returns a pass-design image alongside a credential, the wallet extracts it, writes it to
+  disk, and — since a remote MCP client has no filesystem access to read a local path back —
+  returns it as an inline image in the tool response too, so the pass is actually visible rather
+  than just referenced by path.
+
+### Fixed
+
+- **The spending-cap blocker now shows human-readable amounts.** It previously showed the raw
+  base-unit number with no symbol or decimal conversion, while the balance/fee blocker in the same
+  response already showed the correctly formatted amount — the cap blocker now matches it.
+
 ## [0.10.0] — 14 September 2026
 
 ### Added
