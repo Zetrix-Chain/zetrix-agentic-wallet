@@ -56,6 +56,17 @@ export interface AgenticWalletConfig {
    * `subscribe_and_issue` reads it to check a template's required attributes before paying.
    */
   templateRegistryAddress: string
+  /**
+   * Policy Registry contract address — the entry point for every policy read (`getPolicyContract`,
+   * `getPolicy`, and the proxied `getTemplate`). `undefined` on mainnet, where the Registry is not
+   * deployed; the policy tools then report the network as unsupported instead of querying.
+   */
+  policyRegistryAddress?: string
+  /**
+   * Policy Template contract address — needed only for `getTemplateById`, which the Registry does
+   * not proxy. `undefined` on mainnet for the same reason as {@link policyRegistryAddress}.
+   */
+  policyTemplateAddress?: string
   /** ZID resolver base URL (issuer DID → BBS+/Ed25519 verification keys) — auto-derived from network when not set. */
   zidResolverBaseUrl: string
   /**
@@ -93,6 +104,22 @@ export interface AgenticWalletConfig {
   gasPreference: GasPreference
   /** How many times to re-poll SSIVC for a queued sponsored settlement before giving up. */
   maxSettlementAttempts: number
+  /** Total wall-clock wait for a queued settlement, in ms. Bounds what the attempt cap cannot. */
+  settlementWaitBudgetMs: number
+  /**
+   * How old an unconfirmed settlement must be before the wallet stops calling it "still settling"
+   * and calls it permanently stuck, in ms.
+   *
+   * SSIVC returns the same `status_code 69` for a settlement two minutes old and one three weeks
+   * old, so this age — not their code — is what separates "check back shortly" from "this is not
+   * coming back, and the fee was most likely already taken". Measured basis for the default: a
+   * healthy settlement completed in under a second on 2026-09-21, and that incident's blob
+   * was queued at 11:07:55 and reported EXPIRED by the facilitator at 11:28:31 — 20m36s, their
+   * payment window. (Not to be confused with the wallet's own ~20 minutes, which was its old
+   * blocking loop, 20 attempts x 60s. Two unrelated clocks that happen to land near each other.)
+   * A full day is far past any genuine in-flight case.
+   */
+  settlementStuckAfterMs: number
 }
 
 function stripTrailingSlash(v: string): string {
@@ -123,6 +150,37 @@ function deriveTemplateRegistryAddress(network: string): string {
   return network.includes('testnet')
     ? 'ZTX3JszqPgRUx743SAp7q7zURfjvkWuH2FMEz'
     : 'ZTX3GqJM1U6ifMPonwD4fGvrgoTKJua7b2cKX'
+}
+
+/**
+ * Policy Registry — the entry point for every policy read. The testnet address was verified live
+ * (2026-09-18): the account exists, its `query()` dispatcher exposes getPolicyContract / getPolicy /
+ * getTemplate, and a live call returned a well-formed reply.
+ *
+ * Mainnet returns undefined because the Registry is NOT DEPLOYED there — the same APP-M04 honesty
+ * convention as {@link deriveSsivcBaseUrl}. A guessed address would make every read fail in a way
+ * that reads as "you have no policy" rather than "this network has no policy system at all", which
+ * is precisely the confusion the three-state read result exists to prevent.
+ *
+ * The field guide also lists a separate local/dev deployment. Those addresses are deliberately NOT
+ * recorded here — POLICY_REGISTRY_ADDRESS is how local testing reaches them, so this file never
+ * carries a second environment someone could resolve to by accident.
+ */
+export function derivePolicyRegistryAddress(network: string): string | undefined {
+  return isTestnet(network) ? 'ZTX3Z2Fgsssx5fVq5v8EnhTBh6mqxJ8FQFqnk' : undefined
+}
+
+/**
+ * Policy Template contract. Used ONLY for `getTemplateById` — the Registry proxies `getTemplate`
+ * but NOT `getTemplateById`, so the id-only lookup has to call the Template contract directly.
+ *
+ * Every `{publisher, policyKey}` lookup should still go through the Registry proxy, because the
+ * Registry already holds the Template address it trusts; routing through it removes any chance of
+ * reading a Template contract the Registry does not recognise. Verified live (2026-09-18) as the
+ * address the staging Registry itself proxies to.
+ */
+export function derivePolicyTemplateAddress(network: string): string | undefined {
+  return isTestnet(network) ? 'ZTX3WfTbuZwsLQDWe4f7mzrfULiNdDU84BLJ5' : undefined
 }
 
 /**
@@ -223,6 +281,12 @@ function defaultCredentialIssuanceCaps(network: string): Record<string, string> 
  */
 const KNOWN_NETWORKS = ['zetrix:testnet', 'zetrix:mainnet'] as const
 
+/**
+ * Above this, SETTLEMENT_WAIT_BUDGET_MS starts reinstating the long blocking call the 90s default
+ * exists to prevent, so it is warned about on stderr (APP-L02). Not a clamp — see the loader.
+ */
+const SETTLEMENT_WAIT_BUDGET_WARN_MS = 600_000
+
 function isTestnet(network: string): boolean {
   return network.includes('testnet')
 }
@@ -280,6 +344,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): AgenticWalletConfig {
     nodePort: opt('ZETRIX_NODE_PORT') ?? '',
     templateRegistryAddress: opt('ZETRIX_TEMPLATE_REGISTRY_ADDRESS') ?? deriveTemplateRegistryAddress(network),
     zidResolverBaseUrl: stripTrailingSlash(opt('ZID_RESOLVER_BASE_URL') ?? deriveZidResolverBaseUrl(network)),
+    policyRegistryAddress: opt('POLICY_REGISTRY_ADDRESS') ?? derivePolicyRegistryAddress(network),
+    policyTemplateAddress: opt('POLICY_TEMPLATE_ADDRESS') ?? derivePolicyTemplateAddress(network),
     // Fail closed: an unset cap means "spend nothing", not "spend anything". A wallet that starts
     // with no configuration at all must not be able to auto-pay a hostile x402 challenge. Raising
     // it is a deliberate act.
@@ -299,6 +365,35 @@ export function loadConfig(env: NodeJS.ProcessEnv): AgenticWalletConfig {
     maxSettlementAttempts: (() => {
       const attempts = Number(env.MAX_SETTLEMENT_ATTEMPTS)
       return Number.isInteger(attempts) && attempts > 0 ? attempts : 20
+    })(),
+    // APP-L02: deliberately NOT clamped to a ceiling. This is the ops escape hatch for a slow
+    // paymaster, and a hard cap turns a tuning knob into a wall with no way around it. Setting it
+    // very high cannot restore worse-than-before behaviour on its own either: maxSettlementAttempts
+    // still bounds the loop independently, so the old ~20-minute block needs BOTH knobs
+    // raised, deliberately.
+    //
+    // It IS warned about, though, on the same stderr channel parsePaymentCaps already uses above —
+    // an earlier version of this comment claimed no logging channel existed, which was simply wrong.
+    settlementWaitBudgetMs: (() => {
+      const ms = Number(env.SETTLEMENT_WAIT_BUDGET_MS)
+      const budget = Number.isInteger(ms) && ms > 0 ? ms : 90_000
+      if (budget > SETTLEMENT_WAIT_BUDGET_WARN_MS) {
+        process.stderr.write(
+          `agentic-wallet-mcp: SETTLEMENT_WAIT_BUDGET_MS is ${budget}ms — request_ai_birthcert_verification ` +
+            `and check_ai_birthcert_verification can each block a caller for that long (the budget bounds ` +
+            `both). Above ~${SETTLEMENT_WAIT_BUDGET_WARN_MS}ms this reinstates the long blocking call the ` +
+            `90s default exists to prevent. Intended for temporary debugging only.\n`,
+        )
+      }
+      return budget
+    })(),
+    // Not clamped and not warned about: unlike the wait budget, nothing blocks on this —
+    // it only decides which of two true statements the user is told about a receipt SSIVC will not
+    // resolve. Setting it very low makes the wallet give up on the wording early (it still never
+    // pays again or discards anything on its own); very high just means it keeps saying "check back".
+    settlementStuckAfterMs: (() => {
+      const ms = Number(env.SETTLEMENT_STUCK_AFTER_MS)
+      return Number.isInteger(ms) && ms > 0 ? ms : 86_400_000
     })(),
   }
 }

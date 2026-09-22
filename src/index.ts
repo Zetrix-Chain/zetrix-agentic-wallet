@@ -4,7 +4,7 @@
  *
  * `buildToolList()` is unit-tested; `main()` is the live wiring (the integration seam).
  * It constructs Wallet BE + signer, the x402 self-pay payer, and the MBI client (used both for
- * x402 VC issuance and VP creation/submission), then registers the 9 tools. Run the
+ * x402 VC issuance and VP creation/submission), then registers the 11 tools. Run the
  * esbuild bundle for the bin (x401-zetrix-client's ESM uses extensionless imports).
  */
 
@@ -22,7 +22,7 @@ import { PaymentEngine } from 'x402-zetrix-client'
 import type { PayRequest as X402PayRequest, WalletConfigData, ZetrixNodeConfig } from 'x402-zetrix-client'
 import { X401Wallet, type ZetrixNetwork } from 'x401-zetrix-client'
 import ZtxChainSDK from 'zetrix-sdk-nodejs'
-import { loadConfig, resolveTokenAddress } from './config.js'
+import { loadConfig, resolveTokenAddress, type AgenticWalletConfig } from './config.js'
 import { resolveAssetSymbol, resolveAssetInfo, formatHumanAmount, type ContractQuery } from './clients/token-info-client.js'
 import { queryContract as runContractQuery, type ContractQueryInput, type ContractQueryResult } from './clients/contract-query-client.js'
 import {
@@ -53,7 +53,8 @@ import { buildToolContent } from './tool-result.js'
 import { SsivcClient } from './clients/ssivc-client.js'
 import { createFsSsivcSessionStore } from './clients/ssivc-session-store.js'
 import { createFsDownloadQuarantineStore } from './clients/ssivc-download-quarantine-store.js'
-import { requestAiBirthcertVerification, checkAiBirthcertVerification } from './orchestrator/verify-ai-birthcert.js'
+import { requestAiBirthcertVerification, checkAiBirthcertVerification, clearStuckPaymentReceipt } from './orchestrator/verify-ai-birthcert.js'
+import type { ClearStuckPaymentReceiptInput } from './orchestrator/verify-ai-birthcert.js'
 import { needsNativeGasCheck, prepareBaseUrl } from './accept-selection.js'
 
 // esbuild resolves this JSON import at build time and inlines it into the bundle, so the
@@ -132,6 +133,77 @@ export function buildToolList() {
           },
         },
         required: ['templateId'],
+      },
+    },
+    {
+      name: 'get_policy_template_schema',
+      description:
+        "Read a POLICY template's declared attribute vocabulary from chain — FREE, no payment, no " +
+        'signing. This is the only vocabulary that means anything on chain: the policy contract ' +
+        'validates nothing, so an attribute name outside this list deploys cleanly and then enforces ' +
+        'nothing at all. Accepts either { publisher, policyKey } or { templateId }. A template that ' +
+        'cannot be read reports { error } rather than { found: false }, so "no such template" is ' +
+        'never confused with "could not look it up".',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          templateId: { type: 'string', description: 'Template id, as it appears inside a deployed policy.' },
+          publisher: { type: 'string', description: 'Publisher address. Use together with policyKey.' },
+          policyKey: { type: 'string', description: 'Policy key. Use together with publisher.' },
+        },
+      },
+    },
+    {
+      name: 'get_my_policy',
+      description:
+        'Read the spending policies this owner has deployed on chain — FREE, no payment, no ' +
+        "signing. Defaults to this wallet's own address. Costs 2 + N chain calls and warns above " +
+        '50 keys. An owner who has never deployed a policy is reported as a normal absence, NOT an ' +
+        'error — the policy contract is created lazily on first write. A failed lookup keeps its ' +
+        'own error state, so "we could not list your policies" is never presented as "you have none".',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          owner: { type: 'string', description: "Owner address. Defaults to this wallet's configured address." },
+        },
+      },
+    },
+    {
+      name: 'policy_preflight',
+      description:
+        'Check a draft policy BEFORE it is deployed — FREE, no payment, no signing. It answers two ' +
+        'questions. First, is the draft well-formed: every blocker is returned at once in ' +
+        '`blockers`, so one round of fixes is enough rather than discovering them one failure at a ' +
+        'time. Second, and more important, does the policy MEAN what the user thinks: ' +
+        '`interpretation` states in plain words what it actually does. ALWAYS show `interpretation` ' +
+        'to the user, INCLUDING when ready is true — a policy can be perfectly valid and still mean ' +
+        'something other than what was intended (a spending cap with no window is a LIFETIME cap, ' +
+        'not a monthly one), and reporting only "ready" hides exactly that. A clean result is NOT a ' +
+        'guarantee: `notChecked` lists what could not be verified, including whether the policy will ' +
+        'be enforced at all and whether a payment would currently be allowed.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          policyKey: { type: 'string', description: 'The key this policy would be stored under.' },
+          attributes: {
+            type: 'array',
+            description: 'The draft rules — one { attributeName, attributeType, value } per rule.',
+            items: {
+              type: 'object',
+              properties: {
+                attributeName: { type: 'string' },
+                attributeType: { type: 'string' },
+                value: { type: 'string' },
+              },
+              required: ['attributeName', 'attributeType', 'value'],
+            },
+          },
+          validFromBlock: { type: 'string', description: 'Block this policy starts at, written as a string.' },
+          validToBlock: { type: 'string', description: 'Block it ends at, as a string. "0" means no end.' },
+          templateId: { type: 'string', description: 'Template id. Supply this OR publisher + policyKey.' },
+          publisher: { type: 'string', description: 'Publisher address, used together with policyKey.' },
+        },
+        required: ['policyKey', 'attributes', 'validFromBlock', 'validToBlock'],
       },
     },
     {
@@ -222,6 +294,9 @@ export function buildToolList() {
       name: 'request_ai_birthcert_verification',
       description:
         'Start a Verified AI Birthcert issuance session with myid (MyDigital ID owner verification). ' +
+        'ALWAYS run credential_preflight for "verified_ai_birthcert" immediately before calling this, ' +
+        'even if you checked earlier in the conversation — preflight is free, this tool spends real ' +
+        'funds, and a balance the user topped up a minute ago is not the balance you read before that. ' +
         'Returns { sessionId, verificationUrl, expiresAt } — show verificationUrl to the human owner ' +
         'and ask them to open it and complete MyDigital ID verification (typically finishes in ' +
         'seconds). Once they confirm they are done, call check_ai_birthcert_verification to see ' +
@@ -237,6 +312,11 @@ export function buildToolList() {
         'to refusing everything on mainnet. Set MAX_PAYMENT_AMOUNT to override either. It can return ' +
         '{ error: "..." } instead of a session if that payment fails (insufficient funds, or the ' +
         'payment cap blocked it) — nothing is created in that case. ' +
+        'It can also return { settlementPending: true, paymentReceipt, message } — this means the ' +
+        'payment SUCCEEDED and the sponsored settlement is still clearing, which can take a few ' +
+        'minutes. That is NOT a failure and NOT an error: report it to the user as "payment sent, ' +
+        'still settling", never as "the payment failed". Do not pay again and do not call this tool ' +
+        'again to retry — call check_ai_birthcert_verification to follow it through. ' +
         'If the user did NOT ask for a "verified" credential specifically, they most likely want the ' +
         'self-declared, non-verified Basic AI Birthcert instead — use subscribe_and_issue for that.',
       inputSchema: {
@@ -268,6 +348,23 @@ export function buildToolList() {
               'A quote does NOT reserve the name and does NOT check whether it is already taken — myid checks ' +
               'uniqueness only at issuance, so a name already in use still quotes cleanly. `agentName` is still ' +
               'required because the server rejects a request without one, but the fee does not depend on it.',
+          },
+          discardStuckReceiptAndPayFresh: {
+            type: 'string',
+            description:
+              'DESTRUCTIVE, and it SPENDS. Only for a payment that is genuinely stuck. While the wallet ' +
+              'holds a stuck receipt this tool can only replay it — it will never buy a new credential — ' +
+              'so this is the way to start over: it throws that payment away and pays a SECOND fee. Pass ' +
+              'the stuck receipt id EXACTLY as check_ai_birthcert_verification or ' +
+              'clear_stuck_payment_receipt reported it — never a guess, never true. A mismatched id ' +
+              'discards nothing and pays nothing. Before using it, show the user the receipt id, tell ' +
+              'them the first payment is forfeit and that this costs the fee again, and get their ' +
+              'explicit agreement. If the receipt turns out to belong to a live session this is refused: ' +
+              'that session is already paid for, so call check_ai_birthcert_verification instead. The ' +
+              'result carries discardedPaymentReceipt — keep it, support needs it to trace the lost payment. ' +
+              'A receipt only counts as stuck once it is older than SETTLEMENT_STUCK_AFTER_MS (24h by ' +
+              'default, e.g. SETTLEMENT_STUCK_AFTER_MS=3600000 for one hour); before that the wallet ' +
+              'will say the settlement may still be in flight, and starting over is the user decision, not yours.',
           },
         },
         required: ['agentName'],
@@ -314,7 +411,7 @@ export function buildToolList() {
       name: 'check_ai_birthcert_verification',
       description:
         'Check the status of the most recently requested Verified AI Birthcert session (see ' +
-        'request_ai_birthcert_verification). FREE — spends nothing and starts nothing. Use this, not ' +
+        'request_ai_birthcert_verification). FREE — it never pays for anything. Use this, not ' +
         'request_ai_birthcert_verification, whenever the user asks where their verification link is, ' +
         'what happened to their session, or whether their credential is ready. While the session is ' +
         'still open the result carries `verificationUrl` (the same link issued at creation) and ' +
@@ -328,8 +425,67 @@ export function buildToolList() {
         'credential WAS issued successfully but could not be fetched/verified/cached yet (e.g. a ' +
         'transient MBI error) — this is NOT the same as issuance failing, so do not retry ' +
         'request_ai_birthcert_verification; call check_ai_birthcert_verification again instead. Returns ' +
-        '{ status: "no_session" } if request_ai_birthcert_verification has never been called.',
+        '{ status: "no_session" } if request_ai_birthcert_verification has never been called. ' +
+        'If a previous payment is still clearing, this tool ACTIVELY ADVANCES it — so in that one ' +
+        'case it can take up to ~90s to return (it is waiting on the settlement, not hung; every ' +
+        'other case returns immediately). It replays the ' +
+        'saved receipt (never a new payment) and returns the live session once it settles, so ' +
+        'telling the user to check back here genuinely moves things forward. While it is still ' +
+        'clearing you get { status: "settlement_pending", paymentReceipt, message }: a payment HAS ' +
+        'been made, so never call request_ai_birthcert_verification and never tell the user it ' +
+        'failed. Two cases, told apart by outcomeUnknown and by the first words of message: ' +
+        'without outcomeUnknown (message leads "PAYMENT SENT") it is queued and progressing — just ' +
+        'check again in a few minutes. With outcomeUnknown: true (message leads "OUTCOME UNKNOWN") ' +
+        'the settlement outcome could not be determined at all and has been unresolved long enough ' +
+        'that it is not coming back (stuckFor says how long). The fee was most likely ALREADY TAKEN ' +
+        'and no credential was issued — say that plainly rather than implying it may still land. ' +
+        'do not just tell the user to wait; give them the paymentReceipt and tell them to quote it ' +
+        'to support. Quote paymentReceipt to support in either case if they ask. ' +
+        'Separately, { status: "receipt_void" } is TERMINAL: the payment service has ruled that this ' +
+        'receipt is finished (it expired, or the settlement failed), so checking again cannot help ' +
+        'and no credential will come from it. That does NOT mean the fee was refunded — never tell ' +
+        'the user they were not charged; give them paymentReceipt for support. Buying the credential ' +
+        'then means paying the fee AGAIN, which needs their explicit agreement.',
       inputSchema: { type: 'object', properties: {} },
+    },
+    {
+      name: 'clear_stuck_payment_receipt',
+      description:
+        'LAST RESORT. Discard a stuck Verified AI Birthcert payment receipt that the wallet is ' +
+        'holding and refusing to pay past. DESTRUCTIVE and CANNOT BE UNDONE: the payment it ' +
+        'represents becomes unrecoverable — if that settlement ever completes, the funds are ' +
+        'forfeit and no credential is issued. Do NOT use this as a retry. If the wallet reports ' +
+        '{ status: "settlement_pending" }, the payment is still in progress and will most likely ' +
+        'resolve on its own — call check_ai_birthcert_verification again instead; it actively ' +
+        'advances a queued settlement. Only reach for this tool when the outcome has been stuck ' +
+        'with no change for a long time and the user accepts losing the payment. ' +
+        'Two steps, deliberately: call it with no arguments first and it clears NOTHING — it returns ' +
+        'the receipt id and a warning. Show that id to the user, get their explicit agreement, then ' +
+        'call again with confirmReceiptId set to exactly that id. A mismatched id clears nothing. ' +
+        'If the settlement completed in between — which is exactly what happens when you follow the ' +
+        'advice above and call check_ai_birthcert_verification first — the receipt now belongs to a ' +
+        'LIVE, paid-for session and this tool REFUSES to clear on the id alone: it hands back the ' +
+        'session id and verification link instead. Give that link to the user; only if they truly ' +
+        'want to abandon a session they already paid for, call again with confirmDiscardLiveSession ' +
+        'set to true as well.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          confirmReceiptId: {
+            type: 'string',
+            description:
+              'The receipt id to discard, copied exactly from a prior no-argument call. Omit it to be ' +
+              'shown the id and the warning first — never guess or invent this value.',
+          },
+          confirmDiscardLiveSession: {
+            type: 'boolean',
+            description:
+              'Set true ONLY after the tool has refused because the receipt now belongs to a live ' +
+              'verification session, and the user has been shown that session\'s link and has ' +
+              'explicitly chosen to throw it away anyway. Never set it pre-emptively.',
+          },
+        },
+      },
     },
     {
       name: 'create_holder_account',
@@ -384,6 +540,39 @@ export function buildPayers(
     pay: makePay(config.maxPaymentAmount),
     payForCredential: makePay(config.credentialIssuanceCaps),
     preflightCaps: config.credentialIssuanceCaps,
+  }
+}
+
+/**
+ * The config-derived half of the Verified AI Birthcert deps, extracted so it is observable.
+ *
+ * R2-L03: written inline in `main()`, `settlementWaitBudgetMs: config.settlementWaitBudgetMs` could
+ * be deleted with the whole suite still green — `SETTLEMENT_WAIT_BUDGET_MS` would parse, validate
+ * and warn exactly as tested, then never reach the retry loop. Same class as the cap wiring in
+ * `buildPayers`, and the same remedy: the mapping lives in one place a test can call.
+ */
+export function buildSettlementWiring(
+  config: Pick<
+    AgenticWalletConfig,
+    | 'gasPreference'
+    | 'maxSettlementAttempts'
+    | 'settlementWaitBudgetMs'
+    | 'settlementStuckAfterMs'
+    | 'aiBirthcertVerifiedTemplateId'
+  >,
+): {
+  gasPreference: AgenticWalletConfig['gasPreference']
+  maxSettlementAttempts: number
+  settlementWaitBudgetMs: number
+  settlementStuckAfterMs: number
+  verifiedTemplateId: string | undefined
+} {
+  return {
+    gasPreference: config.gasPreference,
+    maxSettlementAttempts: config.maxSettlementAttempts,
+    settlementWaitBudgetMs: config.settlementWaitBudgetMs,
+    settlementStuckAfterMs: config.settlementStuckAfterMs,
+    verifiedTemplateId: config.aiBirthcertVerifiedTemplateId,
   }
 }
 
@@ -668,17 +857,18 @@ async function main(): Promise<void> {
           holderDid,
           now: () => new Date(),
           sessionStore: ssivcSessionStore,
-          verifiedTemplateId: config.aiBirthcertVerifiedTemplateId,
           cache: vcCache,
           quarantine: downloadQuarantine,
-          gasPreference: config.gasPreference,
-          maxSettlementAttempts: config.maxSettlementAttempts,
+          // gasPreference, maxSettlementAttempts, settlementWaitBudgetMs and verifiedTemplateId —
+          // see buildSettlementWiring (R2-L03).
+          ...buildSettlementWiring(config),
           formatAssetAmount,
           passImagesDir,
         }
         return {
           request: (input: Parameters<typeof requestAiBirthcertVerification>[1]) => requestAiBirthcertVerification(verifyAiBirthcertDeps, input),
           check: () => checkAiBirthcertVerification(verifyAiBirthcertDeps),
+          clearStuckReceipt: (input: ClearStuckPaymentReceiptInput) => clearStuckPaymentReceipt(verifyAiBirthcertDeps, input),
         }
       })()
     : undefined
@@ -740,7 +930,13 @@ async function main(): Promise<void> {
     )
 
   const deps: ToolDeps = {
-    config: { holderDid, zetrixAddress, network: config.network },
+    config: {
+      holderDid,
+      zetrixAddress,
+      network: config.network,
+      policyRegistryAddress: config.policyRegistryAddress,
+      policyTemplateAddress: config.policyTemplateAddress,
+    },
     makeWallet,
     payer,
     subscribeDeps: {
@@ -756,6 +952,8 @@ async function main(): Promise<void> {
       quarantine: downloadQuarantine,
       passImagesDir,
     },
+    // The RAW seam, for the policy client, which reads the query_rets envelope itself.
+    chainQuery: contractQuery,
     queryContract: (input: ContractQueryInput): Promise<ContractQueryResult> => runContractQuery(input, contractQuery),
     queryTokenBalance,
     // Read-only, for credential_preflight's cap headroom. Preflight only ever prices credentials,

@@ -120,6 +120,8 @@ describe('agentic-wallet-mcp prove_identity — end to end', () => {
       makeWallet,
       payer: vi.fn() as never,
       subscribeDeps: { mbi: {} as never, sign: vi.fn(), pay: vi.fn(), holderDid: 'did:zid:h' },
+      // The RAW contract seam the policy tools use; unused by this flow but required by ToolDeps.
+      chainQuery: vi.fn().mockResolvedValue({ errorCode: 0, result: { query_rets: [] } }),
       createAccount: vi.fn(),
     })
 

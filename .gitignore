@@ -15,3 +15,12 @@ mcp.*.local.json
 
 # ClawHub Plugin Inspector reports — regenerate with: clawhub package validate .
 openclaw-plugin/reports/
+
+# packed plugin tarballs — build output of `npm pack`, regenerate rather than commit (R2-L13)
+openclaw-plugin/*.tgz
+
+# agentic workflow artefacts (task briefs, diffs, reports) — internal, never published
+.superpowers/
+
+# runtime data — session state written by a locally-run wallet, never for commit or publication
+runtime/

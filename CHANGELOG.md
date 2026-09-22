@@ -8,6 +8,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > Entries for 0.5.0 and earlier were reconstructed from commit history when this file was
 > introduced in 0.6.0, so they summarise each release rather than being exhaustive.
 
+## [0.12.0] — 22 September 2026
+
+### Added
+
+- **Three free policy read tools**: `get_policy_template_schema` (which spending rules a template
+  allows), `get_my_policy` (the policies this owner has deployed on chain) and `policy_preflight`
+  (is a draft policy valid, and does it MEAN what the user thinks). All read-only: they sign
+  nothing, spend nothing and deploy nothing. Each reports a three-state result, so "this network has
+  no policy system" is never reported as "you have no policy".
+- **`clear_stuck_payment_receipt`**: the supported way to discard a Verified AI Birthcert payment
+  receipt the wallet is holding and refusing to pay past — previously only possible by deleting a
+  file on the server, which a hosted subscriber cannot do. Two steps by construction: the first call
+  clears nothing and returns the receipt id, and clearing requires echoing that exact id back.
+- **`request_ai_birthcert_verification` gains `discardStuckReceiptAndPayFresh`**: discard a stuck
+  receipt and pay again in one call. Takes the receipt id, never a boolean, so a receipt cannot be
+  discarded that was not first shown to the user. Refuses a mismatched id, a receipt belonging to a
+  live session, and combination with `dryRun` — spending nothing in each case.
+- **`SETTLEMENT_STUCK_AFTER_MS`** (default `86400000`, 24h): how long an unconfirmed settlement may
+  stay unresolved before the wallet stops calling it "still settling" and calls it permanently stuck.
+
+### Changed
+
+- **`check_ai_birthcert_verification` now advances a queued settlement** instead of only reporting
+  it. It replays the saved receipt — never a new payment — and returns the live session once it
+  settles, so "check back in a few minutes" genuinely progresses the flow.
+- **A queued settlement no longer blocks the tool call for ~20 minutes.** It returns within a bounded
+  wall-clock budget (`SETTLEMENT_WAIT_BUDGET_MS`, default 90s) as
+  `{ settlementPending: true, paymentReceipt, message }` — the payment succeeded and is in flight,
+  which is not an error.
+- **Settlement messages lead with their verdict** (`PAYMENT SENT` / `OUTCOME UNKNOWN` / `RECEIPT VOID`)
+  and carry `paymentReceipt` as its own field, so an assistant summarising the result cannot turn
+  "we do not know yet" into "it failed".
+- **The three settlement verdicts are now told apart.** A receipt the service declares finished is
+  terminal and reported as `status: "receipt_void"`; an unresolved one is judged by the receipt's own
+  age — recent means "still settling, check back", older than `SETTLEMENT_STUCK_AFTER_MS` means
+  "this is not coming back". None of them claims the fee was refunded: a settlement can expire after
+  the money has already moved, so the receipt id is always handed back for support.
+
+### Fixed
+
+- A stuck receipt no longer dead-ends. The wallet still refuses to buy a new credential while one is
+  held — that refusal is what prevents a second charge — but it now names the way out and states
+  plainly that starting over costs the fee a second time.
+
 ## [0.11.0] — 17 September 2026
 
 ### Added

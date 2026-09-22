@@ -1,7 +1,12 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { loadConfig, UNVERIFIED_MAINNET_SSIVC_BASE_URL } from '../config'
+import {
+  loadConfig,
+  UNVERIFIED_MAINNET_SSIVC_BASE_URL,
+  derivePolicyRegistryAddress,
+  derivePolicyTemplateAddress,
+} from '../config'
 
 const base = {
   ZETRIX_NETWORK: 'zetrix:testnet',
@@ -23,6 +28,8 @@ describe('loadConfig', () => {
       nodePort: '',
       templateRegistryAddress: 'ZTX3JszqPgRUx743SAp7q7zURfjvkWuH2FMEz',
       zidResolverBaseUrl: 'https://zid-resolver-sandbox.zetrix.com',
+      policyRegistryAddress: 'ZTX3Z2Fgsssx5fVq5v8EnhTBh6mqxJ8FQFqnk',
+      policyTemplateAddress: 'ZTX3WfTbuZwsLQDWe4f7mzrfULiNdDU84BLJ5',
       // Testnet default: exactly the AI Birthcert fee, nothing else. See the network-scoped block below.
       maxPaymentAmount: { ZTX3WeinXtt28YMyr4vUZ14ddTgEMGeuc1e6b: '1000000', '*': '0' },
       credentialIssuanceCaps: { ZTX3WeinXtt28YMyr4vUZ14ddTgEMGeuc1e6b: '1000000', '*': '0' },
@@ -31,6 +38,8 @@ describe('loadConfig', () => {
       aiBirthcertVerifiedTemplateId: 'did:zid:9641ee92552e9bcec672f300b071ff86d340ac78c83c225e95971cab8108fb80',
       gasPreference: 'sponsored',
       maxSettlementAttempts: 20,
+      settlementWaitBudgetMs: 90_000,
+      settlementStuckAfterMs: 86_400_000,
     })
   })
 
@@ -286,5 +295,98 @@ describe('sponsored gas config', () => {
   it('ignores a non-positive or unparseable override', () => {
     expect(loadConfig({ ...base, MAX_SETTLEMENT_ATTEMPTS: '0' } as NodeJS.ProcessEnv).maxSettlementAttempts).toBe(20)
     expect(loadConfig({ ...base, MAX_SETTLEMENT_ATTEMPTS: 'abc' } as NodeJS.ProcessEnv).maxSettlementAttempts).toBe(20)
+  })
+
+  // The attempt cap alone cannot bound the wait, because the per-attempt delay is
+  // server-supplied. Operators need the same env-var lever over the wall-clock budget.
+  it('defaults settlementWaitBudgetMs to 90s and accepts an override', () => {
+    expect(loadConfig(base).settlementWaitBudgetMs).toBe(90_000)
+    expect(
+      loadConfig({ ...base, SETTLEMENT_WAIT_BUDGET_MS: '30000' } as NodeJS.ProcessEnv).settlementWaitBudgetMs,
+    ).toBe(30_000)
+  })
+
+  // Decides only which of two true statements a user is told about an unconfirmed
+  // settlement, so unlike the wait budget it is neither clamped nor warned about.
+  it('defaults settlementStuckAfterMs to 24h and accepts an override', () => {
+    expect(loadConfig(base).settlementStuckAfterMs).toBe(86_400_000)
+    expect(
+      loadConfig({ ...base, SETTLEMENT_STUCK_AFTER_MS: '3600000' } as NodeJS.ProcessEnv).settlementStuckAfterMs,
+    ).toBe(3_600_000)
+  })
+
+  it('ignores a non-positive or unparseable stuck threshold', () => {
+    expect(loadConfig({ ...base, SETTLEMENT_STUCK_AFTER_MS: '0' } as NodeJS.ProcessEnv).settlementStuckAfterMs).toBe(86_400_000)
+    expect(loadConfig({ ...base, SETTLEMENT_STUCK_AFTER_MS: 'soon' } as NodeJS.ProcessEnv).settlementStuckAfterMs).toBe(86_400_000)
+  })
+
+  it('ignores a non-positive or unparseable settlement wait budget', () => {
+    expect(loadConfig({ ...base, SETTLEMENT_WAIT_BUDGET_MS: '0' } as NodeJS.ProcessEnv).settlementWaitBudgetMs).toBe(90_000)
+    expect(loadConfig({ ...base, SETTLEMENT_WAIT_BUDGET_MS: 'abc' } as NodeJS.ProcessEnv).settlementWaitBudgetMs).toBe(90_000)
+  })
+
+  // R2-L05. APP-L02 deliberately does NOT clamp the budget — it warns instead, so the warning is
+  // the entire safety mechanism for an oversized value and cannot be left untested.
+  describe('an oversized settlement wait budget warns on stderr rather than being clamped', () => {
+    function loadCapturingStderr(env: NodeJS.ProcessEnv): { budget: number; stderr: string } {
+      const writes: string[] = []
+      const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+        writes.push(String(chunk))
+        return true
+      })
+      try {
+        return { budget: loadConfig(env).settlementWaitBudgetMs, stderr: writes.join('') }
+      } finally {
+        spy.mockRestore()
+      }
+    }
+
+    it('warns above ~10 minutes, and still honours the value', () => {
+      const { budget, stderr } = loadCapturingStderr({ ...base, SETTLEMENT_WAIT_BUDGET_MS: '900000' } as NodeJS.ProcessEnv)
+
+      expect(budget).toBe(900_000)
+      expect(stderr).toContain('SETTLEMENT_WAIT_BUDGET_MS is 900000ms')
+    })
+
+    // APP-L03: check_ blocks on the same budget, so a warning that names only request_ understates
+    // the effect an operator is being warned about.
+    it('names both tools the budget can block', () => {
+      const { stderr } = loadCapturingStderr({ ...base, SETTLEMENT_WAIT_BUDGET_MS: '900000' } as NodeJS.ProcessEnv)
+
+      expect(stderr).toContain('request_ai_birthcert_verification')
+      expect(stderr).toContain('check_ai_birthcert_verification')
+      expect(stderr.endsWith('\n')).toBe(true)
+    })
+
+    it('stays silent at the default, and at the threshold itself', () => {
+      expect(loadCapturingStderr(base).stderr).toBe('')
+      expect(
+        loadCapturingStderr({ ...base, SETTLEMENT_WAIT_BUDGET_MS: '600000' } as NodeJS.ProcessEnv).stderr,
+      ).toBe('')
+    })
+  })
+})
+
+describe('policy contract addresses', () => {
+  it('returns the verified staging addresses on testnet', () => {
+    expect(derivePolicyRegistryAddress('zetrix:testnet')).toBe('ZTX3Z2Fgsssx5fVq5v8EnhTBh6mqxJ8FQFqnk')
+    expect(derivePolicyTemplateAddress('zetrix:testnet')).toBe('ZTX3WfTbuZwsLQDWe4f7mzrfULiNdDU84BLJ5')
+  })
+
+  it('returns undefined on mainnet, because the contracts are not deployed there', () => {
+    // APP-M04: a guessed address would make every read fail as "you have no policy" rather
+    // than "this network has no policy system at all".
+    expect(derivePolicyRegistryAddress('zetrix:mainnet')).toBeUndefined()
+    expect(derivePolicyTemplateAddress('zetrix:mainnet')).toBeUndefined()
+  })
+
+  it('lets an explicit override reach a local deployment on any network', () => {
+    const cfg = loadConfig({
+      ...base,
+      POLICY_REGISTRY_ADDRESS: 'ZTX3local',
+      POLICY_TEMPLATE_ADDRESS: 'ZTX3localTemplate',
+    } as NodeJS.ProcessEnv)
+    expect(cfg.policyRegistryAddress).toBe('ZTX3local')
+    expect(cfg.policyTemplateAddress).toBe('ZTX3localTemplate')
   })
 })

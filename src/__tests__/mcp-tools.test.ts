@@ -19,6 +19,8 @@ function makeDeps() {
   })
   const saveAccount = vi.fn().mockResolvedValue(undefined)
   const queryContract = vi.fn().mockResolvedValue({ ok: true, result: { balance: '5000000' } })
+  // The RAW contract seam the policy tools use, as distinct from the queryContract wrapper above.
+  const chainQuery = vi.fn().mockResolvedValue({ errorCode: 0, result: { query_rets: [] } })
   const checkActivationStatus = vi.fn().mockResolvedValue({ address: 'ZTX3New', activated: true })
   const sleep = vi.fn().mockResolvedValue(undefined)
   const deps = {
@@ -29,10 +31,11 @@ function makeDeps() {
     createAccount,
     saveAccount,
     queryContract,
+    chainQuery,
     checkActivationStatus,
     sleep,
   }
-  return { deps, wallet, makeWallet, payer, mbi, sign, pay, createAccount, saveAccount, queryContract, checkActivationStatus, sleep }
+  return { deps, wallet, makeWallet, payer, mbi, sign, pay, createAccount, saveAccount, queryContract, chainQuery, checkActivationStatus, sleep }
 }
 
 describe('createTools', () => {
@@ -448,6 +451,38 @@ describe('createTools — AI Birthcert verification', () => {
   it('check_ai_birthcert_verification reports unconfigured when verifyAiBirthcert deps are absent', async () => {
     const { deps } = makeDeps()
     const out = await createTools(deps).check_ai_birthcert_verification()
+    expect(out).toEqual({ error: expect.stringContaining('not configured') })
+  })
+
+  // R2-L07: the other two tools had both halves of this covered at the tool layer and clear_ had
+  // neither. It is the destructive one, and its entire safety mechanism is the argument it forwards.
+  it('clear_stuck_payment_receipt delegates to deps.verifyAiBirthcert.clearStuckReceipt, argument intact', async () => {
+    const { deps } = makeDeps()
+    const clearStuckReceipt = vi.fn().mockResolvedValue({ cleared: true, paymentReceipt: 'r-1' })
+    const tools = createTools({ ...deps, verifyAiBirthcert: { request: vi.fn(), check: vi.fn(), clearStuckReceipt } })
+
+    const out = await tools.clear_stuck_payment_receipt({ confirmReceiptId: 'r-1', confirmDiscardLiveSession: true })
+
+    expect(clearStuckReceipt).toHaveBeenCalledWith({ confirmReceiptId: 'r-1', confirmDiscardLiveSession: true })
+    expect(out).toEqual({ cleared: true, paymentReceipt: 'r-1' })
+  })
+
+  // A dropped argument here would turn the two-step gate into a one-step one: the orchestrator reads
+  // an absent confirmReceiptId as "show me the warning first", so the default must stay an empty
+  // object and never a silently-confirming one.
+  it('clear_stuck_payment_receipt defaults to an argument-free call, which clears nothing', async () => {
+    const { deps } = makeDeps()
+    const clearStuckReceipt = vi.fn().mockResolvedValue({ cleared: false, requiresConfirmation: true })
+    const tools = createTools({ ...deps, verifyAiBirthcert: { request: vi.fn(), check: vi.fn(), clearStuckReceipt } })
+
+    await tools.clear_stuck_payment_receipt()
+
+    expect(clearStuckReceipt).toHaveBeenCalledWith({})
+  })
+
+  it('clear_stuck_payment_receipt reports unconfigured when verifyAiBirthcert deps are absent', async () => {
+    const { deps } = makeDeps()
+    const out = await createTools(deps).clear_stuck_payment_receipt({ confirmReceiptId: 'r-1' })
     expect(out).toEqual({ error: expect.stringContaining('not configured') })
   })
 

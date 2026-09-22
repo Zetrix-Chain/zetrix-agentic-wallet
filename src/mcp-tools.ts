@@ -1,5 +1,5 @@
 /**
- * createTools — the 9 agent-facing tools.
+ * createTools — the 11 agent-facing tools.
  *
  * Pure wiring: each tool composes an orchestrator + config. The concrete deps
  * (X401Wallet, x402 payer, MBI + Wallet-BE sign/pay) are built in index.ts
@@ -13,7 +13,9 @@
  *   get_template_schema                 — free read of a template's declared attribute schema
  *   query_contract                      — read-only contract/account query
  *   request_ai_birthcert_verification   — start a myid SSIVC Verified AI Birthcert session
- *   check_ai_birthcert_verification     — poll that session; fetches + caches the VC once issued
+ *   check_ai_birthcert_verification     — poll that session; advances a queued settlement; caches the VC once issued
+ *   clear_stuck_payment_receipt         — last-resort, confirmation-gated discard of a stuck payment receipt
+ *   credential_preflight                — free readiness/price check before a paid issuance
  */
 
 import type { X401Wallet } from 'x401-zetrix-client'
@@ -27,12 +29,34 @@ import type { CheckActivationStatus } from './orchestrator/wait-for-activation.j
 import { type VcCacheStore, isVcValid } from './clients/vc-cache.js'
 import { resolveTemplateAlias, deriveTemplateAttributes, validateTemplateAttributes, derivedAttributeKeys, resolvePassDesignId } from './template-aliases.js'
 import type { ContractQueryInput, ContractQueryResult } from './clients/contract-query-client.js'
-import type { RequestAiBirthcertVerificationInput, RequestVerificationResult, CheckVerificationResult } from './orchestrator/verify-ai-birthcert.js'
+import type {
+  RequestAiBirthcertVerificationInput,
+  RequestVerificationResult,
+  CheckVerificationResult,
+  ClearStuckPaymentReceiptInput,
+  ClearStuckPaymentReceiptResult,
+} from './orchestrator/verify-ai-birthcert.js'
 import { credentialPreflight, VERIFIED_AI_BIRTHCERT, type PreflightInput } from './orchestrator/preflight.js'
 import { isSponsored } from './accept-selection.js'
+import type { ContractQuery } from './clients/token-info-client.js'
+import {
+  declaredVocabulary,
+  getTemplateById,
+  getTemplateViaRegistry,
+  readOwnerPolicies,
+} from './clients/policy-read-client.js'
+import { policyPreflight, unavailableResult, type DraftPolicy } from './orchestrator/policy-preflight.js'
 
 export interface ToolDeps {
-  config: { holderDid: string; zetrixAddress: string; network: string }
+  config: {
+    holderDid: string
+    zetrixAddress: string
+    network: string
+    /** Policy Registry address; undefined where the policy contracts are not deployed. */
+    policyRegistryAddress?: string
+    /** Policy Template address, for the id-only lookup the Registry does not proxy. */
+    policyTemplateAddress?: string
+  }
   /** Builds a per-request X401Wallet bound to the client-supplied VC. */
   makeWallet: (present: VcPresentInput) => X401Wallet
   payer: PayFetch
@@ -47,6 +71,12 @@ export interface ToolDeps {
   queryTokenBalance?: (token: string) => Promise<TokenBalanceResult>
   /** The configured MAX_PAYMENT_AMOUNT map, so preflight can report cap headroom without attempting a payment. */
   paymentCaps?: Record<string, string>
+  /**
+   * The RAW read-only contract seam, as distinct from `queryContract` below, which is the
+   * higher-level wrapper. The policy client needs the raw form because it interprets the
+   * query_rets envelope itself — specifically it reads the LAST entry, which the wrapper does not.
+   */
+  chainQuery: ContractQuery
   /** Read-only contract/account query, backing the query_contract tool. */
   queryContract: (input: ContractQueryInput) => Promise<ContractQueryResult>
   createAccount: CreateAccount
@@ -73,6 +103,7 @@ export interface ToolDeps {
   verifyAiBirthcert?: {
     request: (input: RequestAiBirthcertVerificationInput) => Promise<RequestVerificationResult>
     check: () => Promise<CheckVerificationResult>
+    clearStuckReceipt: (input: ClearStuckPaymentReceiptInput) => Promise<ClearStuckPaymentReceiptResult>
   }
 }
 
@@ -300,11 +331,116 @@ export function createTools(deps: ToolDeps) {
       )
     },
 
+    /**
+     * Free vocabulary lookup. Prefers the Registry proxy when given publisher+policyKey, because
+     * the Registry holds the Template address it trusts and the proxied reply also carries
+     * templateAttributeIds. Falls back to a direct Template call for an id-only lookup, which the
+     * Registry does not proxy.
+     */
+    async get_policy_template_schema(input: { templateId?: string; publisher?: string; policyKey?: string } = {}) {
+      const registry = deps.config.policyRegistryAddress
+      const templateContract = deps.config.policyTemplateAddress
+      const hasPair = Boolean(input.publisher && input.policyKey)
+
+      if (!registry && !templateContract) {
+        return { error: `Policy contracts are not deployed on ${deps.config.network}.` }
+      }
+      if (!hasPair && !input.templateId) {
+        return { error: 'Provide either { publisher, policyKey } or { templateId }.' }
+      }
+
+      // An explicit templateId wins. The pair route only reaches the same contract through the
+      // Registry, so honouring a caller's exact id is never worse and is what they asked for.
+      const read = input.templateId
+        ? templateContract
+          ? await getTemplateById(input.templateId, templateContract, deps.chainQuery)
+          : null
+        : registry
+          ? await getTemplateViaRegistry(input.publisher!, input.policyKey!, registry, deps.chainQuery)
+          : null
+
+      if (!read) {
+        // Distinguish "you gave me too little" from "this network has no contract to ask"
+        // (APP-L01) — telling a caller to supply what they already supplied is a dead end.
+        return {
+          error: input.templateId
+            ? `A templateId lookup needs the policy template contract, which is not configured on ${deps.config.network}.`
+            : `A publisher + policyKey lookup needs the policy registry, which is not configured on ${deps.config.network}.`,
+        }
+      }
+      // A failed read stays a failure. Reporting it as found:false would tell the user their
+      // template does not exist, which is a different and wrong instruction.
+      if ('error' in read) return { error: read.detail }
+      if (read.found === false) return { found: false }
+      return {
+        found: true,
+        declared: [...declaredVocabulary(read.value).entries()].map(([name, type]) => ({ name, type })),
+        // Present only on the Registry route; the id-only read does not return them. Carried
+        // through rather than dropped, since it is the stated reason to prefer that route and the
+        // write path needs it (APP-M06).
+        ...(read.value.templateAttributeIds ? { templateAttributeIds: read.value.templateAttributeIds } : {}),
+      }
+    },
+
+    /** The owner's deployed policies. 2 + N chain calls; warns above 50 keys. */
+    async get_my_policy(input: { owner?: string } = {}) {
+      const registry = deps.config.policyRegistryAddress
+      if (!registry) return { error: `The policy registry is not deployed on ${deps.config.network}.` }
+      const owner = input.owner ?? deps.config.zetrixAddress
+      if (!owner) return { error: 'No owner address — pass one, or configure ZETRIX_ADDRESS.' }
+      return readOwnerPolicies(owner, registry, deps.chainQuery)
+    },
+
+    /** Validate a draft policy before anything signs or pays for it. Free, signs nothing. */
+    async policy_preflight(input: DraftPolicy) {
+      const registry = deps.config.policyRegistryAddress
+      const templateContract = deps.config.policyTemplateAddress
+      const network = deps.config.network
+
+      if (!registry && !templateContract) {
+        // A full PolicyPreflightResult, NOT a bare {error}. The design states twice that
+        // notChecked appears on every result, precisely so a clean preflight is never read as
+        // permission to spend — and mainnet, where no contract exists, is the network where that
+        // warning matters most. Returning {error} here dropped it silently (APP-C02).
+        return unavailableResult(
+          typeof input?.policyKey === 'string' ? input.policyKey : '',
+          `Policy contracts are not deployed on ${network}, so this draft could not be checked against a template.`,
+          network,
+        )
+      }
+
+      return policyPreflight(
+        {
+          network,
+          readTemplate: async (draft) =>
+            // An explicit templateId wins. `draft.policyKey` is the key this policy would be
+            // STORED under, which is not necessarily the template's key — preferring the pair
+            // made an explicitly supplied templateId unreachable (APP-M04).
+            draft.templateId && templateContract
+              ? getTemplateById(draft.templateId, templateContract, deps.chainQuery)
+              : draft.publisher && draft.policyKey && registry
+                ? getTemplateViaRegistry(draft.publisher, draft.policyKey, registry, deps.chainQuery)
+                : {
+                    error: 'query_failed' as const,
+                    detail: 'no template identifier supplied — pass templateId, or publisher with policyKey',
+                  },
+        },
+        input,
+      )
+    },
+
     check_ai_birthcert_verification() {
       if (!deps.verifyAiBirthcert) {
         return { error: AI_BIRTHCERT_NOT_CONFIGURED_ERROR }
       }
       return deps.verifyAiBirthcert.check()
+    },
+
+    clear_stuck_payment_receipt(input: ClearStuckPaymentReceiptInput = {}) {
+      if (!deps.verifyAiBirthcert) {
+        return { error: AI_BIRTHCERT_NOT_CONFIGURED_ERROR }
+      }
+      return deps.verifyAiBirthcert.clearStuckReceipt(input)
     },
   }
 

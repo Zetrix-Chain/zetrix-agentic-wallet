@@ -1,0 +1,14 @@
+{
+  "//": "Typechecks the test suite, which tsconfig.json deliberately excludes so `tsc` can emit from src alone. Without this, `npm run typecheck` covered ZERO test files — a fixture missing a newly-required ToolDeps field compiled only because nothing ever looked at it (APP-M07). Module resolution is 'bundler' here to match how vitest actually resolves the suite's extension-less imports; nothing is emitted, so rootDir and declaration are dropped.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "declaration": false,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "types": ["node", "vitest/globals"]
+  },
+  "include": ["src"],
+  "exclude": ["dist", "node_modules"]
+}

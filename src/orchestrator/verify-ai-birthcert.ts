@@ -22,7 +22,7 @@ import {
 } from '../clients/ssivc-client.js'
 import { orderAccepts, isSponsored, type GasPreference } from '../accept-selection.js'
 import type { PayRequirement } from '../clients/mbi-client.js'
-import type { SsivcSessionStore } from '../clients/ssivc-session-store.js'
+import type { SsivcSessionStore, StoredSsivcSession } from '../clients/ssivc-session-store.js'
 import type { DownloadQuarantineStore } from '../clients/ssivc-download-quarantine-store.js'
 import type { MbiClient, MbiVcEntry, MbiVpAuth } from '../clients/mbi-client.js'
 import { type VcCacheStore, extractValidUntil, isVcValid } from '../clients/vc-cache.js'
@@ -75,6 +75,10 @@ export interface VerifyAiBirthcertDeps {
   gasPreference?: GasPreference
   /** Retry budget for a queued sponsored settlement (see {@link DEFAULT_MAX_SETTLEMENT_ATTEMPTS}). */
   maxSettlementAttempts?: number
+  /** Total wait budget for a queued settlement (see {@link DEFAULT_SETTLEMENT_WAIT_BUDGET_MS}). */
+  settlementWaitBudgetMs?: number
+  /** Age past which an unconfirmed settlement is called permanently stuck (see {@link DEFAULT_SETTLEMENT_STUCK_AFTER_MS}). */
+  settlementStuckAfterMs?: number
   /**
    * Renders a raw base-unit amount as "raw (human SYMBOL)" — the SAME closure `pay_and_fetch` uses
    * for its own insufficient-funds/cap messages (index.ts's `formatAssetAmount`). Used by
@@ -119,6 +123,24 @@ export interface RequestAiBirthcertVerificationInput {
    * check runs at issuance, not at challenge time (a name already taken still quotes cleanly).
    */
   dryRun?: boolean
+  /**
+   * Discard a stuck settlement receipt and pay again, in one call.
+   *
+   * The value is the stuck receipt's **exact id**, never a boolean. That is the whole safety
+   * property, inherited from `clear_stuck_payment_receipt`: an agent cannot discard a receipt it was
+   * never shown, so "the user saw what they are forfeiting" holds structurally rather than by asking
+   * the model to behave. A boolean here would let the model decide to spend again on its own, which
+   * is the habit this ticket exists to break.
+   *
+   * Deliberately NOT age-gated, matching `clear_stuck_payment_receipt`: the two-step route has no
+   * age gate either, and a rule people can route around is not a safety property. The wallet only
+   * *recommends* this once the receipt is past the stuck threshold.
+   *
+   * What it does not do: discard a LIVE session. That record still holds a usable verification link
+   * which SSIVC issues only once (R2-M01), so it is refused here and must go through
+   * `clear_stuck_payment_receipt`, which asks for its own separate confirmation.
+   */
+  discardStuckReceiptAndPayFresh?: string
 }
 
 /**
@@ -148,12 +170,66 @@ export interface RequestVerificationFailure {
   insufficientFunds?: PaymentShortfall
   /** Set when the spending cap refused the payment — includes which cap key was applied. */
   paymentCap?: PaymentCapDetail
+  /**
+   * The settlement receipt at stake, when one exists. Its own field because it is the
+   * first thing support asks for, and digging it out of a long sentence invites transcription errors
+   * on a value that identifies real money.
+   */
+  paymentReceipt?: string
 }
 
-export type RequestVerificationResult = SsivcSessionCreated | RequestVerificationFailure | { quote: VerificationQuote }
+/**
+ * The payment WAS sent and the sponsored settlement is still queued. Deliberately its own
+ * variant rather than a `RequestVerificationFailure`: reporting a live settlement as `{ error }`
+ * made callers — and, in the 18 Sep 2026 QA run, the agent summarising for the user — read it as
+ * "the payment failed", the opposite of what happened. Nothing is lost here and nothing needs
+ * retrying: the receipt is already persisted, and `check_ai_birthcert_verification` follows it.
+ */
+export interface RequestVerificationPending {
+  /** Always `true` — a discriminant a caller can branch on without parsing `message`. */
+  settlementPending: true
+  /** The live settlement receipt. Surfaced as its own field because it is what support asks for first. */
+  paymentReceipt: string
+  message: string
+}
+
+export type RequestVerificationResult =
+  /** `discardedPaymentReceipt` is set only when this call discarded a stuck receipt to pay again. */
+  | (SsivcSessionCreated & { discardedPaymentReceipt?: string })
+  | RequestVerificationFailure
+  | { quote: VerificationQuote }
+  | RequestVerificationPending
 
 export type CheckVerificationResult =
   | { status: 'no_session'; message: string }
+  /**
+   * A payment HAS been made and the wallet is holding its receipt. Distinct from
+   * `no_session`: never tell the caller to start over, and never pay again.
+   *
+   * R2-L01: this one status covers TWO materially different situations, and `outcomeUnknown` is
+   * what tells them apart — `request_` keeps them structurally distinct and this surface must not
+   * collapse them:
+   *  - absent/false — queued and progressing normally. It will most likely resolve on its own;
+   *    checking again in a few minutes is the right advice. Message leads `PAYMENT SENT`.
+   *  - true — the outcome could not be determined at all (the replay itself failed). It may never
+   *    resolve, so "check back later" is the wrong advice on its own: the receipt id needs to reach
+   *    a human. Message leads `OUTCOME UNKNOWN`.
+   */
+  | {
+      status: 'settlement_pending'
+      message: string
+      paymentReceipt: string
+      outcomeUnknown?: boolean
+      /** How long it has been unresolved, when that is past {@link DEFAULT_SETTLEMENT_STUCK_AFTER_MS}. */
+      stuckFor?: string
+    }
+  /**
+   * SSIVC has declared the receipt void — `status_code 67` (expired) or `68` (failed) — so this is
+   * terminal. Distinct from `settlement_pending`, which invites checking again; here there
+   * is nothing to check. It says nothing about whether the fee was taken: see
+   * {@link SettlementReceiptVoidError}.
+   */
+  | { status: 'receipt_void'; message: string; paymentReceipt: string }
   | (SsivcSessionStatus & { vc?: unknown; cacheError?: string; verificationUrl?: string; vcPassImagePaths?: string[] })
 
 /** True iff `entry.vc.credentialSubject.id` equals `holderDid`. */
@@ -200,7 +276,8 @@ async function getConfirmedStatus(
  */
 type PriorSessionDecision =
   | { kind: 'still_pending'; result: SsivcSessionCreated }
-  | { kind: 'replay_receipt'; receipt: string }
+  /** The record the receipt came from — APP-M03 reads its optional fields back. */
+  | { kind: 'replay_receipt'; receipt: string; stored: StoredSsivcSession }
   | { kind: 'pay_fresh' }
   | { kind: 'blocked'; message: string }
 
@@ -219,7 +296,7 @@ async function decidePriorSession(
   // receipt is the correct resume action regardless of which agentName is on the stored record —
   // same reasoning as R2-L03 below, the receipt is bound to the request body's signature, not to
   // agentName.
-  if (stored.sessionId === '') return { kind: 'replay_receipt', receipt: stored.paymentReceipt }
+  if (stored.sessionId === '') return { kind: 'replay_receipt', receipt: stored.paymentReceipt, stored }
 
   if (stored.agentName !== agentName) {
     // APP-M01: the store holds exactly one record. Overwriting it below would silently destroy the
@@ -233,7 +310,7 @@ async function decidePriorSession(
     // receipt is scoped to the request body's signature (see ssivc-client.ts: `signedData` is what
     // binds a session to a specific agent key), not to agentName at the payment layer, so replaying
     // it under the new agentName's body is the same operation createSessionWithReceipt already does.
-    if (otherStatus === 'gone') return { kind: 'replay_receipt', receipt: stored.paymentReceipt }
+    if (otherStatus === 'gone') return { kind: 'replay_receipt', receipt: stored.paymentReceipt, stored }
     if (otherStatus.status === 'pending') {
       return {
         kind: 'blocked',
@@ -250,11 +327,11 @@ async function decidePriorSession(
     // (SPEC.md §634), a "settled but unconsumed" case exactly like the 404/"gone" branch above — the
     // receipt is ONLY consumed once a session reaches "issued". Same R2-L03 reasoning applies: safe
     // to replay under the new agentName's signed body regardless of the exact status string.
-    return { kind: 'replay_receipt', receipt: stored.paymentReceipt }
+    return { kind: 'replay_receipt', receipt: stored.paymentReceipt, stored }
   }
 
   const status = await getConfirmedStatus(deps, stored.sessionId)
-  if (status === 'gone') return { kind: 'replay_receipt', receipt: stored.paymentReceipt }
+  if (status === 'gone') return { kind: 'replay_receipt', receipt: stored.paymentReceipt, stored }
   if (status.status === 'pending') {
     return {
       kind: 'still_pending',
@@ -269,7 +346,7 @@ async function decidePriorSession(
   // the receipt unconsumed. Treat it exactly like the 404/"gone" branch above — replay it — rather
   // than failing closed. `pending` (still in flight) and `issued` (dead receipt) remain the only two
   // statuses handled specially; everything else funnels here.
-  return { kind: 'replay_receipt', receipt: stored.paymentReceipt }
+  return { kind: 'replay_receipt', receipt: stored.paymentReceipt, stored }
 }
 
 /** Serializes the decide → pay → persist critical section (APP-M02) — the MCP host does not
@@ -301,9 +378,84 @@ const DEFAULT_MAX_SETTLEMENT_ATTEMPTS = 20
  * `Retry-After` header) and is only guaranteed finite and > 0 — a misbehaving or malicious value
  * (e.g. 999999999) must not be honoured verbatim, or a single attempt could hang for hours. 60s is
  * generous relative to the observed testnet paymaster latency (SSIVC defaults to a 15s suggestion)
- * while keeping the worst case for the whole loop bounded (20 attempts * 60s = 20 minutes).
+ * while keeping any single attempt bounded. The worst case for the WHOLE loop is bounded by
+ * {@link DEFAULT_SETTLEMENT_WAIT_BUDGET_MS}, not by this value times the attempt cap.
  */
 const MAX_RETRY_DELAY_MS = 60_000
+
+/**
+ * Wall-clock ceiling on the TOTAL time {@link resolveSettlement} will block a single
+ * `request_ai_birthcert_verification` call waiting for a queued settlement.
+ *
+ * The attempt cap alone does not bound this: `retryAfterSeconds` is server-supplied, so
+ * {@link DEFAULT_MAX_SETTLEMENT_ATTEMPTS} attempts x {@link MAX_RETRY_DELAY_MS} is up to 20 minutes
+ * — and in the 18 Sep 2026 QA run it blocked for ~27 minutes inside one tool call, with no output,
+ * so the user never learned a payment had even been made. Waiting longer buys nothing: the receipt
+ * is persisted the moment settlement is first seen as queued, so returning early loses no money and
+ * no state — `check_ai_birthcert_verification` picks the same receipt up.
+ *
+ * Summed over INTENDED delays rather than measured elapsed time, so it stays deterministic under an
+ * injected `sleep` and cannot be stretched by slow I/O between attempts.
+ */
+const DEFAULT_SETTLEMENT_WAIT_BUDGET_MS = 90_000
+
+/**
+ * How old an unconfirmed settlement must be before the wallet calls it permanently stuck.
+ *
+ * SSIVC answers `status_code 69` ("settlement status could not be confirmed. Please retry.") for a
+ * settlement two minutes old and for one three weeks old alike — verified live on 2026-09-21 against
+ * two independently stuck receipts, one of them 19 days old and still returning 69. Their code
+ * therefore cannot distinguish "still in flight" from "never coming back", and the wallet must use
+ * the receipt's own age instead.
+ *
+ * This changes only WHICH TRUE STATEMENT the user is told. Either side of the line, the wallet still
+ * never pays again and never discards the receipt on its own.
+ */
+const DEFAULT_SETTLEMENT_STUCK_AFTER_MS = 86_400_000
+
+/**
+ * How long this receipt has been unresolved, and whether that is past the point of hoping.
+ *
+ * `createdAt` is when the record was first written — i.e. when the payment was made — so it is the
+ * right clock: a receipt re-persisted by a later retry must not look young again.
+ */
+function settlementAge(
+  stored: { createdAt?: string } | null | undefined,
+  now: Date,
+  stuckAfterMs: number,
+): { ageMs: number; stuck: boolean; humanAge: string } {
+  const created = stored?.createdAt ? new Date(stored.createdAt).getTime() : NaN
+  // An unparseable or absent createdAt reads as brand new: the gentler message is the safe default,
+  // since it is the one that keeps the receipt and tells nobody their money is gone.
+  const ageMs = Number.isNaN(created) ? 0 : Math.max(0, now.getTime() - created)
+  const hours = ageMs / 3_600_000
+  const humanAge =
+    hours < 1 ? `${Math.round(ageMs / 60_000)} minutes` : hours < 48 ? `${Math.round(hours)} hours` : `${Math.round(hours / 24)} days`
+  return { ageMs, stuck: ageMs > stuckAfterMs, humanAge }
+}
+
+/**
+ * Fallback delay when SSIVC's `retryAfterSeconds` is unusable. Mirrors the client's own
+ * DEFAULT_RETRY_AFTER_SECONDS (15s), so a missing and a malformed Retry-After behave identically.
+ */
+const FALLBACK_RETRY_DELAY_MS = 15_000
+
+/**
+ * `retryAfterSeconds` -> a delay that is always finite, positive and within {@link MAX_RETRY_DELAY_MS}
+ * (APP-M03).
+ *
+ * `Math.min` alone only clamps the UPPER bound. NaN makes every comparison false, and a negative or
+ * zero value makes the budget's overrun check false too — so the wait budget silently stopped
+ * applying and only the attempt cap bounded the loop, contradicting the budget's own docstring. A
+ * negative value would also have been passed to `setTimeout` as a negative delay.
+ *
+ * Not reachable through today's SsivcClient, which validates Retry-After at the boundary. This is
+ * defence in depth on a value that arrives over the network.
+ */
+function retryDelayMs(retryAfterSeconds: number): number {
+  if (!Number.isFinite(retryAfterSeconds) || retryAfterSeconds <= 0) return FALLBACK_RETRY_DELAY_MS
+  return Math.min(retryAfterSeconds * 1000, MAX_RETRY_DELAY_MS)
+}
 
 const defaultSleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -343,6 +495,47 @@ class SettlementOutcomeUnknownError extends Error {
 }
 
 /**
+ * SSIVC has declared the receipt void — `status_code 67` (expired) or `68` (failed).
+ *
+ * This is the terminal verdict this work was originally written for, and the one that was missing
+ * while only `69` was known: `67`'s own text is "Payment required again". Distinct from
+ * {@link SettlementOutcomeUnknownError}, which means nobody knows yet — here SSIVC does know, and
+ * the answer is that this receipt will never produce a credential.
+ *
+ * What it still does NOT settle is the money. A settlement can expire at the facilitator after the
+ * transfer has executed — measured on the stuck-settlement incident, where the fee left the wallet and no
+ * credential was issued. So the wallet stops replaying, but never says "nothing was charged", and
+ * never pays again on its own.
+ */
+class SettlementReceiptVoidError extends Error {
+  constructor(message: string, public readonly paymentReceipt: string) {
+    super(message)
+    this.name = 'SettlementReceiptVoidError'
+  }
+}
+
+/** True for the two SSIVC verdicts that make a receipt permanently unusable. */
+function isReceiptVoid(err: unknown): err is SsivcError {
+  return err instanceof SsivcError && err.kind === 'settlement_void'
+}
+
+/**
+ * Why a replay could not be resolved, in the words the user will read.
+ *
+ * Separates the two causes the catch-all used to flatten into one sentence. SSIVC answering
+ * `status_code 69` is AUTHORITATIVE: their own settlement record is unresolved, which is what later
+ * justifies telling the user the fee was most likely taken. Our own connection dropping says nothing
+ * about their side, and must not be reported as though it did — the receipt is kept either way, but
+ * only one of these is evidence about where the money went.
+ */
+function unresolvedCause(err: unknown): string {
+  if (err instanceof SsivcError && err.kind === 'settlement_unconfirmed') {
+    return 'the payment service reports that it cannot confirm the settlement either way'
+  }
+  return `the receipt-replay call itself failed (${err instanceof Error ? err.message : String(err)})`
+}
+
+/**
  * Drives a possibly-already-started settlement to a terminal `settled` outcome, retrying with the
  * receipt (never `X-Payment` — REQ-32) until it is or the retry budget runs out. Every retry
  * re-invokes `buildBody`, never reuses a signed envelope: SSIVC rejects a `timestamp` older than 5
@@ -356,13 +549,15 @@ class SettlementOutcomeUnknownError extends Error {
  * up to 20 minutes — unprotected (REQ-35).
  */
 async function resolveSettlement(
-  deps: Pick<VerifyAiBirthcertDeps, 'ssivc' | 'sleep' | 'maxSettlementAttempts'>,
+  deps: Pick<VerifyAiBirthcertDeps, 'ssivc' | 'sleep' | 'maxSettlementAttempts' | 'settlementWaitBudgetMs' | 'settlementStuckAfterMs'>,
   buildBody: () => Promise<SsivcSessionRequestBody>,
   initialOutcome: SsivcSessionOutcome,
   onQueued: (receipt: string) => Promise<void>,
 ): Promise<{ session: SsivcSessionCreated; paymentReceipt: string }> {
   const sleep = deps.sleep ?? defaultSleep
   const maxAttempts = deps.maxSettlementAttempts ?? DEFAULT_MAX_SETTLEMENT_ATTEMPTS
+  const waitBudgetMs = deps.settlementWaitBudgetMs ?? DEFAULT_SETTLEMENT_WAIT_BUDGET_MS
+  let waitedMs = 0
 
   let outcome = initialOutcome
   let lastPersistedReceipt: string | undefined
@@ -372,7 +567,16 @@ async function resolveSettlement(
   }
 
   for (let attempt = 0; outcome.kind === 'queued' && attempt < maxAttempts; attempt++) {
-    const delayMs = Math.min(outcome.retryAfterSeconds * 1000, MAX_RETRY_DELAY_MS)
+    const delayMs = retryDelayMs(outcome.retryAfterSeconds)
+    // Stop BEFORE a sleep that would overrun the budget rather than after it — overshooting is
+    // exactly the failure the bounded wait is about, and a server-supplied retryAfterSeconds must never be
+    // able to buy itself one more full MAX_RETRY_DELAY_MS past the ceiling.
+    //
+    // `attempt > 0` guarantees at least one poll (APP-M01). The budget caps how LONG we wait; it must
+    // never mean "do not even ask once". Without this, a budget below the first delay produced zero
+    // polls, so SETTLEMENT_WAIT_BUDGET_MS=1 silently disabled settlement polling altogether.
+    if (attempt > 0 && waitedMs + delayMs > waitBudgetMs) break
+    waitedMs += delayMs
     await sleep(delayMs)
     const receiptSent = outcome.paymentReceipt
     try {
@@ -382,9 +586,12 @@ async function resolveSettlement(
       // SettlementOutcomeUnknownError's docstring. Never silently swallow it or guess a terminal
       // classification; surface it distinctly so the caller (requestAiBirthcertVerificationLocked's
       // outer catch) can report it without touching the stored receipt.
+      // SSIVC saying the receipt is void is a KNOWN outcome, not an unknown one, so it must
+      // not be folded into the indeterminate branch — the advice differs completely.
+      if (isReceiptVoid(err)) throw new SettlementReceiptVoidError(err.message, receiptSent)
       throw new SettlementOutcomeUnknownError(
-        `the settlement outcome for payment receipt ${receiptSent} could not be determined — the ` +
-          `receipt-retry call itself failed (${err instanceof Error ? err.message : String(err)})`,
+        `the settlement outcome for payment receipt ${receiptSent} could not be determined — ` +
+          unresolvedCause(err),
         receiptSent,
       )
     }
@@ -396,8 +603,9 @@ async function resolveSettlement(
 
   if (outcome.kind === 'queued') {
     throw new SettlementStillQueuedError(
-      'the sponsored payment is being processed and has not settled yet — no funds are lost and the ' +
-        'receipt has been kept; run request_ai_birthcert_verification again shortly to resume',
+      'PAYMENT SENT — the sponsored settlement is still being processed. Nothing has gone wrong and ' +
+        'no funds are lost: the receipt has been saved. Call check_ai_birthcert_verification in a ' +
+        'few minutes to follow it through. Do not pay again.',
       outcome.paymentReceipt,
     )
   }
@@ -551,7 +759,7 @@ async function toFacilitatorInsufficientFundsError(
  * so a queued receipt is persisted exactly as robustly whether this is the primary or the self-pay
  * fallback attempt. */
 async function attemptCandidate(
-  deps: Pick<VerifyAiBirthcertDeps, 'ssivc' | 'pay' | 'sleep' | 'maxSettlementAttempts'>,
+  deps: Pick<VerifyAiBirthcertDeps, 'ssivc' | 'pay' | 'sleep' | 'maxSettlementAttempts' | 'settlementWaitBudgetMs' | 'settlementStuckAfterMs'>,
   accept: PayRequirement,
   buildBody: () => Promise<SsivcSessionRequestBody>,
   onQueued: (receipt: string) => Promise<void>,
@@ -567,7 +775,10 @@ async function attemptCandidate(
 }
 
 async function payAndCreateSession(
-  deps: Pick<VerifyAiBirthcertDeps, 'ssivc' | 'pay' | 'sleep' | 'gasPreference' | 'maxSettlementAttempts' | 'formatAssetAmount'>,
+  deps: Pick<
+    VerifyAiBirthcertDeps,
+    'ssivc' | 'pay' | 'sleep' | 'gasPreference' | 'maxSettlementAttempts' | 'settlementWaitBudgetMs' | 'settlementStuckAfterMs' | 'formatAssetAmount'
+  >,
   buildBody: () => Promise<SsivcSessionRequestBody>,
   onQueued: (receipt: string) => Promise<void>,
 ): Promise<{ session: SsivcSessionCreated; paymentReceipt: string }> {
@@ -604,6 +815,16 @@ export async function requestAiBirthcertVerification(
   // (APP-M01) — neither hazard applies to a call that cannot spend and cannot create a session.
   // Routing a quote through them would make preflight unanswerable exactly while a session is in
   // flight, which is when a user most wants to know the price.
+  // Refused rather than ignored: a caller who asked to discard AND to quote has contradicted itself,
+  // and silently quoting would leave it believing a receipt was thrown away when nothing happened.
+  if (input.dryRun && input.discardStuckReceiptAndPayFresh !== undefined) {
+    return {
+      error:
+        `dryRun and discardStuckReceiptAndPayFresh cannot be combined — nothing was discarded and ` +
+        `nothing was quoted. A quote never spends and never discards; discarding a receipt forfeits a ` +
+        `real payment. Decide which one you meant and call again with only that.`,
+    }
+  }
   if (input.dryRun) return quoteVerification(deps, agentName, input)
 
   // withRequestLock must be the very next thing that happens, before any await, so a second
@@ -620,8 +841,29 @@ export async function requestAiBirthcertVerification(
  * minutes (error `55`, REQ-28b), and a sponsored settlement retry loop can easily outlive that
  * window.
  */
+/**
+ * The four optional request fields, as a spreadable object with absent ones omitted.
+ *
+ * One definition shared by {@link buildSessionBody}, the two session-store writes, and the
+ * store-driven replay in {@link checkAiBirthcertVerification}. If they ever drift, a replayed body
+ * stops matching what the user paid for — the exact silent data loss this ticket exists to prevent.
+ */
+function optionalRequestFields(
+  source: Pick<RequestAiBirthcertVerificationInput, 'agentPurpose' | 'evidenceAssuranceLevel' | 'ownerType' | 'ownerVerified'>,
+): Record<string, string> {
+  const fields: Record<string, string> = {}
+  if (source.agentPurpose) fields.agentPurpose = source.agentPurpose
+  if (source.evidenceAssuranceLevel) fields.evidenceAssuranceLevel = source.evidenceAssuranceLevel
+  if (source.ownerType) fields.ownerType = source.ownerType
+  if (source.ownerVerified) fields.ownerVerified = source.ownerVerified
+  return fields
+}
+
 async function buildSessionBody(
-  deps: VerifyAiBirthcertDeps,
+  // APP-L01: narrowed to exactly what it uses, so advanceQueuedSettlement no longer needs a
+  // `deps as VerifyAiBirthcertDeps` cast to call it — that cast re-widened the very type whose
+  // narrowness is what makes "check_ cannot pay" structural rather than a promise.
+  deps: Pick<VerifyAiBirthcertDeps, 'publicKeyHex' | 'address' | 'now' | 'holderDid' | 'signHexBlob'>,
   agentName: string,
   input: RequestAiBirthcertVerificationInput,
 ): Promise<SsivcSessionRequestBody> {
@@ -633,10 +875,7 @@ async function buildSessionBody(
     id: agentName,
     ownerReference: deps.holderDid,
   }
-  if (input.agentPurpose) fields.agentPurpose = input.agentPurpose
-  if (input.evidenceAssuranceLevel) fields.evidenceAssuranceLevel = input.evidenceAssuranceLevel
-  if (input.ownerType) fields.ownerType = input.ownerType
-  if (input.ownerVerified) fields.ownerVerified = input.ownerVerified
+  Object.assign(fields, optionalRequestFields(input))
 
   // signedData covers every field above (never signedData itself) — see canonical-json.ts.
   const digestHex = createHash('sha256').update(canonicalizeJson(fields), 'utf8').digest('hex')
@@ -668,20 +907,98 @@ async function quoteVerification(
   }
 }
 
+/**
+ * The one-call form of "discard the stuck receipt, then pay again".
+ *
+ * Same consent token as `clear_stuck_payment_receipt` — the exact receipt id, echoed back — so this
+ * cannot discard anything the agent was not first shown. It runs inside the request lock, so the
+ * discard and the payment that follows are one atomic step from any other caller's point of view:
+ * no window where the record is gone but the replacement payment has not been made.
+ */
+async function discardStuckReceiptBeforePaying(
+  deps: Pick<VerifyAiBirthcertDeps, 'sessionStore'>,
+  confirmReceiptId: string,
+): Promise<{ refusal: RequestVerificationFailure } | { discarded: string }> {
+  const stored = await deps.sessionStore.get()
+  if (!stored) {
+    return {
+      refusal: {
+        error:
+          `Nothing was discarded and nothing was paid: this wallet holds no payment receipt at all. ` +
+          `There is nothing to start over from — call request_ai_birthcert_verification again without ` +
+          `discardStuckReceiptAndPayFresh and it will pay normally.`,
+      },
+    }
+  }
+  if (stored.paymentReceipt !== confirmReceiptId) {
+    return {
+      refusal: {
+        paymentReceipt: stored.paymentReceipt,
+        error:
+          `discardStuckReceiptAndPayFresh does not match the stored receipt — nothing was discarded ` +
+          `and NOTHING WAS PAID. Stored receipt is ${stored.paymentReceipt}; you sent ` +
+          `${confirmReceiptId}. Confirm with the user which payment they are forfeiting before retrying.`,
+      },
+    }
+  }
+  // R2-M01's protection, kept: a record with a real sessionId still holds a verification link SSIVC
+  // issued exactly once. Throwing that away needs its own deliberate confirmation, not a flag on the
+  // paying tool — and the user may not need to pay at all, since that session is already bought.
+  if (stored.sessionId !== '') {
+    return {
+      refusal: {
+        paymentReceipt: stored.paymentReceipt,
+        error:
+          `STOP — nothing was discarded and nothing was paid. Receipt ${stored.paymentReceipt} is not ` +
+          `stuck: it belongs to live verification session ${stored.sessionId}, which is already paid ` +
+          `for. Call check_ai_birthcert_verification to get its verification link and finish it — ` +
+          `paying again here would buy a second copy of something the user already owns. If they ` +
+          `genuinely want to abandon it, clear_stuck_payment_receipt asks for its own confirmation.`,
+      },
+    }
+  }
+  await deps.sessionStore.clear()
+  return { discarded: stored.paymentReceipt }
+}
+
 async function requestAiBirthcertVerificationLocked(
   deps: VerifyAiBirthcertDeps,
   agentName: string,
   input: RequestAiBirthcertVerificationInput,
 ): Promise<RequestVerificationResult> {
+  // Runs before anything else, because its whole purpose is to make the prior-session check below
+  // see an empty store and take the pay-fresh path instead of replaying the receipt forever.
+  let discardedPaymentReceipt: string | undefined
+  if (input.discardStuckReceiptAndPayFresh !== undefined) {
+    const outcome = await discardStuckReceiptBeforePaying(deps, input.discardStuckReceiptAndPayFresh)
+    if ('refusal' in outcome) return outcome.refusal
+    discardedPaymentReceipt = outcome.discarded
+  }
+
   const decision = await decidePriorSession(deps, agentName)
   if (decision.kind === 'still_pending') return decision.result
   if (decision.kind === 'blocked') return { error: decision.message }
+
+  /**
+   * The optional fields this request should carry: what was already paid for, with an explicit
+   * caller value taking precedence (APP-M03).
+   *
+   * Earlier work stopped check_ from dropping these, but request_'s own replay path rebuilt the body from
+   * `input` alone — so a bare retry (plausible, since check_ is now the advertised resume path)
+   * replayed an incomplete body AND overwrote the record with the empty set, permanently deleting
+   * what the user paid for. Silence must never delete; only an explicit new value may override.
+   */
+  const effectiveOptionalFields: Record<string, string> = {
+    ...(decision.kind === 'replay_receipt' ? optionalRequestFields(decision.stored) : {}),
+    ...optionalRequestFields(input),
+  }
 
   // Rebuilt (and re-signed) on EVERY attempt, never reused — SSIVC rejects a `timestamp` older than
   // 5 minutes (error `55`, REQ-28b), and a sponsored settlement retry loop can easily outlive that
   // window. This is why a thunk is threaded through payAndCreateSession/resolveSettlement instead
   // of a single pre-built body.
-  const buildBody = (): Promise<SsivcSessionRequestBody> => buildSessionBody(deps, agentName, input)
+  const buildBody = (): Promise<SsivcSessionRequestBody> =>
+    buildSessionBody(deps, agentName, { ...input, ...effectiveOptionalFields })
 
   // REQ-35: the receipt is the only handle on a real, already-paid settlement. Persisted the moment
   // ANY queued outcome is first observed (see resolveSettlement) — not only at give-up — so a
@@ -706,6 +1023,11 @@ async function requestAiBirthcertVerificationLocked(
         createdAt: deps.now().toISOString(),
         verificationUrl: '',
         paymentReceipt: receipt,
+        // check_ai_birthcert_verification replays this receipt with no user input to work
+        // from. Without these the replayed body silently drops whatever the user supplied here.
+        // APP-M03: the EFFECTIVE set, so a bare retry re-persists what was paid for instead of
+        // erasing it.
+        ...effectiveOptionalFields,
       })
     } catch {
       // Swallowed intentionally — see the comment above. Nothing to log to today (no logging
@@ -730,9 +1052,10 @@ async function requestAiBirthcertVerificationLocked(
         // Same indeterminate-outcome treatment as the in-loop retry in resolveSettlement (see
         // SettlementOutcomeUnknownError's docstring) — this is the OTHER call site that replays a
         // receipt via createSessionWithReceipt, so it needs the identical guard.
+        if (isReceiptVoid(err)) throw new SettlementReceiptVoidError(err.message, decision.receipt)
         throw new SettlementOutcomeUnknownError(
           `the settlement outcome for payment receipt ${decision.receipt} could not be determined — ` +
-            `the receipt-replay call itself failed (${err instanceof Error ? err.message : String(err)})`,
+            unresolvedCause(err),
           decision.receipt,
         )
       }
@@ -775,15 +1098,24 @@ async function requestAiBirthcertVerificationLocked(
           createdAt: deps.now().toISOString(),
           verificationUrl: '',
           paymentReceipt: err.paymentReceipt,
+          ...effectiveOptionalFields,
         })
       } catch {
+        // APP-C02: built independently of err.message, NOT by appending to it. err.message is the
+        // happy-path text — "the receipt has been saved … call check_ai_birthcert_verification" —
+        // and on this branch both halves are false: the write just failed, so check_ would find
+        // nothing and report no_session. This string is the only place the receipt now exists, which
+        // makes it the worst possible place for a contradiction.
         return {
+          paymentReceipt: err.paymentReceipt,
           error:
-            err.message +
-            ` (could not save the receipt locally — keep this value to resume manually: ${err.paymentReceipt})`,
+            `PAYMENT SENT — the sponsored settlement is still processing, but the receipt could NOT ` +
+            `be saved on this machine. Keep this value safe, it is the only record of the payment: ` +
+            `${err.paymentReceipt}. Do not pay again. Checking the status will not find it — quote ` +
+            `this receipt id to support to resume manually.`,
         }
       }
-      return { error: err.message }
+      return { settlementPending: true, paymentReceipt: err.paymentReceipt, message: err.message }
     }
     // REQ-37/AC-17 (SPEC.md §5.1/§11): a 409 means our fresh X-Payment blob was already settled —
     // most likely a prior attempt's settlement succeeded but its response was lost before we could
@@ -803,14 +1135,61 @@ async function requestAiBirthcertVerificationLocked(
     // in flight. Report it plainly instead of letting it surface as an opaque unhandled throw, and
     // point at manual/operator investigation rather than "try again" — unlike
     // SettlementStillQueuedError, this state is not known-recoverable.
-    if (err instanceof SettlementOutcomeUnknownError) {
+    // SSIVC has ruled on this receipt — it is void. Terminal regardless of age, because
+    // this is not a matter of waiting longer.
+    if (err instanceof SettlementReceiptVoidError) {
       return {
+        paymentReceipt: err.paymentReceipt,
         error:
-          `could not determine whether the sponsored settlement succeeded or failed for payment ` +
-          `receipt ${err.paymentReceipt} (${err.message}) — this is NOT a confirmed failure, so the ` +
-          `receipt has been kept as-is and no new payment has been attempted; this requires manual ` +
-          `investigation by an operator before retrying, rather than calling ` +
-          `request_ai_birthcert_verification again`,
+          `RECEIPT VOID — this payment can no longer be used, and no credential was issued. The ` +
+          `payment service has ruled on it: ${err.message}. Nothing was paid on this call, and the ` +
+          `receipt is still stored. Whether the original fee was actually taken is NOT settled by ` +
+          `this — a settlement can expire after the money has already moved — so do not tell the ` +
+          `user they were not charged; give them receipt ${err.paymentReceipt} to quote to support. ` +
+          `To buy the credential now, they must pay the fee AGAIN: with their explicit agreement, ` +
+          `call request_ai_birthcert_verification with discardStuckReceiptAndPayFresh set to exactly ` +
+          `${err.paymentReceipt}.`,
+      }
+    }
+    if (err instanceof SettlementOutcomeUnknownError) {
+      // Verdict FIRST, detail after. The previous wording was accurate but opened with two
+      // clauses of explanation, and in the QA run the agent kept the gist and dropped the negation —
+      // reporting "the payment failed" to a user whose payment had NOT been confirmed as failed.
+      // A summariser keeps the opening; so the opening has to carry the whole meaning.
+      //
+      // The SAME age split as check_, because this is the tool a stranded user reaches
+      // for. A stuck receipt makes this call replay rather than pay, so it can never issue a
+      // credential while the record stands — which is correct (it protects them from paying twice)
+      // but used to dead-end at "an operator must investigate", naming no operator and no way out.
+      // Past the threshold it now names the escape the wallet actually has, and its price.
+      const age = settlementAge(
+        decision.kind === 'replay_receipt' ? decision.stored : null,
+        deps.now(),
+        deps.settlementStuckAfterMs ?? DEFAULT_SETTLEMENT_STUCK_AFTER_MS,
+      )
+      if (!age.stuck) {
+        return {
+          paymentReceipt: err.paymentReceipt,
+          settlementPending: true,
+          message:
+            `PAYMENT SENT — the settlement has not been confirmed yet, ${age.humanAge} in. Nothing is ` +
+            `lost: receipt ${err.paymentReceipt} is saved and no new payment was attempted. Do NOT pay ` +
+            `again. Call check_ai_birthcert_verification in a few minutes to follow it through.`,
+        }
+      }
+      return {
+        paymentReceipt: err.paymentReceipt,
+        error:
+          `OUTCOME UNKNOWN — do not retry, do not assume failure. The sponsored settlement for payment ` +
+          `receipt ${err.paymentReceipt} could not be determined either way (${err.message}), and has ` +
+          `been unresolved for ${age.humanAge} — past the point where it resolves on its own. The fee ` +
+          `was most likely already taken and no credential was issued. This call did NOT pay again: ` +
+          `the receipt is kept, and while it is kept this tool can only ever replay it, never buy a ` +
+          `new credential. To start over, the user must first discard it with ` +
+          `clear_stuck_payment_receipt — which forfeits that payment — and the next request then pays ` +
+          `a SECOND fee. Both steps at once: call request_ai_birthcert_verification with ` +
+          `discardStuckReceiptAndPayFresh set to exactly ${err.paymentReceipt}. Either way, show the ` +
+          `user that cost and get their agreement first. Quote receipt ${err.paymentReceipt} to support.`,
       }
     }
     throw err
@@ -822,37 +1201,393 @@ async function requestAiBirthcertVerificationLocked(
     createdAt: deps.now().toISOString(),
     verificationUrl: paid.session.verificationUrl,
     paymentReceipt: paid.paymentReceipt,
+    // Benign today — a record with a real sessionId never replays — but the same latent gap as the
+    // queued writes, so it carries the fields for consistency (APP-M03).
+    ...effectiveOptionalFields,
   })
 
-  return paid.session
+  // The discarded receipt id rides back on the success, because this call is the only
+  // place it still exists — the store has been overwritten by the new session, and support asks for
+  // that id first when reconciling a payment that bought nothing.
+  return discardedPaymentReceipt ? { ...paid.session, discardedPaymentReceipt } : paid.session
+}
+
+/**
+ * Drives a stored give-up record (`sessionId: ''`) forward by replaying its settlement receipt
+ *.
+ *
+ * This is the whole point of the ticket: before it, check_ only READ state, so a give-up record was
+ * a dead end — "wait a few minutes and check back" progressed nothing, and the only tool that could
+ * resume was the one that spends. This never pays: it replays a receipt for a payment already made
+ * (`deps` deliberately excludes `pay`, so that is true by construction, not by discipline).
+ *
+ * The request body is rebuilt from the STORE, not from caller input — check_ takes none. That is why
+ * {@link StoredSsivcSession} carries the optional request fields: a body missing them would issue
+ * the credential without what the user paid for.
+ *
+ * Every failure mode leaves the stored receipt exactly as it is. It is the only handle on real money.
+ */
+async function advanceQueuedSettlement(
+  deps: Pick<
+    VerifyAiBirthcertDeps,
+    'ssivc' | 'sessionStore' | 'signHexBlob' | 'publicKeyHex' | 'address' | 'holderDid' | 'now' | 'sleep' | 'maxSettlementAttempts' | 'settlementWaitBudgetMs' | 'settlementStuckAfterMs'
+  >,
+  stored: StoredSsivcSession,
+): Promise<CheckVerificationResult> {
+  const buildBody = (): Promise<SsivcSessionRequestBody> =>
+    buildSessionBody(deps, stored.agentName, {
+      agentName: stored.agentName,
+      ...optionalRequestFields(stored),
+    })
+
+  let initialOutcome: SsivcSessionOutcome
+  try {
+    initialOutcome = await deps.ssivc.createSessionWithReceipt(await buildBody(), stored.paymentReceipt)
+  } catch (err) {
+    if (isReceiptVoid(err)) return voidReceiptOutcome(stored.paymentReceipt, err.message)
+    return unknownSettlementOutcome(stored.paymentReceipt, err, undefined, settlementAge(stored, deps.now(), deps.settlementStuckAfterMs ?? DEFAULT_SETTLEMENT_STUCK_AFTER_MS))
+  }
+
+  let settled: { session: SsivcSessionCreated; paymentReceipt: string }
+  try {
+    // APP-M02: a REAL persister, not a no-op. The previous no-op leaned on "resolveSettlement only
+    // ever reports the same receipt back for a replay" — an assumption about SSIVC that was never
+    // confirmed, sitting right beside the receipt-changed branch that the sibling request_ path wires
+    // a real writer into precisely because it can happen (REQ-35). If SSIVC ever does hand back a
+    // fresh receipt, the no-op meant check_ reported it in chat while the store kept the dead one,
+    // and every later call replayed a corpse forever — the exact loss REQ-35 exists to prevent.
+    //
+    // Best-effort, same as persistQueuedReceipt: a store failure must never abort a settlement the
+    // user has already paid for.
+    const persistReplayedReceipt = async (receipt: string): Promise<void> => {
+      try {
+        await deps.sessionStore.set({ ...stored, paymentReceipt: receipt })
+      } catch {
+        // Swallowed deliberately — see above.
+      }
+    }
+    settled = await resolveSettlement(deps, buildBody, initialOutcome, persistReplayedReceipt)
+  } catch (err) {
+    if (err instanceof SettlementStillQueuedError) {
+      return { status: 'settlement_pending', message: err.message, paymentReceipt: err.paymentReceipt }
+    }
+    if (err instanceof SettlementReceiptVoidError) return voidReceiptOutcome(err.paymentReceipt, err.message)
+    if (err instanceof SettlementOutcomeUnknownError) {
+      return unknownSettlementOutcome(err.paymentReceipt, undefined, err.message, settlementAge(stored, deps.now(), deps.settlementStuckAfterMs ?? DEFAULT_SETTLEMENT_STUCK_AFTER_MS))
+    }
+    throw err
+  }
+
+  // Settled at last: upgrade the give-up record into a real session so the NEXT call is an ordinary
+  // status check rather than another replay. Best-effort for the same reason persistQueuedReceipt is
+  // — a store failure must not discard a session the user has already paid for and can act on now.
+  try {
+    await deps.sessionStore.set({
+      ...stored,
+      sessionId: settled.session.sessionId,
+      verificationUrl: settled.session.verificationUrl,
+      paymentReceipt: settled.paymentReceipt,
+    })
+  } catch {
+    // Swallowed: the verificationUrl below is still valid and is what the user needs right now.
+  }
+
+  return {
+    sessionId: settled.session.sessionId,
+    status: 'pending',
+    expiresAt: settled.session.expiresAt,
+    verificationUrl: settled.session.verificationUrl,
+  }
+}
+
+/** The one phrasing for "this wallet has no stored session at all". */
+function noStoredSession(): CheckVerificationResult {
+  return {
+    status: 'no_session',
+    message: 'No verification session found for this wallet — call request_ai_birthcert_verification first.',
+  }
+}
+
+/**
+ * The one phrasing for "SSIVC has ruled: this receipt is finished" — see {@link SettlementReceiptVoidError}.
+ *
+ * Deliberately NOT age-aware, unlike {@link unknownSettlementOutcome}: age exists to guess whether
+ * something unresolved will resolve, and here nothing is unresolved. Deliberately not a
+ * `settlement_pending` status either — that would send an agent back to keep checking a dead receipt.
+ */
+function voidReceiptOutcome(paymentReceipt: string, detail: string): CheckVerificationResult {
+  return {
+    status: 'receipt_void',
+    paymentReceipt,
+    message:
+      `RECEIPT VOID — this payment can no longer be used and no credential was issued. The payment ` +
+      `service has ruled on it: ${detail}. Checking again will not change this. Whether the fee was ` +
+      `actually taken is NOT settled by this — a settlement can expire after the money has moved — ` +
+      `so do not tell the user they were not charged; give them receipt ${paymentReceipt} to quote ` +
+      `to support. Buying the credential now means paying the fee AGAIN, which needs their explicit ` +
+      `agreement: request_ai_birthcert_verification with discardStuckReceiptAndPayFresh set to ` +
+      `exactly ${paymentReceipt}.`,
+  }
+}
+
+/**
+ * The one phrasing for "we do not know whether this settled" — see {@link SettlementOutcomeUnknownError}.
+ *
+ * This splits it in two by the receipt's age, because one status code covers two situations that
+ * need opposite advice. The old single message told someone whose payment was ninety seconds old
+ * that an operator had to investigate, and told someone whose payment died three weeks ago to keep
+ * waiting. Both were wrong in the same words.
+ */
+function unknownSettlementOutcome(
+  paymentReceipt: string,
+  err?: unknown,
+  message?: string,
+  age?: { stuck: boolean; humanAge: string },
+): CheckVerificationResult {
+  const detail = message ?? unresolvedCause(err)
+
+  // Still young: the settlement may genuinely be in flight, so the honest advice is to wait. The
+  // receipt is kept either way; only the wording differs.
+  if (age && !age.stuck) {
+    return {
+      status: 'settlement_pending',
+      paymentReceipt,
+      message:
+        `PAYMENT SENT — the settlement has not been confirmed yet, ${age.humanAge} in. Nothing has ` +
+        `gone wrong and no funds are lost: receipt ${paymentReceipt} is saved. Do NOT pay again. ` +
+        `Call check_ai_birthcert_verification again in a few minutes to follow it through.`,
+    }
+  }
+
+  return {
+    status: 'settlement_pending',
+    paymentReceipt,
+    // R2-L01: the machine-readable half of the OUTCOME UNKNOWN verdict. Without it the status alone
+    // reads as "queued, check back later", which is the one piece of advice this branch must not give.
+    outcomeUnknown: true,
+    ...(age ? { stuckFor: age.humanAge } : {}),
+    message:
+      `OUTCOME UNKNOWN — do not retry, do not assume failure. The settlement outcome for payment ` +
+      `receipt ${paymentReceipt} could not be determined: ${detail}. ` +
+      (age
+        ? `It has been unresolved for ${age.humanAge}, which is past the point where it resolves on ` +
+          `its own. The fee was most likely already taken and no credential was issued — say so ` +
+          `plainly rather than implying the payment may still land. `
+        : '') +
+      `The receipt has been kept. Quote this receipt id to support. ` +
+      (age
+        ? `To start over, clear_stuck_payment_receipt discards it — and the next request pays a SECOND fee.`
+        : ''),
+  }
+}
+
+export interface ClearStuckPaymentReceiptInput {
+  /**
+   * The receipt id to discard, echoed back exactly as a prior unconfirmed call reported it.
+   * Omit to be shown the id and the warning first.
+   */
+  confirmReceiptId?: string
+  /**
+   * Second, separate confirmation, required only when the record has become a LIVE session since
+   * the receipt id was issued (R2-M01).
+   *
+   * The receipt id alone is not a sufficient token here: `advanceQueuedSettlement` upgrades a stuck
+   * record into a real session while leaving `paymentReceipt` unchanged, so an id handed out in
+   * step 1 stays valid across the very `check_ai_birthcert_verification` call this tool tells the
+   * agent to make first. Without this flag, that sequence would silently destroy a paid, open
+   * session and its one-shot verification_url.
+   */
+  confirmDiscardLiveSession?: boolean
+}
+
+export interface ClearStuckPaymentReceiptResult {
+  cleared: boolean
+  /** The receipt at stake — present whenever one is stored, cleared or not. Support asks for this first. */
+  paymentReceipt?: string
+  /** True when a receipt is stored and the caller has not yet confirmed which one to discard. */
+  requiresConfirmation?: boolean
+  /** The live session id, when the record holds one — reported so a live session is never discarded blind. */
+  sessionId?: string
+  /**
+   * The live session's verification link, echoed back when the tool refuses to discard it.
+   * The store is the only place this survives — SSIVC issues it once, at creation — so handing it
+   * back is the difference between "nothing was lost" and losing a paid-for link.
+   */
+  verificationUrl?: string
+  message?: string
+  error?: string
+}
+
+/**
+ * Discard a stuck payment record.
+ *
+ * When a settlement outcome is genuinely unknown the wallet keeps the receipt and refuses to pay
+ * again — correct, since guessing risks charging the user twice. But that left no way out: the only
+ * remedy was deleting `<stateDir>/ssivc-session.json` on the gateway by hand, which a hosted Avatar
+ * subscriber has no access to do. Same structural gap as the spending cap.
+ *
+ * Two-step by construction, not by convention. A call without `confirmReceiptId` clears nothing and
+ * reports the id; clearing requires echoing that exact id back. An agent therefore cannot discard a
+ * receipt it was never shown, so "never automatic, and the receipt id must be shown before it is
+ * discarded" holds structurally rather than by asking the model to behave.
+ *
+ * Confirmed-failure handling does not remove the need for this: timeouts and lost
+ * responses will always leave some outcomes genuinely unknown.
+ */
+export async function clearStuckPaymentReceipt(
+  deps: Pick<VerifyAiBirthcertDeps, 'sessionStore'>,
+  input: ClearStuckPaymentReceiptInput,
+): Promise<ClearStuckPaymentReceiptResult> {
+  // APP-M01: same single-slot store request_ and check_ mutate, so the same lock. Without it, this
+  // can delete a receipt in the middle of another call's replay — destroying the only handle on a
+  // payment that was, at that moment, being successfully settled.
+  return withRequestLock(() => clearStuckPaymentReceiptLocked(deps, input))
+}
+
+async function clearStuckPaymentReceiptLocked(
+  deps: Pick<VerifyAiBirthcertDeps, 'sessionStore'>,
+  input: ClearStuckPaymentReceiptInput,
+): Promise<ClearStuckPaymentReceiptResult> {
+  const stored = await deps.sessionStore.get()
+  if (!stored) {
+    return { cleared: false, message: 'Nothing to clear — this wallet has no stored verification session or payment receipt.' }
+  }
+
+  // A record with a real sessionId is not a stuck receipt: the user may still have a working
+  // verification link. Discarding it is allowed (they may genuinely want to start over) but must not
+  // be described in the same terms as clearing a dead end.
+  const isLiveSession = stored.sessionId !== ''
+
+  if (input.confirmReceiptId === undefined) {
+    return {
+      cleared: false,
+      requiresConfirmation: true,
+      paymentReceipt: stored.paymentReceipt,
+      ...(isLiveSession ? { sessionId: stored.sessionId, verificationUrl: stored.verificationUrl } : {}),
+      message:
+        `This will discard payment receipt ${stored.paymentReceipt}` +
+        (isLiveSession
+          ? ` AND the live verification session ${stored.sessionId}, which may still be open and usable — ` +
+            `check check_ai_birthcert_verification before discarding it.`
+          : '.') +
+        ` The payment it represents becomes unrecoverable and CANNOT be undone — if that settlement ` +
+        `ever completes, the funds are forfeit and the credential is not issued. Only do this when the ` +
+        `outcome is genuinely stuck. Show the receipt id to the user, get their explicit agreement, ` +
+        `then call this tool again with confirmReceiptId set to exactly that id` +
+        (isLiveSession ? ` and confirmDiscardLiveSession set to true.` : `.`),
+    }
+  }
+
+  if (input.confirmReceiptId !== stored.paymentReceipt) {
+    return {
+      cleared: false,
+      paymentReceipt: stored.paymentReceipt,
+      error:
+        `confirmReceiptId does not match the stored receipt — nothing was cleared. Stored receipt is ` +
+        `${stored.paymentReceipt}; you sent ${input.confirmReceiptId}. Confirm you are discarding the ` +
+        `right payment before retrying.`,
+    }
+  }
+
+  // R2-M01: the record may have gone LIVE between the two calls — and the path this tool's own
+  // description recommends first ("call check_ai_birthcert_verification instead; it actively
+  // advances a queued settlement") is exactly what makes it happen. That upgrade leaves
+  // `paymentReceipt` unchanged, so the id from step 1 still matches and the id alone can no longer
+  // be trusted as the whole confirmation. This is not a tight race: the window is agent-turns wide,
+  // so the lock cannot close it. Re-derived here, on the confirming call, against the record as it
+  // is NOW — never against the state step 1 happened to see.
+  if (isLiveSession && input.confirmDiscardLiveSession !== true) {
+    return {
+      cleared: false,
+      requiresConfirmation: true,
+      paymentReceipt: stored.paymentReceipt,
+      sessionId: stored.sessionId,
+      verificationUrl: stored.verificationUrl,
+      message:
+        `STOP — nothing was cleared. This is no longer a stuck receipt: the settlement completed and ` +
+        `receipt ${stored.paymentReceipt} now belongs to LIVE verification session ${stored.sessionId}` +
+        (stored.verificationUrl ? `, whose verification link is ${stored.verificationUrl}` : '') +
+        `. The payment worked. Give the user that link and let them finish MyDigital ID verification ` +
+        `— clearing now would throw away a session they have already paid for, and the link cannot be ` +
+        `reissued. If they genuinely want to abandon it and start over, call again with the same ` +
+        `confirmReceiptId AND confirmDiscardLiveSession set to true.`,
+    }
+  }
+
+  await deps.sessionStore.clear()
+  return {
+    cleared: true,
+    paymentReceipt: stored.paymentReceipt,
+    ...(isLiveSession ? { sessionId: stored.sessionId } : {}),
+    message:
+      `Cleared payment receipt ${stored.paymentReceipt}` +
+      (isLiveSession
+        ? ` AND live verification session ${stored.sessionId}, which was open and paid for — its ` +
+          `verification link is gone and cannot be reissued.`
+        : '.') +
+      ` The wallet no longer holds it, so ` +
+      `request_ai_birthcert_verification will pay fresh on the next call. Keep this receipt id in ` +
+      `case the original payment needs to be traced.`,
+  }
 }
 
 export async function checkAiBirthcertVerification(
   deps: Pick<
     VerifyAiBirthcertDeps,
-    'ssivc' | 'sessionStore' | 'mbi' | 'messageSigner' | 'address' | 'holderDid' | 'verifiedTemplateId' | 'cache' | 'quarantine' | 'passImagesDir'
+    | 'ssivc'
+    | 'sessionStore'
+    | 'mbi'
+    | 'messageSigner'
+    | 'address'
+    | 'holderDid'
+    | 'verifiedTemplateId'
+    | 'cache'
+    | 'quarantine'
+    | 'passImagesDir'
+    // Needed to rebuild and sign a request body for the receipt replay. This tool still
+    // never pays — `pay` is deliberately NOT in this list, so a replay cannot spend by construction.
+    | 'signHexBlob'
+    | 'publicKeyHex'
+    | 'now'
+    | 'sleep'
+    | 'maxSettlementAttempts'
+    | 'settlementWaitBudgetMs'
+    | 'settlementStuckAfterMs'
   >,
 ): Promise<CheckVerificationResult> {
   const stored = await deps.sessionStore.get()
-  if (!stored) {
-    return {
-      status: 'no_session',
-      message: 'No verification session found for this wallet — call request_ai_birthcert_verification first.',
-    }
-  }
+  if (!stored) return noStoredSession()
+
   // Same root cause as decidePriorSession's empty-sessionId short-circuit: this record means a
   // sponsored payment was made and settlement was still queued when the caller gave up — no session
   // was ever created, so there is no sessionId to look up (SSIVC 301-redirects a lookup against an
   // empty path segment instead of 404ing it). Report this distinctly rather than calling getSession.
+  //
+  // APP-M01: this branch MUTATES the store (replay + write), so it takes the same lock request_ does.
+  // check_ used to be read-only, which is why it never needed one. Two unlocked replays both win
+  // their read and the last write orphans the other's session: one payment, two live SSIVC sessions,
+  // and the stored verificationUrl pointing at only one of them. The store is re-read INSIDE the
+  // lock — by the time we get in, whoever held it may already have finished the job.
   if (stored.sessionId === '') {
-    return {
-      status: 'no_session',
-      message:
-        'a sponsored payment is still settling and no verification session exists yet — the payment ' +
-        'receipt has been kept, so calling request_ai_birthcert_verification again resumes it and ' +
-        'will not pay twice.',
-    }
+    return withRequestLock(async () => {
+      const fresh = await deps.sessionStore.get()
+      if (!fresh) return noStoredSession()
+      if (fresh.sessionId === '') return advanceQueuedSettlement(deps, fresh)
+      return checkExistingSession(deps, fresh)
+    })
   }
+
+  return checkExistingSession(deps, stored)
+}
+
+/** The ordinary status check for a record that already has a real session id. */
+async function checkExistingSession(
+  deps: Pick<
+    VerifyAiBirthcertDeps,
+    'ssivc' | 'mbi' | 'messageSigner' | 'address' | 'holderDid' | 'verifiedTemplateId' | 'cache' | 'quarantine' | 'passImagesDir'
+  >,
+  stored: StoredSsivcSession,
+): Promise<CheckVerificationResult> {
   const status = await deps.ssivc.getSession(stored.sessionId)
   // R13: replay the link we stored at creation. SSIVC issues `verification_url` exactly once, in the
   // create response — `getSession` never returns it — so this store is the only place it survives.

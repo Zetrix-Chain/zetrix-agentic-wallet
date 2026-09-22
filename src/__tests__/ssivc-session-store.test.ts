@@ -55,6 +55,51 @@ describe('createFsSsivcSessionStore', () => {
     expect(await store.get()).toEqual(sample)
   })
 
+  // Check_ai_birthcert_verification replays a stuck receipt with NO user input to work
+  // from, so the optional request fields have to survive in the store — otherwise the replayed body
+  // silently drops whatever the user originally supplied and the credential is issued without it.
+  it('round-trips the optional request fields the credential was paid for', async () => {
+    const store = createFsSsivcSessionStore(join(dir, 'ssivc-session.json'))
+    const withOptionals = {
+      ...sample,
+      agentPurpose: 'Handles procurement negotiations',
+      evidenceAssuranceLevel: 'high',
+      ownerType: 'organisation',
+      ownerVerified: 'true',
+    }
+    await store.set(withOptionals)
+    expect(await store.get()).toEqual(withOptionals)
+  })
+
+  // Older records have none of those fields. They must still load — the receipt
+  // in them is real money, and dropping the record would strand it.
+  it('still loads a record saved before the optional fields existed', async () => {
+    const store = createFsSsivcSessionStore(join(dir, 'ssivc-session.json'))
+    await store.set(sample)
+    expect(await store.get()).toEqual(sample)
+  })
+
+  it('rejects a record whose optional field is present but the wrong type', async () => {
+    const path = join(dir, 'ssivc-session.json')
+    writeFileSync(path, JSON.stringify({ ...sample, agentPurpose: 42 }))
+    expect(await createFsSsivcSessionStore(path).get()).toBeNull()
+  })
+
+  // The only way out of a stuck receipt was deleting this file on the gateway by hand,
+  // which a hosted Avatar subscriber cannot do. The store needs a supported way to discard it.
+  it('clear() removes a saved session so get() reports none', async () => {
+    const store = createFsSsivcSessionStore(join(dir, 'ssivc-session.json'))
+    await store.set(sample)
+    await store.clear()
+    expect(await store.get()).toBeNull()
+  })
+
+  it('clear() is a no-op when nothing has been saved', async () => {
+    const store = createFsSsivcSessionStore(join(dir, 'ssivc-session.json'))
+    await expect(store.clear()).resolves.toBeUndefined()
+    expect(await store.get()).toBeNull()
+  })
+
   it('overwrites a previously saved session', async () => {
     const store = createFsSsivcSessionStore(join(dir, 'ssivc-session.json'))
     await store.set({ ...sample, sessionId: 's-old', agentName: 'Old Agent', paymentReceipt: 'receipt-old' })

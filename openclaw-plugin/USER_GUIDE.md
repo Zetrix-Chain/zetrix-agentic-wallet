@@ -26,7 +26,7 @@ Check it worked:
 ```bash
 openclaw plugins list          # zetrix-agentic-wallet, enabled
 openclaw mcp doctor            # zetrix-agentic-wallet: ok
-openclaw mcp probe zetrix-agentic-wallet   # 10 tools
+openclaw mcp probe zetrix-agentic-wallet   # 14 tools
 ```
 
 Nothing else is needed. No `npx`, no account signup, no password, no MCP configuration.

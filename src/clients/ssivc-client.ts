@@ -19,7 +19,37 @@
 
 import type { PayRequirement } from './mbi-client.js'
 
-export type SsivcErrorKind = 'payment_invalid' | 'facilitator_unavailable' | 'blob_already_settled' | 'validation'
+export type SsivcErrorKind =
+  | 'payment_invalid'
+  | 'facilitator_unavailable'
+  | 'blob_already_settled'
+  | 'validation'
+  /**
+   * SSIVC cannot resolve this receipt's settlement either way — `400` + `status_code 69`.
+   *
+   * NOT a confirmed failure and NOT a confirmed success, so the wallet must neither pay again nor
+   * discard the receipt on it. Their facilitator leaves a blob QUEUED until its payment window
+   * elapses and then reports EXPIRED, which SSIVC does not model — hence "could not be confirmed".
+   * Observed to persist for weeks, so it is also not reliably transient: see the orchestrator, which
+   * distinguishes a fresh one from a permanently stuck one by the receipt's age, not by this code.
+   */
+  | 'settlement_unconfirmed'
+  /**
+   * SSIVC has declared this receipt VOID — `67` (the sponsored settlement expired) or `68` (it
+   * failed). Terminal either way: replaying it can only fail, and `67`'s own text says "Payment
+   * required again".
+   *
+   * Terminal about the RECEIPT, not about the money. A settlement can expire at the facilitator
+   * after the transfer has already executed — observed on the stuck-settlement incident, where the fee left
+   * the wallet and no credential was ever issued. So this licenses "stop replaying and ask the user
+   * whether to pay again"; it does NOT license telling them nothing was charged.
+   */
+  | 'settlement_void'
+
+/** SSIVC's settlement verdicts on the replay path, from the UAT OpenAPI spec + live probes. */
+const SETTLEMENT_UNCONFIRMED_STATUS_CODE = '69'
+const SETTLEMENT_EXPIRED_STATUS_CODE = '67'
+const SETTLEMENT_FAILED_STATUS_CODE = '68'
 
 export class SsivcError extends Error {
   httpStatus?: number
@@ -187,6 +217,15 @@ export class SsivcClient {
       msg = j.errors?.length ? j.errors.join('; ') : (j.message ?? j.error ?? text)
       if (res.status === 402 && j.error === 'payment_invalid') kind = 'payment_invalid'
       else if (res.status === 503 && j.error === 'facilitator_unavailable') kind = 'facilitator_unavailable'
+      // Scoped to the 400 SSIVC actually ships it on: on any other status this code is not
+      // a settlement verdict, and misreading a 5xx as one would let a server fault look terminal.
+      else if (res.status === 400 && statusCode === SETTLEMENT_UNCONFIRMED_STATUS_CODE) kind = 'settlement_unconfirmed'
+      else if (
+        res.status === 400 &&
+        (statusCode === SETTLEMENT_EXPIRED_STATUS_CODE || statusCode === SETTLEMENT_FAILED_STATUS_CODE)
+      ) {
+        kind = 'settlement_void'
+      }
     } catch {
       /* keep raw text; kind is already set above for the status-only cases */
     }

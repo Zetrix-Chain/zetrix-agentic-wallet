@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { buildPayers } from '../index'
+import { buildPayers, buildSettlementWiring } from '../index'
 import { loadConfig } from '../config'
 import { assertWithinPaymentCap } from '../payment-guard'
 
@@ -54,5 +54,46 @@ describe('buildPayers', () => {
 
     await expect(pay(fee as never)).rejects.toThrow()
     await expect(payForCredential(fee as never)).resolves.toBe('paid')
+  })
+})
+
+// R2-L03: same failure shape as the cap wiring above. The config layer parses, validates and warns
+// about SETTLEMENT_WAIT_BUDGET_MS, and the retry loop honours an injected budget — but nothing
+// observed the line joining the two, so deleting it left the env var silently inert in production
+// with every test still green.
+describe('buildSettlementWiring', () => {
+  it('carries the settlement knobs from config onto the deps, under the names the orchestrator reads', () => {
+    const wiring = buildSettlementWiring({
+      gasPreference: 'self',
+      maxSettlementAttempts: 7,
+      settlementWaitBudgetMs: 12_345,
+      aiBirthcertVerifiedTemplateId: 'tpl-verified',
+    })
+
+    expect(wiring).toEqual({
+      gasPreference: 'self',
+      maxSettlementAttempts: 7,
+      settlementWaitBudgetMs: 12_345,
+      verifiedTemplateId: 'tpl-verified',
+    })
+  })
+
+  // The two numeric knobs are interchangeable by type, so a swap would type-check.
+  it('does not swap the attempt count and the wall-clock budget', () => {
+    const wiring = buildSettlementWiring({
+      gasPreference: 'sponsored',
+      maxSettlementAttempts: 20,
+      settlementWaitBudgetMs: 90_000,
+      aiBirthcertVerifiedTemplateId: 'tpl',
+    })
+
+    expect(wiring.maxSettlementAttempts).toBe(20)
+    expect(wiring.settlementWaitBudgetMs).toBe(90_000)
+  })
+
+  it('reaches the deps from a real loadConfig, env var and all', () => {
+    const cfg = loadConfig({ ...base, SETTLEMENT_WAIT_BUDGET_MS: '45000' } as never)
+
+    expect(buildSettlementWiring(cfg).settlementWaitBudgetMs).toBe(45_000)
   })
 })

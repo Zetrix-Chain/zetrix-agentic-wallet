@@ -172,6 +172,82 @@ describe('SsivcClient', () => {
       const out = await ssivc.createSessionWithReceipt(requestBody, 'receipt-abc')
       expect(out).toMatchObject({ kind: 'queued', retryAfterSeconds: 10 })
     })
+
+    // Observed live on UAT 2026-09-21 by replaying two independently stuck receipts
+    // (5fa7ea4e, and the Avatar run's 7e549af8): SSIVC answers `400` + `status_code "69"` +
+    // "Payment settlement status could not be confirmed. Please retry."
+    //
+    // Root cause per the SSIVC team: the facilitator left the blob QUEUED until its payment window
+    // elapsed and reported EXPIRED, which SSIVC does not model — so the settlement outcome is
+    // genuinely unresolved on their side, not confirmed-failed. It is emitted with a dedicated code
+    // now, which is why this keys on `69` and not on the message text.
+    describe('a settlement SSIVC cannot confirm', () => {
+      it('classifies 400 + status_code 69 as kind "settlement_unconfirmed"', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+          resp(400, { status_code: '69', errors: ['Payment settlement status could not be confirmed. Please retry.'] }),
+        ))
+
+        await expect(ssivc.createSessionWithReceipt(requestBody, 'r-stuck')).rejects.toMatchObject({
+          name: 'SsivcError', httpStatus: 400, statusCode: '69', kind: 'settlement_unconfirmed',
+        })
+      })
+
+      // The money-safety boundary. "99" is SSIVC's GENERIC bucket — observed on the same endpoint
+      // for "Unknown or malformed payment receipt." Treating it as a settlement state would let an
+      // ordinary server error drive the wallet's payment decisions.
+      it('leaves a generic 400 + status_code 99 as plain validation', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+          resp(400, { status_code: '99', errors: ['Unknown or malformed payment receipt.'] }),
+        ))
+
+        await expect(ssivc.createSessionWithReceipt(requestBody, 'r-unknown')).rejects.toMatchObject({
+          name: 'SsivcError', httpStatus: 400, kind: 'validation',
+        })
+      })
+
+      // The UAT OpenAPI spec (Applications - AI Birthcert -> createAiBirthcertIssuanceSession, the
+      // examples nested under its single 400) documents three settlement verdicts, not one. 67 and 68
+      // are terminal; only 69 means "ask again later".
+      it('classifies 67 (sponsored settlement expired) as kind "settlement_void"', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+          resp(400, { status_code: '67', errors: ['Sponsored settlement expired. Payment required again.'] }),
+        ))
+
+        await expect(ssivc.createSessionWithReceipt(requestBody, 'r-expired')).rejects.toMatchObject({
+          name: 'SsivcError', httpStatus: 400, statusCode: '67', kind: 'settlement_void',
+        })
+      })
+
+      // The exact message the QA run received on 18 Sep, which now carries a code.
+      it('classifies 68 (settlement failed, receipt unusable) as kind "settlement_void"', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+          resp(400, { status_code: '68', errors: ['Payment settlement failed. This receipt can no longer be used.'] }),
+        ))
+
+        await expect(ssivc.createSessionWithReceipt(requestBody, 'r-failed')).rejects.toMatchObject({
+          name: 'SsivcError', httpStatus: 400, statusCode: '68', kind: 'settlement_void',
+        })
+      })
+
+      // Terminal and indeterminate must never collapse into one kind: one says stop, the other says wait.
+      it('keeps 69 distinct from the two terminal codes', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+          resp(400, { status_code: '69', errors: ['Payment settlement status could not be confirmed. Please retry.'] }),
+        ))
+
+        const err = await ssivc.createSessionWithReceipt(requestBody, 'r-unknown').catch((e) => e)
+        expect(err.kind).toBe('settlement_unconfirmed')
+        expect(err.kind).not.toBe('settlement_void')
+      })
+
+      // 69 is about a settlement; on any other status it is not one we recognise.
+      it('does not read 69 out of an unrelated HTTP status', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(resp(500, { status_code: '69', errors: ['boom'] })))
+
+        const err = await ssivc.createSessionWithReceipt(requestBody, 'r').catch((e) => e)
+        expect(err.kind).not.toBe('settlement_unconfirmed')
+      })
+    })
   })
 
   describe('getSession', () => {

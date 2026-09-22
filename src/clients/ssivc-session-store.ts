@@ -6,7 +6,7 @@
  * §4). Same shape and owner-only permissions as account-store.ts.
  */
 
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 
 export interface StoredSsivcSession {
@@ -17,12 +17,41 @@ export interface StoredSsivcSession {
   verificationUrl: string
   /** The X-Payment-Response settlement receipt — replayable while the payment is settled-but-unconsumed. */
   paymentReceipt: string
+  /**
+   * The optional request fields this session was PAID for.
+   *
+   * `check_ai_birthcert_verification` can now replay a stuck receipt, and it has no user input to
+   * rebuild the request body from — only this record. Without these, a replay would resend a body
+   * missing whatever the user originally supplied, and the credential would be issued without it:
+   * silent data loss, visible only once they read their birthcert. Absent on older records,
+   * and absent whenever the caller simply did not supply them — both are indistinguishable
+   * here and both are correct.
+   */
+  agentPurpose?: string
+  evidenceAssuranceLevel?: string
+  ownerType?: string
+  ownerVerified?: string
 }
 
 export interface SsivcSessionStore {
   get(): Promise<StoredSsivcSession | null>
   set(session: StoredSsivcSession): Promise<void>
+  /**
+   * Discard the stored session entirely.
+   *
+   * DESTRUCTIVE: if the record held an unconsumed settlement receipt, that payment becomes
+   * unrecoverable — the receipt is the only handle on it. Exists because the alternative was worse:
+   * the only escape from a stuck receipt used to be deleting this file on the gateway by hand,
+   * which a hosted Avatar subscriber cannot do. Callers must confirm with the user first; see
+   * clearStuckPaymentReceipt.
+   *
+   * Idempotent — clearing when nothing is stored is a no-op, not an error.
+   */
+  clear(): Promise<void>
 }
+
+/** Absent is fine (older records, and callers who supplied nothing); present-but-not-a-string is not. */
+const isAbsentOrString = (v: unknown): boolean => v === undefined || typeof v === 'string'
 
 function isStoredSessionShape(value: unknown): value is StoredSsivcSession {
   if (typeof value !== 'object' || value === null) return false
@@ -32,7 +61,11 @@ function isStoredSessionShape(value: unknown): value is StoredSsivcSession {
     typeof v.agentName === 'string' &&
     typeof v.createdAt === 'string' &&
     typeof v.verificationUrl === 'string' &&
-    typeof v.paymentReceipt === 'string'
+    typeof v.paymentReceipt === 'string' &&
+    isAbsentOrString(v.agentPurpose) &&
+    isAbsentOrString(v.evidenceAssuranceLevel) &&
+    isAbsentOrString(v.ownerType) &&
+    isAbsentOrString(v.ownerVerified)
   )
 }
 
@@ -56,6 +89,12 @@ export function createFsSsivcSessionStore(filePath: string): SsivcSessionStore {
       const tmpPath = `${filePath}.tmp-${process.pid}-${Date.now()}`
       await writeFile(tmpPath, JSON.stringify(session, null, 2), { encoding: 'utf8', mode: 0o600 })
       await rename(tmpPath, filePath)
+    },
+
+    async clear() {
+      // force: true makes a missing file a no-op rather than ENOENT — "already gone" is exactly the
+      // outcome the caller wants, so it must not read as a failure.
+      await rm(filePath, { force: true })
     },
   }
 }

@@ -43,7 +43,11 @@ Your host may present them slightly differently — match on the part after the 
 | `subscribe_and_issue` | **yes** | Buying and receiving a verifiable credential |
 | `create_holder_account` | no | Creating an additional holder account (rarely needed) |
 | `request_ai_birthcert_verification` | **yes** | Starting a Verified AI Birthcert session (MyDigitalID owner verification) |
-| `check_ai_birthcert_verification` | no | Status **and the verification link** of the most recent Verified AI Birthcert session |
+| `check_ai_birthcert_verification` | no | Status, **the verification link**, and advancing a payment that is still clearing, for the most recent Verified AI Birthcert session |
+| `clear_stuck_payment_receipt` | no | **Last resort, destructive** — discard a payment receipt that is genuinely stuck, forfeiting that payment |
+| `get_policy_template_schema` | no | Which spending rules a policy template allows you to write |
+| `get_my_policy` | no | The spending policies this wallet owner has deployed on chain |
+| `policy_preflight` | no | Checking a draft spending policy — is it valid, and does it MEAN what the user thinks |
 
 ## Safe first action
 
@@ -131,6 +135,62 @@ report what actually happened rather than promising it will be free.
 **Do not paste a link you are remembering.** If the tool did not just return it, you do not have it.
 A link recalled from earlier in the conversation may belong to a session that has since expired or
 completed, and the user cannot tell the difference.
+
+## When a payment is still clearing
+
+`check_ai_birthcert_verification` may return `status: "settlement_pending"` with a `paymentReceipt`.
+This means the payment **succeeded** and the wallet is following it. Never say it failed, and never
+call `request_ai_birthcert_verification` to "try again" — that is a second payment for the same
+thing. This one call can take up to about 90 seconds, because it is actively advancing the
+settlement rather than just reporting on it. It is not hung.
+
+Two cases, and they need different answers:
+
+- **No `outcomeUnknown`** (the message starts `PAYMENT SENT`) — it is queued and progressing. Tell
+  the user it went through and check again in a few minutes.
+- **`outcomeUnknown: true`** (the message starts `OUTCOME UNKNOWN`) — the wallet could not determine
+  what happened. Do not simply tell them to wait. Give them the `paymentReceipt` and tell them to
+  quote it to support; it is the only record of the payment.
+
+## Discarding a stuck receipt
+
+`clear_stuck_payment_receipt` throws a payment away. If that settlement ever completes, the money is
+gone and no credential is issued. It is not a retry and not a way to unstick a slow settlement —
+`check_ai_birthcert_verification` is. Only reach for it when nothing has changed for a long time and
+the user has said, in so many words, that they accept losing the payment.
+
+It takes two calls by design. Call it with no arguments first: it clears nothing and returns the
+receipt id. Show that id to the user, get their explicit agreement, then call again with
+`confirmReceiptId` set to exactly that id. Never invent or guess the id.
+
+If the second call comes back refusing because the receipt now belongs to a **live session**, the
+payment worked while you were asking. Do not push past it. Give the user the `verificationUrl` it
+returned — that link cannot be reissued — and let them finish. Only if they still want to abandon a
+session they have already paid for do you call again adding `confirmDiscardLiveSession: true`.
+
+## Spending policies
+
+A policy is the user's own spending rulebook for this wallet, stored on chain. Reading one is
+always free. This wallet can only READ policies today — it cannot write or deploy one.
+
+**Always run `policy_preflight` on a draft before anyone deploys it, and always show the user its
+`interpretation` — including when `ready` is true.** The chain validates nothing: a policy can be
+completely valid, deploy cleanly, and still mean something other than what the user asked for.
+Reporting only "ready" hides exactly the mistakes this check exists to catch. The most common:
+
+- A spending cap written **without a time window is a LIFETIME cap**, not a monthly one. "RM500 a
+  month" written that way silently means "RM500 ever".
+- An **empty allow-list denies everything**, because nothing is on it.
+- A **misspelled rule name is not enforced at all** — it deploys, and restricts nothing.
+- `approvalPolicy` and `settlementChannel` **are never enforced**. Never describe either as a
+  control the user can rely on.
+
+A clean preflight is NOT permission to spend. It cannot tell you whether a payment would actually
+be allowed right now — that depends on how much has already been spent, which this wallet cannot
+see. Read `notChecked` and say what was not verified rather than implying the policy is proven.
+
+If a policy read fails, say the lookup failed. Never report it as "you have no policy" — those are
+different answers and the wallet keeps them apart deliberately.
 
 ## When a payment cannot proceed
 

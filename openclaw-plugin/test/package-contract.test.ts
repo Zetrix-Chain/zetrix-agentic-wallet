@@ -19,20 +19,24 @@ const pkg = JSON.parse(readFileSync(join(pluginRoot, 'package.json'), 'utf8'))
 // Normalised: the repo checks out CRLF on Windows, and none of these assertions are about newlines.
 const skill = readFileSync(join(pluginRoot, 'skills', 'zetrix-agentic-wallet', 'SKILL.md'), 'utf8').replace(/\r\n/g, '\n')
 
-/** The nine tool names the wallet actually exposes, read from its tool descriptors. */
+/** The eleven tool names the wallet actually exposes, read from its tool descriptors. */
 const walletToolNames = (() => {
   const src = readFileSync(join(walletRoot, 'src', 'index.ts'), 'utf8')
   return [...src.matchAll(/^\s{6}name: '([a-z_]+)',$/gm)].map((m) => m[1])
 })()
 
 describe('the wallet tool list is readable', () => {
-  it('finds exactly the ten tools', () => {
+  it('finds exactly the fourteen tools', () => {
     expect(walletToolNames.sort()).toEqual([
       'check_ai_birthcert_verification',
+      'clear_stuck_payment_receipt',
       'create_holder_account',
       'credential_preflight',
+      'get_my_policy',
+      'get_policy_template_schema',
       'get_template_schema',
       'pay_and_fetch',
+      'policy_preflight',
       'prove_identity',
       'query_contract',
       'request_ai_birthcert_verification',
@@ -263,6 +267,22 @@ describe('SKILL.md', () => {
 
   it('mentions every paid tool, so none can be used without the spend rules', () => {
     for (const t of ['pay_and_fetch', 'subscribe_and_issue', 'request_ai_birthcert_verification']) expect(skill).toContain(t)
+  })
+
+  // R2-L11: the assertion above only catches a skill naming a tool that does NOT exist. The drift
+  // that actually happened was the mirror image — clear_stuck_payment_receipt shipped and the skill
+  // never mentioned it, so the agent had no idea the tool existed and the suite stayed green.
+  it('names every tool the wallet exposes, so a new one cannot ship unmentioned', () => {
+    const missing = walletToolNames.filter((t) => !skill.includes(t))
+    expect(missing).toEqual([])
+  })
+
+  // The destructive tool is the one where a skill that merely names it is not enough.
+  it('tells the agent how to use the destructive tool safely', () => {
+    const section = skill.slice(skill.indexOf('clear_stuck_payment_receipt'))
+    expect(section).toMatch(/confirmReceiptId/)
+    expect(section).toMatch(/confirmDiscardLiveSession/)
+    expect(section).toMatch(/not a retry|never a retry|is not a retry/i)
   })
 
   // Observed live: a balance lookup returned an error, and rather than surfacing it the agent
