@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { existsSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { buildToolList } from '../index'
 import { EXPECTED_AGENT_TEXT, MONEY_TOUCHING_TOOLS, splitAgentSentences } from './fixtures/agent-facing-text'
 
@@ -699,6 +700,24 @@ describe('buildToolList', () => {
     const byName = Object.fromEntries(buildToolList().map((t) => [t.name, t]))
     expect(byName.get_my_policy.inputSchema.required).toBeUndefined()
     expect(byName.get_policy_template_schema.inputSchema.required).toBeUndefined()
+  })
+})
+
+/**
+ * The README's tool table is the first thing anyone reads on GitHub and on the npm page, and nothing
+ * enforced it: three policy tools shipped, were registered, were documented in the plugin's SKILL.md
+ * (which IS enforced), and were simply missing from the README — where a reader is most likely to
+ * look. It went public that way before anyone noticed.
+ *
+ * The plugin already has this guard; this is the same one for the wallet's own README.
+ */
+describe('README documents every tool', () => {
+  const readme = readFileSync(join(import.meta.dirname, '..', '..', 'README.md'), 'utf8')
+  const documented = [...readme.matchAll(/^\| `([a-z_]+)` \|/gm)].map((m) => m[1]).sort()
+
+  it('names exactly the tools the server registers — no more, no fewer', () => {
+    const registered = buildToolList().map((t) => t.name).sort()
+    expect(documented).toEqual(registered)
   })
 })
 

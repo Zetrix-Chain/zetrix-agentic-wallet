@@ -12,6 +12,7 @@
 
 import { createHash } from 'node:crypto'
 import { canonicalizeJson } from '../canonical-json.js'
+import { withSessionExpiry, type SessionExpiryFields } from './session-expiry.js'
 import {
   SsivcError,
   type SsivcErrorKind,
@@ -276,7 +277,8 @@ export type CheckVerificationResult =
    * {@link SettlementReceiptVoidError}.
    */
   | { status: 'receipt_void'; message: string; paymentReceipt: string; discardedPaymentReceipt?: string }
-  | (SsivcSessionStatus & { vc?: unknown; cacheError?: string; verificationUrl?: string; vcPassImagePaths?: string[] })
+  | (SsivcSessionStatus &
+      Partial<SessionExpiryFields> & { vc?: unknown; cacheError?: string; verificationUrl?: string; vcPassImagePaths?: string[] })
 
 /** True iff `entry.vc.credentialSubject.id` equals `holderDid`. */
 function subjectMatches(vc: unknown, holderDid: string): boolean {
@@ -474,10 +476,36 @@ function settlementAge(
   // An unparseable or absent createdAt reads as brand new: the gentler message is the safe default,
   // since it is the one that keeps the receipt and tells nobody their money is gone.
   const ageMs = Number.isNaN(created) ? 0 : Math.max(0, now.getTime() - created)
-  const hours = ageMs / 3_600_000
-  const humanAge =
-    hours < 1 ? `${Math.round(ageMs / 60_000)} minutes` : hours < 48 ? `${Math.round(hours)} hours` : `${Math.round(hours / 24)} days`
-  return { ageMs, stuck: ageMs > stuckAfterMs, humanAge }
+  return { ageMs, stuck: ageMs > stuckAfterMs, humanAge: humanDuration(ageMs) }
+}
+
+function humanDuration(ms: number): string {
+  const hours = ms / 3_600_000
+  return hours < 1 ? `${Math.round(ms / 60_000)} minutes` : hours < 48 ? `${Math.round(hours)} hours` : `${Math.round(hours / 24)} days`
+}
+
+/**
+ * Refusal for a discard aimed at a receipt that is not stuck yet.
+ *
+ * Both discard routes — discardStuckReceiptAndPayFresh and clear_stuck_payment_receipt — take a
+ * "consent token" that is just the receipt id echoed back, so all they ever proved is that the caller
+ * had SEEN the id. The wallet cannot verify that a human agreed, and in a live run a bare "retry" from
+ * the user was taken as agreement to "discard and pay a second 1 JMYR": the first payment had in fact
+ * settled, and the user paid twice. The tool description said the wallet would only treat a receipt as
+ * stuck after SETTLEMENT_STUCK_AFTER_MS — but that was advice in a message, not a rule. This makes it a
+ * rule: a young receipt is refused outright, nothing discarded and nothing paid. Deliberately says
+ * nothing about whether the fee was taken; it only says the settlement may still resolve.
+ */
+function notStuckYetMessage(receipt: string, humanAge: string, stuckAfterMs: number): string {
+  return (
+    `NOT STUCK YET — nothing was discarded and NOTHING WAS PAID. Receipt ${receipt} is only ${humanAge} old, ` +
+    `and a settlement can still resolve after that long: the credential service may simply not have ` +
+    `re-checked it. Discarding it now would forfeit a payment that may already have gone through and ` +
+    `charge a SECOND fee. Do not offer that option to the user. Call check_ai_birthcert_verification ` +
+    `to follow the receipt instead; starting over only becomes available once it has been unresolved ` +
+    `for more than ${humanDuration(stuckAfterMs)} (SETTLEMENT_STUCK_AFTER_MS). A bare "retry" or "yes" ` +
+    `from the user is not agreement to pay again.`
+  )
 }
 
 /**
@@ -652,9 +680,65 @@ function isIssuerRejection(err: unknown): err is SsivcError {
     'settlement_unconfirmed',
     'settlement_void',
     'blob_already_settled',
+    'agent_name_in_use',
     'payment_invalid',
   ]
   return !notARejection.includes(err.kind)
+}
+
+/**
+ * True when SSIVC refused the request because the `agentName` is already in use (`409` +
+ * `status_code 26`). Kept apart from `blob_already_settled`, which shares the HTTP status:
+ * that one means a payment attempt was already settled, this one is a verdict about the NAME.
+ */
+function isAgentNameInUse(err: unknown): err is SsivcError {
+  return err instanceof SsivcError && err.kind === 'agent_name_in_use'
+}
+
+/**
+ * What to tell the user when the requested agentName is already taken.
+ *
+ * Says one thing about the name and makes NO claim about the fee: this name can never succeed, so
+ * retrying it is pointless and the user needs a different one. Whether a fee was taken is
+ * deliberately not asserted in either direction (R12-C01). SSIVC's owner has said the uniqueness
+ * check runs before the fee is deducted, but the wallet signs and hands over the payment blob before
+ * it can ever see a `409/26`, and SPEC.md (§ "reusing a name already in use causes issuance to fail
+ * downstream", confirmed 2026-08-13) says the opposite — so nothing here may rest on that ordering.
+ * It also must not be worded as `blob_already_settled` ("your payment was already settled" would be
+ * false, and its "do not retry ... pays the fee AGAIN" framing would scare the user off a retry with
+ * a new name that the message can simply describe accurately).
+ *
+ * `paidThisCall` because on request_'s fresh-pay route `deps.pay` has ALREADY run by the time SSIVC
+ * can answer (R10-M01's rule: never deny this call's own payment). `receipt` is absent on the fresh
+ * route when SSIVC returned none.
+ */
+function agentNameInUseMessage(
+  err: SsivcError,
+  agentName: string,
+  paidThisCall: boolean,
+  receipt?: string,
+): string {
+  const code = err.statusCode ? ` (status_code ${err.statusCode})` : ''
+  return (
+    `AGENT NAME ALREADY IN USE${code}: "${quotedServiceReason(err)}". The credential service refused ` +
+    `agentName "${agentName}" because it is already taken, so this request will never succeed with ` +
+    `that name — do NOT retry it with the same name. Ask the user for a different agentName. This ` +
+    `is a verdict about the NAME only: it does NOT establish whether a fee was taken, in either ` +
+    `direction, so never tell the user they were charged or that they were not, and never describe ` +
+    `it as a settled payment. ` +
+    (paidThisCall
+      ? `THIS CALL ITSELF SENT A PAYMENT before the refusal, so a fee may have been spent on this ` +
+        `attempt`
+      : `No new payment was made by this call`) +
+    (receipt ? ` (receipt ${receipt} has been KEPT)` : ``) +
+    `. ` +
+    (paidThisCall
+      ? `A new request with a different agentName pays its own fee, so get the user's agreement ` +
+        `first. `
+      : `Do NOT pay again for this name. `) +
+    `If the user asks about a charge, quote ${receipt ? 'the receipt' : 'the agentName'} and ` +
+    `this message to support.`
+  )
 }
 
 /**
@@ -682,8 +766,12 @@ function isPaymentInvalidRejection(err: unknown): err is SsivcError {
  * while the only writer is SSIVC, but the cost of holding the line here is one function.
  */
 function quotedServiceReason(err: SsivcError): string {
-  const stripped = err.message.replace(/^.*?HTTP \d+:\s*/, '') || err.message
-  const oneLine = stripped
+  return boundReason(err.message.replace(/^.*?HTTP \d+:\s*/, '') || err.message)
+}
+
+/** One line, no quotes or control characters, capped: SSIVC-controlled text goes into agent-facing prose. */
+function boundReason(raw: string): string {
+  const oneLine = raw
     .replace(/[\u0000-\u001F\u007F]+/g, ' ')
     .replace(/["'`]/g, '')
     .replace(/\s+/g, ' ')
@@ -691,6 +779,39 @@ function quotedServiceReason(err: SsivcError): string {
   if (!oneLine) return 'no reason given'
   return oneLine.length > 300 ? `${oneLine.slice(0, 300)}…` : oneLine
 }
+
+/**
+ * SSIVC's actual answer (or the transport failure) behind an outcome the wallet could not resolve,
+ * for the "not confirmed yet" messages.
+ *
+ * Before this the young-receipt wording carried none of it, so the host agent had nothing real to
+ * quote and — asked what SSIVC returned — invented a story ("stuck", "normal on testnet"). Same
+ * bounding as the refusal messages, and it claims nothing: it only reports what came back.
+ */
+function ssivcAnswerNote(cause: unknown): string {
+  if (cause instanceof SsivcError && cause.httpStatus !== undefined) {
+    const code = cause.statusCode ? `, status_code ${cause.statusCode}` : ''
+    return ` SSIVC's answer was HTTP ${cause.httpStatus}${code}: "${quotedServiceReason(cause)}".`
+  }
+  if (cause instanceof Error) {
+    return ` The call to SSIVC itself failed before any answer: "${boundReason(cause.message)}".`
+  }
+  return ''
+}
+
+/**
+ * A sentence the host agent can relay as-is. Models follow a supplied sentence far more
+ * reliably than a list of things not to say, and every other route to the user was the agent's own
+ * gloss ("this is normal", "picked up automatically"). Claims none of: success, failure, safety, or
+ * that anything will recover by itself — and keeps "do not pay again" (SPEC REQ-19h).
+ */
+const TELL_USER_UNCONFIRMED =
+  ` Tell the user: "Your payment was sent, but the credential service has not confirmed it yet, so I ` +
+  `cannot say whether it went through. The receipt is saved — please do not pay again. I will check ` +
+  `again shortly."`
+const TELL_USER_QUEUED =
+  ` Tell the user: "Your payment was sent and the settlement is still being processed. The receipt is ` +
+  `saved — please do not pay again. I will check again shortly."`
 
 /**
  * What to tell the user when a receipt replay was rejected rather than left unresolved.
@@ -844,7 +965,8 @@ async function resolveSettlement(
     throw new SettlementStillQueuedError(
       'PAYMENT SENT — the sponsored settlement is still being processed. Nothing has gone wrong and ' +
         'no funds are lost: the receipt has been saved. Call check_ai_birthcert_verification in a ' +
-        'few minutes to follow it through. Do not pay again.',
+        'few minutes to follow it through. Do not pay again.' +
+        TELL_USER_QUEUED,
       outcome.paymentReceipt,
     )
   }
@@ -1044,6 +1166,15 @@ export async function requestAiBirthcertVerification(
   deps: VerifyAiBirthcertDeps,
   input: RequestAiBirthcertVerificationInput,
 ): Promise<RequestVerificationResult> {
+  // Every session this tool hands back carries the time left, worked out here from the
+  // wallet's own clock, so the host agent never has to do timezone arithmetic itself.
+  return withSessionExpiry(await requestAiBirthcertVerificationInner(deps, input), deps.now())
+}
+
+async function requestAiBirthcertVerificationInner(
+  deps: VerifyAiBirthcertDeps,
+  input: RequestAiBirthcertVerificationInput,
+): Promise<RequestVerificationResult> {
   if (!input.agentName || !input.agentName.trim()) {
     throw new Error('requestAiBirthcertVerification: agentName is required')
   }
@@ -1155,7 +1286,7 @@ async function quoteVerification(
  * no window where the record is gone but the replacement payment has not been made.
  */
 async function discardStuckReceiptBeforePaying(
-  deps: Pick<VerifyAiBirthcertDeps, 'sessionStore'>,
+  deps: Pick<VerifyAiBirthcertDeps, 'sessionStore' | 'now' | 'settlementStuckAfterMs'>,
   confirmReceiptId: string,
 ): Promise<{ refusal: RequestVerificationFailure } | { discarded: string }> {
   const stored = await deps.sessionStore.get()
@@ -1193,6 +1324,18 @@ async function discardStuckReceiptBeforePaying(
           `for. Call check_ai_birthcert_verification to get its verification link and finish it — ` +
           `paying again here would buy a second copy of something the user already owns. If they ` +
           `genuinely want to abandon it, clear_stuck_payment_receipt asks for its own confirmation.`,
+      },
+    }
+  }
+  // Only a receipt that has aged past the stuck threshold may be discarded. Checked AFTER the
+  // id and live-session checks so those refusals keep their own, more specific, wording.
+  const stuckAfterMs = deps.settlementStuckAfterMs ?? DEFAULT_SETTLEMENT_STUCK_AFTER_MS
+  const age = settlementAge(stored, deps.now(), stuckAfterMs)
+  if (!age.stuck) {
+    return {
+      refusal: {
+        paymentReceipt: stored.paymentReceipt,
+        error: notStuckYetMessage(stored.paymentReceipt, age.humanAge, stuckAfterMs),
       },
     }
   }
@@ -1416,6 +1559,11 @@ async function payOrReplayLocked(
     // UNKNOWN) all carry — leaving the tool description's "exactly as `message` itself will say"
     // false for this one branch. There is no receipt to quote here (SSIVC never returns one on a
     // 409), so the message names agentName instead — the one thing support can actually search on.
+    if (isAgentNameInUse(err)) {
+      // `paidThisCall` is true on every route that reaches here today (phase 1 cannot return a 409, so
+      // this is always post-payment), but it is passed rather than assumed (R12-C01).
+      return { error: agentNameInUseMessage(err, agentName, paidThisCall) }
+    }
     if (err instanceof SsivcError && err.kind === 'blob_already_settled') {
       return {
         error:
@@ -1491,6 +1639,14 @@ async function payOrReplayLocked(
       // settlement" is backwards for a verdict specifically about the payment) and not the
       // young-receipt wording below either (which claims "Nothing is lost" — an unsupported
       // positive claim on the strength of SSIVC's explicit negative one).
+      if (isAgentNameInUse(err.cause)) {
+        return {
+          paymentReceipt: err.paymentReceipt,
+          settlementPending: true,
+          issuerRejected: true,
+          message: agentNameInUseMessage(err.cause, agentName, paidThisCall, err.paymentReceipt),
+        }
+      }
       if (isPaymentInvalidRejection(err.cause)) {
         return {
           paymentReceipt: err.paymentReceipt,
@@ -1522,10 +1678,15 @@ async function payOrReplayLocked(
             ? `PAYMENT SENT — the settlement has not been confirmed yet, ${age.humanAge} in. This call ` +
               `itself sent the payment; whether it settled is not yet known. Receipt ` +
               `${err.paymentReceipt} is saved. Do NOT pay again. Call ` +
-              `check_ai_birthcert_verification in a few minutes to follow it through.`
-            : `PAYMENT SENT — the settlement has not been confirmed yet, ${age.humanAge} in. Nothing is ` +
-              `lost: receipt ${err.paymentReceipt} is saved and no new payment was attempted. Do NOT ` +
-              `pay again. Call check_ai_birthcert_verification in a few minutes to follow it through.`,
+              `check_ai_birthcert_verification in a few minutes to follow it through.` +
+              ssivcAnswerNote(err.cause) +
+              TELL_USER_UNCONFIRMED
+            : `PAYMENT SENT — the settlement has not been confirmed yet, ${age.humanAge} in. The outcome is ` +
+              `not known yet, so do not tell the user the payment succeeded or that it failed. Receipt ` +
+              `${err.paymentReceipt} is saved and no new payment was attempted. Do NOT pay again. Call ` +
+              `check_ai_birthcert_verification in a few minutes to follow it through.` +
+              ssivcAnswerNote(err.cause) +
+              TELL_USER_UNCONFIRMED,
         }
       }
       return {
@@ -1602,7 +1763,7 @@ async function advanceQueuedSettlement(
       await discardVoidReceipt(deps)
       return voidReceiptOutcome(stored.paymentReceipt, err.message)
     }
-    return unknownSettlementOutcome(stored.paymentReceipt, err, undefined, settlementAge(stored, deps.now(), deps.settlementStuckAfterMs ?? DEFAULT_SETTLEMENT_STUCK_AFTER_MS))
+    return unknownSettlementOutcome(stored.paymentReceipt, err, undefined, settlementAge(stored, deps.now(), deps.settlementStuckAfterMs ?? DEFAULT_SETTLEMENT_STUCK_AFTER_MS), undefined, stored.agentName)
   }
 
   let settled: { session: SsivcSessionCreated; paymentReceipt: string }
@@ -1633,7 +1794,7 @@ async function advanceQueuedSettlement(
       return voidReceiptOutcome(err.paymentReceipt, err.message)
     }
     if (err instanceof SettlementOutcomeUnknownError) {
-      return unknownSettlementOutcome(err.paymentReceipt, undefined, err.message, settlementAge(stored, deps.now(), deps.settlementStuckAfterMs ?? DEFAULT_SETTLEMENT_STUCK_AFTER_MS), err.cause)
+      return unknownSettlementOutcome(err.paymentReceipt, undefined, err.message, settlementAge(stored, deps.now(), deps.settlementStuckAfterMs ?? DEFAULT_SETTLEMENT_STUCK_AFTER_MS), err.cause, stored.agentName)
     }
     throw err
   }
@@ -1705,8 +1866,24 @@ function unknownSettlementOutcome(
   message?: string,
   age?: { stuck: boolean; humanAge: string },
   cause?: unknown,
+  agentName?: string,
 ): CheckVerificationResult {
   const detail = message ?? unresolvedCause(err)
+  // a taken agentName is a verdict about the NAME, so it is answered before the age split
+  // and before the rejection wording (whose "a refusal can clear once the service recovers" is
+  // wrong for a name that will never become free). `issuerRejected` because the service was
+  // reached and refused the request; the message says what to do instead.
+  const nameInUse = [cause, err].find(isAgentNameInUse)
+  if (nameInUse) {
+    return {
+      status: 'settlement_pending',
+      paymentReceipt,
+      issuerRejected: true,
+      ...(age?.stuck ? { stuckFor: age.humanAge } : {}),
+      // `false`: this helper only serves check_, whose deps have no `pay` (R10-M01).
+      message: agentNameInUseMessage(nameInUse, agentName ?? 'the requested name', false, paymentReceipt),
+    }
+  }
   const rejection = [cause, err].find(isIssuerRejection)
   const paymentInvalid = [cause, err].find(isPaymentInvalidRejection)
 
@@ -1752,9 +1929,12 @@ function unknownSettlementOutcome(
       status: 'settlement_pending',
       paymentReceipt,
       message:
-        `PAYMENT SENT — the settlement has not been confirmed yet, ${age.humanAge} in. Nothing has ` +
-        `gone wrong and no funds are lost: receipt ${paymentReceipt} is saved. Do NOT pay again. ` +
-        `Call check_ai_birthcert_verification again in a few minutes to follow it through.`,
+        `PAYMENT SENT — the settlement has not been confirmed yet, ${age.humanAge} in. The outcome is ` +
+        `not known yet, so do not tell the user the payment succeeded or that it failed. Receipt ` +
+        `${paymentReceipt} is saved. Do NOT pay again. Call check_ai_birthcert_verification again in ` +
+        `a few minutes to follow it through.` +
+        ssivcAnswerNote(cause ?? err) +
+        TELL_USER_UNCONFIRMED,
     }
   }
 
@@ -1834,7 +2014,7 @@ export interface ClearStuckPaymentReceiptResult {
  * responses will always leave some outcomes genuinely unknown.
  */
 export async function clearStuckPaymentReceipt(
-  deps: Pick<VerifyAiBirthcertDeps, 'sessionStore'>,
+  deps: Pick<VerifyAiBirthcertDeps, 'sessionStore' | 'now' | 'settlementStuckAfterMs'>,
   input: ClearStuckPaymentReceiptInput,
 ): Promise<ClearStuckPaymentReceiptResult> {
   // APP-M01: same single-slot store request_ and check_ mutate, so the same lock. Without it, this
@@ -1844,7 +2024,7 @@ export async function clearStuckPaymentReceipt(
 }
 
 async function clearStuckPaymentReceiptLocked(
-  deps: Pick<VerifyAiBirthcertDeps, 'sessionStore'>,
+  deps: Pick<VerifyAiBirthcertDeps, 'sessionStore' | 'now' | 'settlementStuckAfterMs'>,
   input: ClearStuckPaymentReceiptInput,
 ): Promise<ClearStuckPaymentReceiptResult> {
   const stored = await deps.sessionStore.get()
@@ -1856,6 +2036,22 @@ async function clearStuckPaymentReceiptLocked(
   // verification link. Discarding it is allowed (they may genuinely want to start over) but must not
   // be described in the same terms as clearing a dead end.
   const isLiveSession = stored.sessionId !== ''
+
+  // A give-up receipt (no session yet) can only be cleared once it is genuinely stuck. Refused on
+  // BOTH steps, so an agent is never even handed the "show the user this id and ask" prompt for a
+  // receipt that may still resolve. A live session is a different situation (the user may want to
+  // abandon a link they already hold) and keeps its own confirmation path.
+  if (!isLiveSession) {
+    const stuckAfterMs = deps.settlementStuckAfterMs ?? DEFAULT_SETTLEMENT_STUCK_AFTER_MS
+    const age = settlementAge(stored, deps.now(), stuckAfterMs)
+    if (!age.stuck) {
+      return {
+        cleared: false,
+        paymentReceipt: stored.paymentReceipt,
+        error: notStuckYetMessage(stored.paymentReceipt, age.humanAge, stuckAfterMs),
+      }
+    }
+  }
 
   if (input.confirmReceiptId === undefined) {
     return {
@@ -1931,7 +2127,13 @@ async function clearStuckPaymentReceiptLocked(
 }
 
 export async function checkAiBirthcertVerification(
-  deps: Pick<
+  deps: CheckDeps,
+): Promise<CheckVerificationResult> {
+  // See requestAiBirthcertVerification.
+  return withSessionExpiry(await checkAiBirthcertVerificationInner(deps), deps.now())
+}
+
+type CheckDeps = Pick<
     VerifyAiBirthcertDeps,
     | 'ssivc'
     | 'sessionStore'
@@ -1952,8 +2154,9 @@ export async function checkAiBirthcertVerification(
     | 'maxSettlementAttempts'
     | 'settlementWaitBudgetMs'
     | 'settlementStuckAfterMs'
-  >,
-): Promise<CheckVerificationResult> {
+  >
+
+async function checkAiBirthcertVerificationInner(deps: CheckDeps): Promise<CheckVerificationResult> {
   const stored = await deps.sessionStore.get()
   if (!stored) return noStoredSession()
 

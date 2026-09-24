@@ -82,6 +82,39 @@ describe('SsivcClient', () => {
       await expect(ssivc.createSessionSettle(requestBody, 'X')).rejects.toMatchObject({ name: 'SsivcError', httpStatus: 409, kind: 'blob_already_settled' })
     })
 
+    // a 409 that SSIVC labels status_code 26 is a taken agentName, not a settled payment -
+    // the two must not be conflated, because one says "your fee was taken" and the other says no fee was.
+    it('classifies a 409 with status_code 26 as kind "agent_name_in_use", not blob_already_settled', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(resp(409, { status_code: '26', errors: ['agentName already in use'] })))
+      await expect(ssivc.createSessionSettle(requestBody, 'X')).rejects.toMatchObject({
+        name: 'SsivcError', httpStatus: 409, statusCode: '26', kind: 'agent_name_in_use',
+      })
+    })
+
+    // R12-M01: the classification is deliberately narrow, and every widening below turns a money
+    // message from "cautious" to "confident". A status_code 26 on the wrong HTTP status, or a numeric 26
+    // where the wire format is a string, must fail SAFE.
+    it.each([400, 402, 422, 500, 503])(
+      'does NOT classify status_code 26 on HTTP %i as agent_name_in_use',
+      async (status) => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(resp(status, { status_code: '26', errors: ['x'] })))
+        await expect(ssivc.createSessionSettle(requestBody, 'X')).rejects.toMatchObject({ httpStatus: status })
+        await expect(ssivc.createSessionSettle(requestBody, 'X')).rejects.not.toMatchObject({ kind: 'agent_name_in_use' })
+      },
+    )
+
+    it('does NOT classify a numeric status_code 26 on a 409 - it falls back to the cautious kind', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(resp(409, { status_code: 26, errors: ['agentName already in use'] })))
+      await expect(ssivc.createSessionSettle(requestBody, 'X')).rejects.toMatchObject({
+        httpStatus: 409, kind: 'blob_already_settled',
+      })
+    })
+
+    it('keeps a 409 with any OTHER status_code as blob_already_settled', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(resp(409, { status_code: '99', errors: ['conflict'] })))
+      await expect(ssivc.createSessionSettle(requestBody, 'X')).rejects.toMatchObject({ httpStatus: 409, kind: 'blob_already_settled' })
+    })
+
     it('still classifies kind "blob_already_settled" on a 409 with a non-JSON body (e.g. a proxy error page)', async () => {
       // APP-L01: kind classification must not depend on the body parsing as JSON, since a 409
       // routed through an intermediary (a proxy, a gateway) can arrive as an HTML error page.

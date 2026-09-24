@@ -387,10 +387,14 @@ export function loadConfig(env: NodeJS.ProcessEnv): AgenticWalletConfig {
       }
       return budget
     })(),
-    // Not clamped and not warned about: unlike the wait budget, nothing blocks on this —
-    // it only decides which of two true statements the user is told about a receipt SSIVC will not
-    // resolve. Setting it very low makes the wallet give up on the wording early (it still never
-    // pays again or discards anything on its own); very high just means it keeps saying "check back".
+    // Not clamped and not warned about: unlike the wait budget, nothing blocks on this. But it is NOT
+    // just wording any more. It decides when a receipt counts as stuck, and a receipt that is not stuck
+    // yet is REFUSED by both discard routes (discardStuckReceiptAndPayFresh and
+    // clear_stuck_payment_receipt) — nothing discarded, nothing paid. So a very LOW value makes the
+    // discard-and-pay-a-second-fee path available sooner, after a shorter wait for a settlement that may
+    // still resolve. The default (24h) is the safe setting; lower it only deliberately, for an operator
+    // or a test. It is not agent-reachable. Very high just means the wallet keeps saying "check back"
+    // and never offers a fresh start. The wallet never pays again or discards on its own either way.
     settlementStuckAfterMs: (() => {
       const ms = Number(env.SETTLEMENT_STUCK_AFTER_MS)
       return Number.isInteger(ms) && ms > 0 ? ms : 86_400_000

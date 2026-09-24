@@ -23,6 +23,14 @@ export type SsivcErrorKind =
   | 'payment_invalid'
   | 'facilitator_unavailable'
   | 'blob_already_settled'
+  /**
+   * SSIVC refused the request because this `agentName` is already in use — `409` + `status_code 26`.
+   *
+   * Split out of `blob_already_settled`: both arrive as HTTP 409, but this one is a
+   * verdict about the NAME, so telling the user "your payment was already settled" would be wrong,
+   * and retrying the same name can never succeed. It says nothing about whether a fee was taken.
+   */
+  | 'agent_name_in_use'
   | 'validation'
   /**
    * SSIVC cannot resolve this receipt's settlement either way — `400` + `status_code 69`.
@@ -50,6 +58,7 @@ export type SsivcErrorKind =
 const SETTLEMENT_UNCONFIRMED_STATUS_CODE = '69'
 const SETTLEMENT_EXPIRED_STATUS_CODE = '67'
 const SETTLEMENT_FAILED_STATUS_CODE = '68'
+const AGENT_NAME_IN_USE_STATUS_CODE = '26'
 
 export class SsivcError extends Error {
   httpStatus?: number
@@ -90,6 +99,9 @@ export interface SsivcSessionCreated {
   sessionId: string
   verificationUrl: string
   expiresAt: string
+  /** Added by the wallet, not SSIVC: time left by the wallet's own clock. See session-expiry.ts. */
+  expiresInSeconds?: number
+  expiresIn?: string
 }
 
 /** A (re-)created session, plus the settlement receipt to persist for a possible future retry. */
@@ -122,6 +134,55 @@ interface SsivcEnvelope<T> {
 }
 
 const SESSIONS_PATH = '/v2/verify/ai-birthcert/sessions'
+
+/**
+ * Opt-in wire tracing for the SSIVC exchange, enabled with `SSIVC_TRACE=1`.
+ *
+ * Exists because a settlement that stalls is almost never diagnosable from the wallet's own
+ * reporting: the wallet only ever sees SSIVC's verdict, and when that verdict disagrees with the
+ * facilitator there is no way to tell from here which side is wrong. Reproducing the call by hand
+ * is not an option either — every request carries a `signedData` over a timestamp that must be
+ * minutes old, signed by a key the wallet holds and no one can reach from a REST client. Printing
+ * the exact request is the only way to get a replayable one.
+ *
+ * OFF by default, and deliberately not wired to any config file: the trace contains the payment
+ * receipt and the request signature. The receipt is a bearer handle on a real payment — anyone
+ * holding it can replay it — so this belongs in a terminal a developer is watching, never in a
+ * shipped log pipeline. Turn it on for a reproduction, then turn it off.
+ *
+ * Writes to stderr, which is where MCP servers put diagnostics; stdout is the protocol channel and
+ * writing there corrupts the session.
+ */
+const traceEnabled = (): boolean => process.env.SSIVC_TRACE === '1'
+
+function traceRequest(method: string, url: string, headers: Record<string, string>, body?: unknown): void {
+  if (!traceEnabled()) return
+  try {
+    const lines = [`[ssivc-trace] --> ${method} ${url}`]
+    for (const [k, v] of Object.entries(headers)) lines.push(`[ssivc-trace] --> ${k}: ${v}`)
+    if (body !== undefined) lines.push(`[ssivc-trace] --> body: ${JSON.stringify(body)}`)
+    process.stderr.write(lines.join('\n') + '\n')
+  } catch {
+    // Tracing must never break a paid request.
+  }
+}
+
+async function traceResponse(method: string, url: string, res: Response): Promise<void> {
+  if (!traceEnabled()) return
+  try {
+    // clone() because the caller still has to read this body — reading it here would leave them a
+    // consumed stream and turn a diagnostic into an outage.
+    const text = await res.clone().text()
+    const receipt = res.headers.get('x-payment-response')
+    process.stderr.write(
+      `[ssivc-trace] <-- ${res.status} ${method} ${url}\n` +
+        (receipt ? `[ssivc-trace] <-- X-Payment-Response: ${receipt}\n` : '') +
+        `[ssivc-trace] <-- body: ${text}\n`,
+    )
+  } catch {
+    // As above.
+  }
+}
 
 export class SsivcClient {
   private readonly baseUrl: string
@@ -192,13 +253,20 @@ export class SsivcClient {
   private fetch(method: string, path: string, body?: unknown, extraHeaders?: Record<string, string>): Promise<Response> {
     const headers: Record<string, string> = { Accept: 'application/json', ...(extraHeaders ?? {}) }
     if (body !== undefined) headers['Content-Type'] = 'application/json'
-    return fetch(`${this.baseUrl}${path}`, {
+    const url = `${this.baseUrl}${path}`
+    traceRequest(method, url, headers, body)
+    return fetch(url, {
       method,
       headers,
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
-    }).catch((e) => {
-      throw new SsivcError(`SSIVC ${path} request failed: ${(e as Error).message}`)
     })
+      .then(async (res) => {
+        await traceResponse(method, url, res)
+        return res
+      })
+      .catch((e) => {
+        throw new SsivcError(`SSIVC ${path} request failed: ${(e as Error).message}`)
+      })
   }
 
   private async error(res: Response, context?: string): Promise<SsivcError> {
@@ -215,7 +283,10 @@ export class SsivcClient {
       const j = JSON.parse(text) as SsivcEnvelope<unknown> & { error?: string }
       statusCode = j.status_code
       msg = j.errors?.length ? j.errors.join('; ') : (j.message ?? j.error ?? text)
-      if (res.status === 402 && j.error === 'payment_invalid') kind = 'payment_invalid'
+      // Only a 409 that SSIVC itself labels 26: a bare/non-JSON 409 keeps the blob_already_settled
+      // classification set above, which is the one that stays cautious about the money.
+      if (res.status === 409 && statusCode === AGENT_NAME_IN_USE_STATUS_CODE) kind = 'agent_name_in_use'
+      else if (res.status === 402 && j.error === 'payment_invalid') kind = 'payment_invalid'
       else if (res.status === 503 && j.error === 'facilitator_unavailable') kind = 'facilitator_unavailable'
       // Scoped to the 400 SSIVC actually ships it on: on any other status this code is not
       // a settlement verdict, and misreading a 5xx as one would let a server fault look terminal.

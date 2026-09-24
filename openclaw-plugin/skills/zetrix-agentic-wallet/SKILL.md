@@ -121,8 +121,11 @@ budget or a spending allowance for the day.
 approve a payment so they can re-read a link they have already bought is exactly the habit that makes
 people wave real payment prompts through.
 
-While the session is open the result carries `verificationUrl` and `expiresAt`. Give both — the link
-on its own is no use if it quietly expired an hour ago. Say when it expires in plain terms.
+While the session is open the result carries `verificationUrl`, `expiresAt`, and `expiresIn` (with
+`expiresInSeconds`). Give the link and `expiresIn` exactly as given — the link on its own is no use if it
+quietly expired, and the window can be short. **Never work out the time remaining yourself** from
+`expiresAt`: your clock and timezone can differ from the server's, and one run told a user the link was
+good for "about 8 hours" when it had about 15 minutes. `expiresIn` is worked out by the wallet.
 
 Once `status` is `issued` there is no link, and there should not be: the verification is finished.
 Report the credential instead.
@@ -164,7 +167,12 @@ Read `message`, not just the flags. These cases need different answers:
 `clear_stuck_payment_receipt` throws a payment away. If that settlement ever completes, the money is
 gone and no credential is issued. It is not a retry and not a way to unstick a slow settlement —
 `check_ai_birthcert_verification` is. Only reach for it when nothing has changed for a long time and
-the user has said, in so many words, that they accept losing the payment.
+the user has said, in so many words, that they accept losing the payment. The wallet enforces the
+"long time": a receipt younger than `SETTLEMENT_STUCK_AFTER_MS` (24 hours by default) is **refused**
+on both steps and on `discardStuckReceiptAndPayFresh`, nothing discarded and nothing paid — so never
+offer discarding for a payment that is not yet that old. A bare "retry" or "yes" from the user is not
+agreement to pay a second fee: one run treated it as consent and the user was charged twice for a
+payment that had already settled.
 
 It takes two calls by design. Call it with no arguments first: it clears nothing and returns the
 receipt id. Show that id to the user, get their explicit agreement, then call again with

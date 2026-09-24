@@ -8,6 +8,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > Entries for 0.5.0 and earlier were reconstructed from commit history when this file was
 > introduced in 0.6.0, so they summarise each release rather than being exhaustive.
 
+## [0.12.2] — 24 September 2026
+
+### Fixed
+
+- **A taken `agentName` is no longer reported as an already-settled payment.** The credential service
+  answers both "this name is already taken" and "this exact payment was already settled" with the same
+  HTTP 409, and the wallet used to treat every 409 as the settled case — telling the user their fee was
+  most likely taken and warning that retrying would charge it again, when picking a different name was
+  actually free to try. The two are now told apart, and a taken name says only that: choose a different
+  `agentName`; it does not claim the fee was, or was not, taken.
+- **A payment can no longer be discarded and paid again until it is genuinely stuck.** In a live run the
+  first payment had already settled, the assistant offered to "discard the stuck receipt and start
+  fresh" for a second 1 JMYR, and a bare "retry" from the user was taken as agreement, so the user paid
+  twice. The rule that a receipt only counts as stuck after 24 hours (`SETTLEMENT_STUCK_AFTER_MS`) was
+  only advice; the wallet now enforces it on both ways of discarding a receipt and pays nothing when the
+  receipt is younger. Set `SETTLEMENT_STUCK_AFTER_MS` lower on purpose if you need to start over sooner.
+- **The agent can now tell the user how long the verification link really lasts.** The wallet used to
+  return the session's expiry untouched and leave the arithmetic to the agent, and in one run the agent
+  mixed up timezones and said the link was good for about 8 hours when it had about 15 minutes. Results
+  now carry `expiresIn` ("about 14 minutes") and `expiresInSeconds`, worked out by the wallet, and the
+  tool descriptions tell the agent to quote them.
+- **A payment the credential service has not confirmed yet is now reported with what the service actually
+  said**, including its status code and message, plus a short sentence the agent can pass on to the user
+  as-is. Previously the agent had nothing real to quote and sometimes made up an explanation.
+
+### Added
+
+- `SSIVC_TRACE=1` prints every request to and response from the credential service to stderr, for
+  diagnosing a settlement that will not resolve. Off by default; the trace contains the payment receipt,
+  so it is for reproductions only.
+
 ## [0.12.1] — 24 September 2026
 
 ### Fixed

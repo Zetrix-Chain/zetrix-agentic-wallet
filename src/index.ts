@@ -297,9 +297,12 @@ export function buildToolList() {
         'ALWAYS run credential_preflight for "verified_ai_birthcert" immediately before calling this, ' +
         'even if you checked earlier in the conversation — preflight is free, this tool spends real ' +
         'funds, and a balance the user topped up a minute ago is not the balance you read before that. ' +
-        'Returns { sessionId, verificationUrl, expiresAt } — show verificationUrl to the human owner ' +
+        'Returns { sessionId, verificationUrl, expiresAt, expiresIn, expiresInSeconds } — show verificationUrl to the human owner ' +
         'and ask them to open it and complete MyDigital ID verification (typically finishes in ' +
-        'seconds). Once they confirm they are done, call check_ai_birthcert_verification to see ' +
+        'seconds). Tell them how long the link is good for by quoting `expiresIn` exactly as given: ' +
+        'the wallet works it out from its own clock, so never calculate the time remaining yourself ' +
+        'from `expiresAt` — your clock and timezone may differ from the server\'s. ' +
+        'Once they confirm they are done, call check_ai_birthcert_verification to see ' +
         'whether the credential was issued. IMPORTANT: agentName must be unique — if this exact name ' +
         'has already been used to request a Verified AI Birthcert, issuance will fail. Before calling, ' +
         'ask the human owner whether they want to supply any of the optional fields — agentPurpose, ' +
@@ -330,7 +333,9 @@ export function buildToolList() {
         'be determined at all yet (the message says "has not been confirmed yet" and does not say "still being processed") — an indeterminate ' +
         'state, not a confirmed one, even though neither flag is set. Either way the receipt is ' +
         'saved and you must not pay again, so report it as "payment sent, still settling" without ' +
-        'promising the user it definitely succeeded. With ' +
+        'promising the user it definitely succeeded. When the message contains a "Tell the user:" ' +
+        'sentence, relay that sentence rather than composing your own reassurance, and if asked what ' +
+        'the service said, quote only what the message says it answered. With ' +
         'issuerRejected: true the credential service was reached and refused the request — the ' +
         'settlement is NOT what failed, but do NOT describe this as the payment having succeeded ' +
         'either: `message` quotes its reason, and you must relay that reason rather than ' +
@@ -399,7 +404,9 @@ export function buildToolList() {
               'that path quote BOTH ids to support, not just the field. ' +
               'A receipt only counts as stuck once it is older than SETTLEMENT_STUCK_AFTER_MS (24h by ' +
               'default, e.g. SETTLEMENT_STUCK_AFTER_MS=3600000 for one hour); before that the wallet ' +
-              'will say the settlement may still be in flight, and starting over is the user decision, not yours.',
+              'REFUSES this parameter outright — nothing is discarded and nothing is paid — so do not ' +
+              'offer the user this option for a receipt that is not stuck yet. A bare "retry" or "yes" ' +
+              'from the user is not agreement to pay again.',
           },
         },
         required: ['agentName'],
@@ -450,7 +457,9 @@ export function buildToolList() {
         'request_ai_birthcert_verification, whenever the user asks where their verification link is, ' +
         'what happened to their session, or whether their credential is ready. While the session is ' +
         'still open the result carries `verificationUrl` (the same link issued at creation) and ' +
-        '`expiresAt` — give the user both, so they know how long it is good for. ' +
+        '`expiresAt` and `expiresIn` — give the user the link and `expiresIn` exactly as given, so ' +
+        'they know how long it is good for; never work out the time remaining yourself from ' +
+        '`expiresAt`, because your clock and timezone may differ from the server\'s. ' +
         'Returns { status: "pending" } while the owner has not ' +
         'yet completed MyDigital ID verification, or { status: "issued", vcId } once myid has minted ' +
         'the credential — myid returns vcId ONLY when status is "issued", never otherwise. On ' +
@@ -492,7 +501,8 @@ export function buildToolList() {
         'minutes. If it says "has not been confirmed yet" the outcome could not be determined at ' +
         'all yet: do NOT describe that one as progressing and do NOT describe it as succeeded, ' +
         'because it is indeterminate, not confirmed. Either way the receipt is saved, so do not ' +
-        'pay again, and check again later. With outcomeUnknown: true (message leads "OUTCOME UNKNOWN") ' +
+        'pay again, and check again later. When the message contains a "Tell the user:" sentence, ' +
+        'relay it rather than composing your own reassurance. With outcomeUnknown: true (message leads "OUTCOME UNKNOWN") ' +
         'the settlement outcome could not be determined at all and has been unresolved long enough ' +
         'that it is not coming back (stuckFor says how long). The fee was most likely ALREADY TAKEN ' +
         'and no credential was issued — say that plainly rather than implying it may still land. ' +
@@ -519,7 +529,9 @@ export function buildToolList() {
         'service refusal, so do not promise the user it will resolve on its own; call ' +
         'check_ai_birthcert_verification again instead; it actively ' +
         'advances a queued settlement. Only reach for this tool when the outcome has been stuck ' +
-        'with no change for a long time and the user accepts losing the payment. ' +
+        'with no change for a long time and the user accepts losing the payment. The wallet enforces ' +
+        'that: a receipt younger than SETTLEMENT_STUCK_AFTER_MS (24h by default) is REFUSED on both ' +
+        'steps, so do not offer this option for one. ' +
         'Two steps, deliberately: call it with no arguments first and it clears NOTHING — it returns ' +
         'the receipt id and a warning. Show that id to the user, get their explicit agreement, then ' +
         'call again with confirmReceiptId set to exactly that id. A mismatched id clears nothing. ' +
