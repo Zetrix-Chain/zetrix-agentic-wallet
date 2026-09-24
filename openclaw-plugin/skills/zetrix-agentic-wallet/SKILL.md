@@ -139,18 +139,25 @@ completed, and the user cannot tell the difference.
 ## When a payment is still clearing
 
 `check_ai_birthcert_verification` may return `status: "settlement_pending"` with a `paymentReceipt`.
-This means the payment **succeeded** and the wallet is following it. Never say it failed, and never
+This means a payment **was sent** and the wallet is following it. Never say it failed, and never
 call `request_ai_birthcert_verification` to "try again" — that is a second payment for the same
 thing. This one call can take up to about 90 seconds, because it is actively advancing the
 settlement rather than just reporting on it. It is not hung.
 
-Two cases, and they need different answers:
+Read `message`, not just the flags. These cases need different answers:
 
-- **No `outcomeUnknown`** (the message starts `PAYMENT SENT`) — it is queued and progressing. Tell
-  the user it went through and check again in a few minutes.
+- **No `outcomeUnknown`, message says *"still being processed"*** — the settlement is confirmed
+  queued and progressing. Tell the user the payment went out and to check again in a few minutes.
+- **No `outcomeUnknown`, message says *"has not been confirmed yet"*** — same flags, different
+  state: the outcome could not be determined at all yet. Do **not** call this progressing and do
+  **not** call it succeeded. Say the payment was sent, the outcome is not confirmed, the receipt is
+  saved, and you will check again later. Do not pay again.
 - **`outcomeUnknown: true`** (the message starts `OUTCOME UNKNOWN`) — the wallet could not determine
   what happened. Do not simply tell them to wait. Give them the `paymentReceipt` and tell them to
   quote it to support; it is the only record of the payment.
+- **`issuerRejected: true` or `paymentInvalid: true`** — the credential service was reached and
+  refused. Relay what `message` quotes. Neither says whether the fee was taken, in either
+  direction, so never tell the user they were not charged, and never tell them they were.
 
 ## Discarding a stuck receipt
 

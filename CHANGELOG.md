@@ -8,6 +8,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > Entries for 0.5.0 and earlier were reconstructed from commit history when this file was
 > introduced in 0.6.0, so they summarise each release rather than being exhaustive.
 
+## [0.12.1] — 24 September 2026
+
+### Fixed
+
+- **A refused receipt replay is now reported as a refusal, not as a pending settlement.** When the
+  credential service was reached and answered with a 4xx (for example a token failure on its side),
+  the wallet used to say "PAYMENT SENT — nothing has gone wrong", even when something had. It now
+  returns `issuerRejected: true` with the service's own message and status code, and
+  `paymentInvalid: true` when the service specifically ruled the payment invalid. Neither says
+  whether the fee was taken, in either direction. The receipt is still kept and the call stays
+  retryable through `check_ai_birthcert_verification`. Indeterminate, void and already-settled
+  answers are deliberately not treated as refusals.
+- **A receipt the payment service has declared void is discarded automatically**, so the next
+  request pays fresh instead of replaying a dead receipt forever. The discarded receipt id is
+  returned so the lost payment stays traceable.
+- **No message denies a payment this call itself made.** On a fresh purchase that then fails to
+  settle, the wallet no longer says "no new payment was made" or "nothing is lost".
+- **The already-settled answer no longer invites a second charge.** It now says the fee was most
+  likely taken and asks for the user's explicit agreement before retrying.
+- **`discardedPaymentReceipt` is returned on every result after a discard**, including errors and
+  pending results. If the same call also discarded a void receipt, both ids are given.
+- **Tool descriptions no longer tell an agent an undetermined settlement is "progressing".** Both
+  `request_ai_birthcert_verification` and `check_ai_birthcert_verification` now separate a
+  confirmed-queued settlement from one whose outcome could not be determined.
+
+### Tests
+
+- Every agent-facing tool and parameter description is now pinned by a reviewed snapshot plus
+  guards against false money claims and unsafe retry advice.
+
 ## [0.12.0] — 22 September 2026
 
 ### Added

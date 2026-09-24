@@ -14,6 +14,7 @@ import { createHash } from 'node:crypto'
 import { canonicalizeJson } from '../canonical-json.js'
 import {
   SsivcError,
+  type SsivcErrorKind,
   type SsivcClient,
   type SsivcSessionRequestBody,
   type SsivcSessionCreated,
@@ -176,6 +177,12 @@ export interface RequestVerificationFailure {
    * on a value that identifies real money.
    */
   paymentReceipt?: string
+  /**
+   * Set only when this call itself discarded a dead receipt — either a stuck one the caller
+   * confirmed via `discardStuckReceiptAndPayFresh`, or a void one (`status_code 67`/`68`) the wallet
+   * discarded on its own. After the call the id exists nowhere else, so it rides back here.
+   */
+  discardedPaymentReceipt?: string
 }
 
 /**
@@ -190,7 +197,25 @@ export interface RequestVerificationPending {
   settlementPending: true
   /** The live settlement receipt. Surfaced as its own field because it is what support asks for first. */
   paymentReceipt: string
+  /**
+   * The credential service was reached and refused the request — the settlement is not what failed,
+   * and `message` quotes what it said.
+   *
+   * A field rather than a prefix on `message` (R2-M01), matching `check_`'s result: the alternative
+   * was asking a caller to branch on how the prose opens, which is exactly the parsing the rest of
+   * this contract exists to avoid.
+   */
+  issuerRejected?: boolean
+  /**
+   * SSIVC has specifically ruled the payment/receipt invalid (`payment_invalid`, R3-M01) — distinct
+   * from `issuerRejected`, whose wording says "the settlement is not what failed", which is
+   * backwards for this case. `message` quotes what SSIVC said; it makes no claim about whether the
+   * fee was taken, in either direction.
+   */
+  paymentInvalid?: boolean
   message: string
+  /** Set only when this call discarded a stuck receipt before this outcome. */
+  discardedPaymentReceipt?: string
 }
 
 export type RequestVerificationResult =
@@ -209,8 +234,14 @@ export type CheckVerificationResult =
    * R2-L01: this one status covers TWO materially different situations, and `outcomeUnknown` is
    * what tells them apart — `request_` keeps them structurally distinct and this surface must not
    * collapse them:
-   *  - absent/false — queued and progressing normally. It will most likely resolve on its own;
-   *    checking again in a few minutes is the right advice. Message leads `PAYMENT SENT`.
+   *  - absent/false — message leads `PAYMENT SENT`, and checking again in a few minutes is the
+   *    right advice. R11-M03: this half is itself TWO states, and the flag cannot separate them —
+   *    only the clause after the lead can. `still being processed` is a confirmed queued
+   *    settlement, progressing normally; `has not been confirmed yet` is an outcome that could not
+   *    be determined at all, merely too young to be called stuck ({@link SettlementOutcomeUnknownError}
+   *    before it ages), so it must NOT be reported as progressing or as succeeded. Every
+   *    agent-facing surface documents that split (SPEC.md REQ-19b), so neither message may adopt
+   *    the other's phrase.
    *  - true — the outcome could not be determined at all (the replay itself failed). It may never
    *    resolve, so "check back later" is the wrong advice on its own: the receipt id needs to reach
    *    a human. Message leads `OUTCOME UNKNOWN`.
@@ -222,6 +253,21 @@ export type CheckVerificationResult =
       outcomeUnknown?: boolean
       /** How long it has been unresolved, when that is past {@link DEFAULT_SETTLEMENT_STUCK_AFTER_MS}. */
       stuckFor?: string
+      /**
+       * The credential service answered with a 4xx — it was reached, formed a verdict, and said
+       * why; `message` quotes it. The payment is untouched and retrying is still correct, but the
+       * machine-readable flag exists so a host agent cannot present this as "still settling", which
+       * is what it did through an 18-hour issuer outage.
+       */
+      issuerRejected?: boolean
+      /**
+       * SSIVC has specifically ruled the payment/receipt invalid (`payment_invalid`, R3-M01) —
+       * distinct from `issuerRejected`: that field's meaning ("the settlement is not what failed")
+       * is backwards here, since `payment_invalid` IS SSIVC's verdict about the payment. `message`
+       * quotes what SSIVC said and makes no claim about whether the fee was taken, in either
+       * direction.
+       */
+      paymentInvalid?: boolean
     }
   /**
    * SSIVC has declared the receipt void — `status_code 67` (expired) or `68` (failed) — so this is
@@ -229,7 +275,7 @@ export type CheckVerificationResult =
    * is nothing to check. It says nothing about whether the fee was taken: see
    * {@link SettlementReceiptVoidError}.
    */
-  | { status: 'receipt_void'; message: string; paymentReceipt: string }
+  | { status: 'receipt_void'; message: string; paymentReceipt: string; discardedPaymentReceipt?: string }
   | (SsivcSessionStatus & { vc?: unknown; cacheError?: string; verificationUrl?: string; vcPassImagePaths?: string[] })
 
 /** True iff `entry.vc.credentialSubject.id` equals `holderDid`. */
@@ -488,7 +534,13 @@ class SettlementStillQueuedError extends Error {
  * is only correct when the state is known-recoverable, which an unrecognized error does not confirm.
  */
 class SettlementOutcomeUnknownError extends Error {
-  constructor(message: string, public readonly paymentReceipt: string) {
+  /**
+   * `cause` carries the original failure, not just its text. Without it the only thing surviving to
+   * the reporting layer was a formatted string, so the distinction between "the service rejected
+   * this and said why" and "we could not reach an answer" was lost exactly where it decides what
+   * the user is told — see {@link isIssuerRejection}.
+   */
+  constructor(message: string, public readonly paymentReceipt: string, public readonly cause?: unknown) {
     super(message)
     this.name = 'SettlementOutcomeUnknownError'
   }
@@ -515,6 +567,31 @@ class SettlementReceiptVoidError extends Error {
 }
 
 /** True for the two SSIVC verdicts that make a receipt permanently unusable. */
+/**
+ * Throw away a receipt the payment service has declared void.
+ *
+ * Unlike every other discard in this file, this one needs no confirmation — and that is not the rule
+ * being relaxed, it is the rule not applying. Confirmation exists because discarding a receipt can
+ * forfeit a payment that might still land; a void receipt cannot land, by the server's own ruling, so
+ * holding it protects nothing. What it does do is block: every later request_ replays it, is refused
+ * again, and the user cannot buy anything until they run a separate discard call first.
+ *
+ * Discarding is NOT paying again. This frees the next purchase to be an ordinary one; it does not
+ * make it. Both callers say plainly that buying again is the user's decision and costs the fee again,
+ * and both return the discarded id — after this it exists nowhere else.
+ *
+ * Best-effort: a store that will not write must not turn a clean terminal verdict into an exception,
+ * since that verdict is the only place the id survives. A failed clear simply means the next call
+ * replays and lands here again — same outcome, one call later.
+ */
+async function discardVoidReceipt(deps: Pick<VerifyAiBirthcertDeps, 'sessionStore'>): Promise<void> {
+  try {
+    await deps.sessionStore.clear()
+  } catch {
+    // Swallowed deliberately — see above.
+  }
+}
+
 function isReceiptVoid(err: unknown): err is SsivcError {
   return err instanceof SsivcError && err.kind === 'settlement_void'
 }
@@ -533,6 +610,167 @@ function unresolvedCause(err: unknown): string {
     return 'the payment service reports that it cannot confirm the settlement either way'
   }
   return `the receipt-replay call itself failed (${err instanceof Error ? err.message : String(err)})`
+}
+
+/**
+ * True when the credential service answered — with a rejection — rather than the call failing to
+ * produce an answer at all.
+ *
+ * The difference decides what the user is told. A network fault or a 5xx genuinely leaves the
+ * outcome unknown. A 4xx does not: the service was reached, formed a verdict, and said why. Telling
+ * someone "the settlement has not been confirmed yet, nothing has gone wrong" in that case is simply
+ * false, and it cost a live user thirteen minutes of waiting on a settlement that had confirmed in
+ * eleven seconds while SSIVC was failing to authenticate to its own verification gateway
+ * (`400 status_code 99`, "Error retrieving ZVG access token").
+ *
+ * Deliberately NOT keyed on `99`. That is SSIVC's generic fallback, not a ZVG-specific code (observed in a real
+ * incident), so the next one may mean something entirely different. What makes the report useful is
+ * quoting THEIR message, which this wallet already receives and — until this change — discarded.
+ */
+function isIssuerRejection(err: unknown): err is SsivcError {
+  if (!(err instanceof SsivcError)) return false
+  if (err.httpStatus === undefined || err.httpStatus < 400 || err.httpStatus >= 500) return false
+  // The HTTP class alone is not enough (review APP-C01). SSIVC ships several settlement verdicts
+  // on 400, and each already carries a `kind` saying what it means — so the kind decides, and only
+  // an error that carries none, or one about something other than the settlement, counts as a
+  // refusal to report through THIS wording.
+  //
+  // - `settlement_unconfirmed` (69) is the exact opposite of a verdict: SPEC.md REQ-19d requires it
+  //   be treated as genuinely unresolved. Reporting it as a refusal would manufacture certainty
+  //   this module elsewhere (the stuck-receipt branch) correctly declines to claim.
+  // - `settlement_void` (67/68) is terminal and has its own path with its own wording; it should
+  //   never arrive here, and if a future change routes it through, it must not be reworded.
+  // - `blob_already_settled` (409) most likely means the money DID move, which is the one thing
+  //   this message must not talk over.
+  // - `payment_invalid` (402) is excluded from THIS classifier for the reason R2-M05 gave — this
+  //   wording's "that refusal is about the request, not about the settlement" is backwards for a
+  //   verdict specifically about the payment — but it is NOT folded into the generic indeterminate
+  //   branch either (R3-M01 caught that landing there asserted "nothing has gone wrong and no
+  //   funds are lost", an unsupported positive claim on the strength of SSIVC's explicit negative
+  //   one). It gets its own classifier and wording — see {@link isPaymentInvalidRejection}.
+  const notARejection: (SsivcErrorKind | undefined)[] = [
+    'settlement_unconfirmed',
+    'settlement_void',
+    'blob_already_settled',
+    'payment_invalid',
+  ]
+  return !notARejection.includes(err.kind)
+}
+
+/**
+ * True when SSIVC has specifically ruled the payment/receipt invalid — `402` + `kind:
+ * 'payment_invalid'` (SPEC.md: "payment blob invalid/expired/underpaid").
+ *
+ * Split out from {@link isIssuerRejection} rather than folded into it (R3-M01): that function's
+ * wording tells the user "that refusal is about the request, not about the settlement", which is
+ * exactly backwards here — `payment_invalid` IS SSIVC's verdict about the payment. Folding it into
+ * the OTHER bucket (the generic indeterminate branch) is just as wrong the other way: that branch's
+ * young-receipt wording says "nothing has gone wrong and no funds are lost", an unsupported positive
+ * claim made on the strength of SSIVC's explicit negative one. Neither existing bucket can hold this
+ * case honestly, so it gets its own.
+ */
+function isPaymentInvalidRejection(err: unknown): err is SsivcError {
+  return err instanceof SsivcError && err.kind === 'payment_invalid'
+}
+
+/**
+ * Renders SSIVC's text safe to quote inside an instruction-bearing message.
+ *
+ * Their string is third-party content that ends up next to sentences telling an agent what to do,
+ * so it is stripped of control characters, flattened to one line, capped, and has its quotes
+ * neutralised so it cannot appear to close the quotation and continue as instructions. Low urgency
+ * while the only writer is SSIVC, but the cost of holding the line here is one function.
+ */
+function quotedServiceReason(err: SsivcError): string {
+  const stripped = err.message.replace(/^.*?HTTP \d+:\s*/, '') || err.message
+  const oneLine = stripped
+    .replace(/[\u0000-\u001F\u007F]+/g, ' ')
+    .replace(/["'`]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!oneLine) return 'no reason given'
+  return oneLine.length > 300 ? `${oneLine.slice(0, 300)}…` : oneLine
+}
+
+/**
+ * What to tell the user when a receipt replay was rejected rather than left unresolved.
+ *
+ * Says three things the old wording got wrong: the settlement is not what failed, the receipt was
+ * kept, and here is what the service actually said. Still advises retrying — an outage can clear,
+ * and the measured one did — but stops presenting a rejection as progress.
+ *
+ * What it pointedly does NOT say is whether the fee was taken. It cannot know: a settlement can
+ * confirm on chain and the service still refuse the request that follows, which is exactly what
+ * happened on the incident this came from (SPEC.md §6, REQ-19f).
+ *
+ * R10-M01: `paidThisCall` exists because this builder is shared by two surfaces with opposite
+ * truths. check_ never pays (its `deps` has no `pay`), so "no new payment was made" is always true
+ * there and it passes `false`. request_'s FRESH-PAY route already ran `deps.pay` before SSIVC was
+ * ever asked to settle, so on the path where the settle queues and a later poll is refused, the
+ * hardcoded "no new payment was made" was a false money claim about THIS call. Passing `true` swaps
+ * it for an admission instead of a denial. It never claims the fee definitely moved either — only
+ * that a payment was attempted on this call, which is the one thing that is known.
+ */
+function issuerRejectionMessage(
+  err: SsivcError,
+  receipt: string,
+  humanAge: string,
+  paidThisCall: boolean,
+): string {
+  const code = err.statusCode ? ` (status_code ${err.statusCode})` : ''
+  return (
+    `PAYMENT SENT, BUT THE CREDENTIAL SERVICE REFUSED THE REQUEST${code}: ` +
+    `"${quotedServiceReason(err)}". That refusal is about the request, not about the settlement — ` +
+    `do not tell the user the payment is still processing, because processing is not what failed. ` +
+    `${humanAge} in, receipt ${receipt} has been KEPT` +
+    (paidThisCall
+      ? `, and THIS CALL ITSELF SENT A PAYMENT before the refusal — so a fee may have been spent on ` +
+        `this attempt. It is still `
+      : ` and no new payment was made, so this is still `) +
+    `recoverable and a refusal can clear once the service recovers — call ` +
+    `check_ai_birthcert_verification again later. It does NOT establish whether the fee was taken: ` +
+    `never tell the user they were not charged. Do NOT pay again. If it keeps repeating, quote the ` +
+    `receipt and this message to support.`
+  )
+}
+
+/**
+ * What to tell the user when SSIVC has specifically ruled the payment/receipt invalid
+ * ({@link isPaymentInvalidRejection}) — deliberately different wording from
+ * {@link issuerRejectionMessage} (R3-M01).
+ *
+ * The generic rejection message reassures that "the refusal is about the request, not about the
+ * settlement" — accurate for an upstream fault like the ZVG outage this MR was written for, but
+ * backwards here: SSIVC's own classification says this IS a verdict about the payment. So this
+ * wording makes no claim about the settlement either way, and — same discipline as every other
+ * message on this path — makes no claim about whether the fee was taken. It also does not repeat
+ * the false-safety line R3-M01 caught the generic indeterminate branch making ("nothing has gone
+ * wrong and no funds are lost"): SSIVC gave an explicit negative-leaning answer, so a positive one
+ * would be asserting the opposite of what was said.
+ *
+ * `paidThisCall` for the same reason as {@link issuerRejectionMessage} (R10-M01): on request_'s
+ * fresh-pay route the hardcoded "no new payment was made" was false about this very call.
+ */
+function paymentInvalidMessage(
+  err: SsivcError,
+  receipt: string,
+  humanAge: string,
+  paidThisCall: boolean,
+): string {
+  const code = err.statusCode ? ` (status_code ${err.statusCode})` : ''
+  return (
+    `PAYMENT SENT, BUT THE CREDENTIAL SERVICE SAYS THIS PAYMENT DID NOT VALIDATE${code}: ` +
+    `"${quotedServiceReason(err)}". This is a verdict about the payment itself, not confirmation ` +
+    `either way about whether funds moved — do not tell the user they were charged, and do not ` +
+    `tell them they were not. ${humanAge} in, receipt ${receipt} has been KEPT` +
+    (paidThisCall
+      ? `, and THIS CALL ITSELF SENT A PAYMENT before that verdict — so a fee may have been spent ` +
+        `on this attempt.`
+      : ` and no new payment was made.`) +
+    ` Do NOT pay again and do NOT assume this is unrecoverable. Call ` +
+    `check_ai_birthcert_verification again later to see if it clears. If it keeps repeating, quote ` +
+    `the receipt and this message to support rather than guessing what it means.`
+  )
 }
 
 /**
@@ -593,6 +831,7 @@ async function resolveSettlement(
         `the settlement outcome for payment receipt ${receiptSent} could not be determined — ` +
           unresolvedCause(err),
         receiptSent,
+        err,
       )
     }
     if (outcome.kind === 'queued' && outcome.paymentReceipt !== lastPersistedReceipt) {
@@ -968,13 +1207,53 @@ async function requestAiBirthcertVerificationLocked(
 ): Promise<RequestVerificationResult> {
   // Runs before anything else, because its whole purpose is to make the prior-session check below
   // see an empty store and take the pay-fresh path instead of replaying the receipt forever.
-  let discardedPaymentReceipt: string | undefined
-  if (input.discardStuckReceiptAndPayFresh !== undefined) {
-    const outcome = await discardStuckReceiptBeforePaying(deps, input.discardStuckReceiptAndPayFresh)
-    if ('refusal' in outcome) return outcome.refusal
-    discardedPaymentReceipt = outcome.discarded
+  if (input.discardStuckReceiptAndPayFresh === undefined) {
+    return payOrReplayLocked(deps, agentName, input)
   }
+  const outcome = await discardStuckReceiptBeforePaying(deps, input.discardStuckReceiptAndPayFresh)
+  if ('refusal' in outcome) return outcome.refusal
 
+  // The discarded id exists nowhere else once the store is cleared, and support asks for it first —
+  // so it rides back on every result after the discard, not only the success (R8-M04). Precisely
+  // (R9-M02/R9-M03): as the `discardedPaymentReceipt` FIELD on every returned result, except when the
+  // call also discarded a second, void receipt of its own — that result already uses the field for
+  // the void id, so the confirmed id rides in the `error`/`message` TEXT instead. A throw is the one
+  // exit that carries no result at all, so it is handled separately just below (R9-LOW).
+  let result: RequestVerificationResult
+  try {
+    result = await payOrReplayLocked(deps, agentName, input)
+  } catch (err) {
+    // payOrReplayLocked rethrows anything its catch ladder does not classify, and that throw escapes
+    // past every return below — so without this the id the user just confirmed dies with the store
+    // record and reaches nobody. Rethrown (not converted to { error }) so the caller's own
+    // unhandled-error handling is unchanged; only the message grows.
+    const detail = err instanceof Error ? err.message : String(err)
+    throw new Error(
+      `${detail} — DISCARDED RECEIPT ${outcome.discarded}: this call threw that payment receipt away ` +
+        `before failing, it exists nowhere else now, so quote it to support.`,
+      { cause: err },
+    )
+  }
+  if ('discardedPaymentReceipt' in result && result.discardedPaymentReceipt !== outcome.discarded) {
+    // Two receipts died on one call: the wallet's own void discard took the field, so the one the
+    // caller confirmed must be named in the text or it exists nowhere (REQ-19e).
+    const also = ` ALSO DISCARDED earlier on this same call: receipt ${outcome.discarded}, the one the user confirmed — quote it to support too.`
+    if ('error' in result && typeof result.error === 'string') return { ...result, error: result.error + also }
+    if ('message' in result && typeof result.message === 'string') return { ...result, message: result.message + also }
+    // Unreachable today, and deliberately not papered over: the only shape that sets
+    // discardedPaymentReceipt itself is the RECEIPT VOID branch, which always carries `error` too. If
+    // a future shape sets the field with no text field at all, the confirmed id IS lost here — add a
+    // text field to that shape rather than letting this line stay silent about it.
+    return result
+  }
+  return { ...result, discardedPaymentReceipt: outcome.discarded }
+}
+
+async function payOrReplayLocked(
+  deps: VerifyAiBirthcertDeps,
+  agentName: string,
+  input: RequestAiBirthcertVerificationInput,
+): Promise<RequestVerificationResult> {
   const decision = await decidePriorSession(deps, agentName)
   if (decision.kind === 'still_pending') return decision.result
   if (decision.kind === 'blocked') return { error: decision.message }
@@ -1042,6 +1321,13 @@ async function requestAiBirthcertVerificationLocked(
   // check.
   const requestedGasPayer = input.gasPayer === 'self' || input.gasPayer === 'sponsored' ? input.gasPayer : undefined
 
+  // APP-M01: only the replay path (decision.kind === 'replay_receipt') makes no payment of its own —
+  // it just resumes a receipt already paid for on a PRIOR call. Every other path runs
+  // payAndCreateSession, which calls deps.pay before SSIVC is ever asked to settle, so a
+  // SettlementReceiptVoidError surfacing from THIS branch means money may have moved on THIS exact
+  // call, not a prior one. The void message below must not claim otherwise.
+  const paidThisCall = decision.kind !== 'replay_receipt'
+
   let paid: { session: SsivcSessionCreated; paymentReceipt: string }
   try {
     if (decision.kind === 'replay_receipt') {
@@ -1057,6 +1343,7 @@ async function requestAiBirthcertVerificationLocked(
           `the settlement outcome for payment receipt ${decision.receipt} could not be determined — ` +
             unresolvedCause(err),
           decision.receipt,
+          err,
         )
       }
       paid = await resolveSettlement(deps, buildBody, initialOutcome, persistQueuedReceipt)
@@ -1123,8 +1410,23 @@ async function requestAiBirthcertVerificationLocked(
     // 409 (open decision D11), so we can't auto-recover it here — but we MUST NOT let this surface
     // as an unhandled/opaque error either. Report it distinctly so the caller knows retrying blindly
     // won't help and a human may need to check whether the payment actually went through.
+    //
+    // R8-M03: this message used to be just the raw SSIVC text, with none of the do-not-retry
+    // language the other three money-at-risk branches (receipt-save failure, RECEIPT VOID, OUTCOME
+    // UNKNOWN) all carry — leaving the tool description's "exactly as `message` itself will say"
+    // false for this one branch. There is no receipt to quote here (SSIVC never returns one on a
+    // 409), so the message names agentName instead — the one thing support can actually search on.
     if (err instanceof SsivcError && err.kind === 'blob_already_settled') {
-      return { error: `payment already settled for this attempt: ${err.message}` }
+      return {
+        error:
+          `PAYMENT ALREADY SETTLED FOR THIS ATTEMPT — do not retry, do not assume it failed. SSIVC ` +
+          `says this exact payment attempt was already settled once before (${err.message}), most ` +
+          `likely because a prior call's success response was lost before we could save its receipt. ` +
+          `The fee was most likely already taken for agentName "${agentName}". Calling this tool ` +
+          `again pays the fee AGAIN, so do NOT retry without the user's explicit agreement — a human ` +
+          `may need to check on the SSIVC side whether this agentName already has a session before ` +
+          `anyone pays again.`,
+      }
     }
     // Indeterminate settlement outcome from a receipt-retry/replay call (see
     // SettlementOutcomeUnknownError's docstring). We deliberately do NOT touch the session store
@@ -1138,17 +1440,27 @@ async function requestAiBirthcertVerificationLocked(
     // SSIVC has ruled on this receipt — it is void. Terminal regardless of age, because
     // this is not a matter of waiting longer.
     if (err instanceof SettlementReceiptVoidError) {
+      // Discarded, not re-paid. The server has ruled this receipt unusable, so keeping it would only
+      // make every later call replay it and be refused again.
+      await discardVoidReceipt(deps)
       return {
         paymentReceipt: err.paymentReceipt,
+        discardedPaymentReceipt: err.paymentReceipt,
         error:
           `RECEIPT VOID — this payment can no longer be used, and no credential was issued. The ` +
-          `payment service has ruled on it: ${err.message}. Nothing was paid on this call, and the ` +
-          `receipt is still stored. Whether the original fee was actually taken is NOT settled by ` +
-          `this — a settlement can expire after the money has already moved — so do not tell the ` +
-          `user they were not charged; give them receipt ${err.paymentReceipt} to quote to support. ` +
-          `To buy the credential now, they must pay the fee AGAIN: with their explicit agreement, ` +
-          `call request_ai_birthcert_verification with discardStuckReceiptAndPayFresh set to exactly ` +
-          `${err.paymentReceipt}.`,
+          `payment service has ruled on it: ${err.message}. ` +
+          // APP-M01: on the fresh-pay route, deps.pay already ran earlier in THIS call, before the
+          // settlement was later ruled void on a poll — that is a real payment on this call, not a
+          // prior one, and must not be denied. Only the replay route truly paid nothing this call.
+          (paidThisCall
+            ? `THIS CALL MAY ITSELF HAVE SENT A PAYMENT before the settlement was ruled void. `
+            : `NOTHING WAS PAID on this call. `) +
+          `The dead receipt has been discarded, so nothing is blocking a fresh purchase. Whether the ` +
+          `fee was actually taken is NOT settled by this — a settlement can expire after the money ` +
+          `has already moved — so do not tell the user they were not charged; give them receipt ` +
+          `${err.paymentReceipt} to quote to support. If they want the credential, call ` +
+          `request_ai_birthcert_verification again and it will pay normally — that is THE FEE AGAIN, ` +
+          `so ask them first rather than calling it on their behalf.`,
       }
     }
     if (err instanceof SettlementOutcomeUnknownError) {
@@ -1167,14 +1479,53 @@ async function requestAiBirthcertVerificationLocked(
         deps.now(),
         deps.settlementStuckAfterMs ?? DEFAULT_SETTLEMENT_STUCK_AFTER_MS,
       )
+      // Age first splits "still in flight" from "never coming back" — but only for an outcome
+      // nobody knows. A refusal is a verdict about the request, and age says nothing about a
+      // verdict (R2-C01), so it is answered before the age split rather than inside one half of it.
+      // Left age-gated, a long-running outage of exactly the kind this branch exists for would,
+      // past the threshold, tell the user "do not retry" and "the fee was most likely already
+      // taken" about a receipt SPEC.md REQ-19f says is still recoverable — and point them at
+      // clear_stuck_payment_receipt and a second fee.
+      // Checked ahead of the generic rejection too (R3-M01): payment_invalid needs its own
+      // wording, not the generic one ("that refusal is about the request, not about the
+      // settlement" is backwards for a verdict specifically about the payment) and not the
+      // young-receipt wording below either (which claims "Nothing is lost" — an unsupported
+      // positive claim on the strength of SSIVC's explicit negative one).
+      if (isPaymentInvalidRejection(err.cause)) {
+        return {
+          paymentReceipt: err.paymentReceipt,
+          settlementPending: true,
+          paymentInvalid: true,
+          // R10-M01: paidThisCall, because on the fresh-pay route deps.pay already ran on THIS call
+          // before SSIVC ruled on the receipt. The builder's default wording denies that.
+          message: paymentInvalidMessage(err.cause, err.paymentReceipt, age.humanAge, paidThisCall),
+        }
+      }
+      if (isIssuerRejection(err.cause)) {
+        return {
+          paymentReceipt: err.paymentReceipt,
+          settlementPending: true,
+          issuerRejected: true,
+          // R10-M01: see the paymentInvalidMessage call just above.
+          message: issuerRejectionMessage(err.cause, err.paymentReceipt, age.humanAge, paidThisCall),
+        }
+      }
       if (!age.stuck) {
         return {
           paymentReceipt: err.paymentReceipt,
           settlementPending: true,
-          message:
-            `PAYMENT SENT — the settlement has not been confirmed yet, ${age.humanAge} in. Nothing is ` +
-            `lost: receipt ${err.paymentReceipt} is saved and no new payment was attempted. Do NOT pay ` +
-            `again. Call check_ai_birthcert_verification in a few minutes to follow it through.`,
+          // R10-LOW: the paidThisCall half no longer opens with "Nothing is lost". A fee was spent on
+          // this very call with an outcome nobody knows yet, so "nothing is lost" sitting against that
+          // admission reads as reassurance the wallet cannot give. The replay half keeps it: there
+          // nothing WAS spent on this call, which is what makes the phrase true.
+          message: paidThisCall
+            ? `PAYMENT SENT — the settlement has not been confirmed yet, ${age.humanAge} in. This call ` +
+              `itself sent the payment; whether it settled is not yet known. Receipt ` +
+              `${err.paymentReceipt} is saved. Do NOT pay again. Call ` +
+              `check_ai_birthcert_verification in a few minutes to follow it through.`
+            : `PAYMENT SENT — the settlement has not been confirmed yet, ${age.humanAge} in. Nothing is ` +
+              `lost: receipt ${err.paymentReceipt} is saved and no new payment was attempted. Do NOT ` +
+              `pay again. Call check_ai_birthcert_verification in a few minutes to follow it through.`,
         }
       }
       return {
@@ -1183,8 +1534,14 @@ async function requestAiBirthcertVerificationLocked(
           `OUTCOME UNKNOWN — do not retry, do not assume failure. The sponsored settlement for payment ` +
           `receipt ${err.paymentReceipt} could not be determined either way (${err.message}), and has ` +
           `been unresolved for ${age.humanAge} — past the point where it resolves on its own. The fee ` +
-          `was most likely already taken and no credential was issued. This call did NOT pay again: ` +
-          `the receipt is kept, and while it is kept this tool can only ever replay it, never buy a ` +
+          `was most likely already taken and no credential was issued. ` +
+          // R10-LOW: the clause that follows used to start "the receipt is kept" for both halves,
+          // which left the paidThisCall half with a lowercase sentence start after a full stop. Each
+          // half now carries its own capitalisation.
+          (paidThisCall
+            ? `THIS CALL ITSELF SENT THE PAYMENT, so a fee has been spent on this attempt. The receipt is kept, `
+            : `This call did NOT pay again: the receipt is kept, `) +
+          `and while it is kept this tool can only ever replay it, never buy a ` +
           `new credential. To start over, the user must first discard it with ` +
           `clear_stuck_payment_receipt — which forfeits that payment — and the next request then pays ` +
           `a SECOND fee. Both steps at once: call request_ai_birthcert_verification with ` +
@@ -1206,10 +1563,7 @@ async function requestAiBirthcertVerificationLocked(
     ...effectiveOptionalFields,
   })
 
-  // The discarded receipt id rides back on the success, because this call is the only
-  // place it still exists — the store has been overwritten by the new session, and support asks for
-  // that id first when reconciling a payment that bought nothing.
-  return discardedPaymentReceipt ? { ...paid.session, discardedPaymentReceipt } : paid.session
+  return paid.session
 }
 
 /**
@@ -1244,7 +1598,10 @@ async function advanceQueuedSettlement(
   try {
     initialOutcome = await deps.ssivc.createSessionWithReceipt(await buildBody(), stored.paymentReceipt)
   } catch (err) {
-    if (isReceiptVoid(err)) return voidReceiptOutcome(stored.paymentReceipt, err.message)
+    if (isReceiptVoid(err)) {
+      await discardVoidReceipt(deps)
+      return voidReceiptOutcome(stored.paymentReceipt, err.message)
+    }
     return unknownSettlementOutcome(stored.paymentReceipt, err, undefined, settlementAge(stored, deps.now(), deps.settlementStuckAfterMs ?? DEFAULT_SETTLEMENT_STUCK_AFTER_MS))
   }
 
@@ -1271,9 +1628,12 @@ async function advanceQueuedSettlement(
     if (err instanceof SettlementStillQueuedError) {
       return { status: 'settlement_pending', message: err.message, paymentReceipt: err.paymentReceipt }
     }
-    if (err instanceof SettlementReceiptVoidError) return voidReceiptOutcome(err.paymentReceipt, err.message)
+    if (err instanceof SettlementReceiptVoidError) {
+      await discardVoidReceipt(deps)
+      return voidReceiptOutcome(err.paymentReceipt, err.message)
+    }
     if (err instanceof SettlementOutcomeUnknownError) {
-      return unknownSettlementOutcome(err.paymentReceipt, undefined, err.message, settlementAge(stored, deps.now(), deps.settlementStuckAfterMs ?? DEFAULT_SETTLEMENT_STUCK_AFTER_MS))
+      return unknownSettlementOutcome(err.paymentReceipt, undefined, err.message, settlementAge(stored, deps.now(), deps.settlementStuckAfterMs ?? DEFAULT_SETTLEMENT_STUCK_AFTER_MS), err.cause)
     }
     throw err
   }
@@ -1319,14 +1679,15 @@ function voidReceiptOutcome(paymentReceipt: string, detail: string): CheckVerifi
   return {
     status: 'receipt_void',
     paymentReceipt,
+    discardedPaymentReceipt: paymentReceipt,
     message:
       `RECEIPT VOID — this payment can no longer be used and no credential was issued. The payment ` +
-      `service has ruled on it: ${detail}. Checking again will not change this. Whether the fee was ` +
-      `actually taken is NOT settled by this — a settlement can expire after the money has moved — ` +
-      `so do not tell the user they were not charged; give them receipt ${paymentReceipt} to quote ` +
-      `to support. Buying the credential now means paying the fee AGAIN, which needs their explicit ` +
-      `agreement: request_ai_birthcert_verification with discardStuckReceiptAndPayFresh set to ` +
-      `exactly ${paymentReceipt}.`,
+      `service has ruled on it: ${detail}. Checking again will not change this. The dead receipt has ` +
+      `been discarded, so nothing is blocking a fresh purchase. Whether the fee was actually taken is ` +
+      `NOT settled by this — a settlement can expire after the money has moved — so do not tell the ` +
+      `user they were not charged; give them receipt ${paymentReceipt} to quote to support. If they ` +
+      `want the credential, call request_ai_birthcert_verification again and it will pay normally — ` +
+      `that is THE FEE AGAIN, so ask them first rather than calling it on their behalf.`,
   }
 }
 
@@ -1343,8 +1704,46 @@ function unknownSettlementOutcome(
   err?: unknown,
   message?: string,
   age?: { stuck: boolean; humanAge: string },
+  cause?: unknown,
 ): CheckVerificationResult {
   const detail = message ?? unresolvedCause(err)
+  const rejection = [cause, err].find(isIssuerRejection)
+  const paymentInvalid = [cause, err].find(isPaymentInvalidRejection)
+
+  // Same age-independence as the rejection check below, and checked first (R3-M01): payment_invalid
+  // must not fall into either the generic rejection wording ("that refusal is about the request,
+  // not about the settlement" — backwards for a verdict specifically about the payment) or the
+  // young-receipt wording just past it ("nothing has gone wrong and no funds are lost" — an
+  // unsupported positive claim on the strength of SSIVC's explicit negative one).
+  if (paymentInvalid) {
+    return {
+      status: 'settlement_pending',
+      paymentReceipt,
+      paymentInvalid: true,
+      ...(age?.stuck ? { stuckFor: age.humanAge } : {}),
+      // `false`: this helper only ever serves check_, which has no `pay` in its deps at all, so
+      // "no new payment was made" is true here by construction (R10-M01).
+      message: paymentInvalidMessage(paymentInvalid, paymentReceipt, age?.humanAge ?? 'some time', false),
+    }
+  }
+
+  // Answered BEFORE the age split, not inside its young half (R2-C01). A 4xx is a verdict, not
+  // silence; the age of the receipt tells you nothing about whether the service refused it. Gating
+  // this on youth meant a long outage of exactly the kind this branch exists for flipped, at 24h,
+  // into "do not retry" and "the fee was most likely already taken" — about a receipt SPEC.md
+  // REQ-19f says is still recoverable, and with clear_stuck_payment_receipt (a second fee) offered
+  // as the way out. The outage that prompted this MR ran 19 hours; five more and the wallet would
+  // have advised paying twice.
+  if (rejection) {
+    return {
+      status: 'settlement_pending',
+      paymentReceipt,
+      issuerRejected: true,
+      ...(age?.stuck ? { stuckFor: age.humanAge } : {}),
+      // `false` for the same reason as the paymentInvalid branch above (R10-M01).
+      message: issuerRejectionMessage(rejection, paymentReceipt, age?.humanAge ?? 'some time', false),
+    }
+  }
 
   // Still young: the settlement may genuinely be in flight, so the honest advice is to wait. The
   // receipt is kept either way; only the wording differs.

@@ -310,13 +310,40 @@ export function buildToolList() {
         'real funds: it self-pays an x402 challenge, subject to the same credential-issuance payment ' +
         'cap as subscribe_and_issue — a separate, narrower cap than pay_and_fetch\'s, which defaults ' +
         'to refusing everything on mainnet. Set MAX_PAYMENT_AMOUNT to override either. It can return ' +
-        '{ error: "..." } instead of a session if that payment fails (insufficient funds, or the ' +
-        'payment cap blocked it) — nothing is created in that case. ' +
-        'It can also return { settlementPending: true, paymentReceipt, message } — this means the ' +
-        'payment SUCCEEDED and the sponsored settlement is still clearing, which can take a few ' +
-        'minutes. That is NOT a failure and NOT an error: report it to the user as "payment sent, ' +
-        'still settling", never as "the payment failed". Do not pay again and do not call this tool ' +
-        'again to retry — call check_ai_birthcert_verification to follow it through. ' +
+        '{ error: "..." } instead of a session. Read `message` before deciding what to tell the ' +
+        'user or whether retrying is safe — it does NOT always mean nothing was paid. For ' +
+        'insufficient funds or a payment-cap block specifically, nothing is created and nothing ' +
+        'was paid, so once the underlying problem is fixed (e.g. the user tops up), calling this ' +
+        'tool again is the right next step. Several OTHER { error } shapes mean the opposite: a ' +
+        'payment may already have been sent on a prior or even this call (blob_already_settled, a ' +
+        'receipt that could not be saved locally, RECEIPT VOID, OUTCOME UNKNOWN) — for any of ' +
+        'those, calling this tool again pays the fee AGAIN, so do NOT retry without ' +
+        'explicit agreement from the user, exactly as `message` itself will say. ' +
+        'It can also return { settlementPending: true, paymentReceipt, message } instead — a ' +
+        'payment WAS SENT and no session exists yet. That is NOT a failure and NOT an error, but do ' +
+        'NOT pay again and do NOT call this tool again to retry it — call ' +
+        'check_ai_birthcert_verification to follow it through instead. It covers three different ' +
+        'situations, told apart by the `issuerRejected` and `paymentInvalid` fields. With neither ' +
+        'set, do NOT assume the payment is known to have succeeded — this shape covers TWO different ' +
+        'states that look identical from these fields alone: usually the settlement is genuinely ' +
+        'still clearing (the message says "still being processed"), but sometimes the outcome could not ' +
+        'be determined at all yet (the message says "has not been confirmed yet" and does not say "still being processed") — an indeterminate ' +
+        'state, not a confirmed one, even though neither flag is set. Either way the receipt is ' +
+        'saved and you must not pay again, so report it as "payment sent, still settling" without ' +
+        'promising the user it definitely succeeded. With ' +
+        'issuerRejected: true the credential service was reached and refused the request — the ' +
+        'settlement is NOT what failed, but do NOT describe this as the payment having succeeded ' +
+        'either: `message` quotes its reason, and you must relay that reason rather than ' +
+        'describing it as still settling or as a success. With paymentInvalid: true the service ' +
+        'has specifically ruled the payment or receipt invalid — do NOT say "the settlement is not ' +
+        'what failed" for this one, since this verdict IS about the payment; relay what it said ' +
+        'instead, and do NOT describe it as a success either. Neither this case nor issuerRejected ' +
+        'tells you whether the fee was taken, in either direction — never tell the user they were ' +
+        'not charged, and just as much, never tell them they WERE charged either. That no-claim ' +
+        'rule covers issuerRejected and paymentInvalid specifically. The plain no-flag case above is ' +
+        'different again, and NOT simply "known to have succeeded" either — see the note on it above: ' +
+        'it is two states, only one of which is confirmed, so read `message` there too rather than ' +
+        'assuming success from the shape alone. ' +
         'If the user did NOT ask for a "verified" credential specifically, they most likely want the ' +
         'self-declared, non-verified Basic AI Birthcert instead — use subscribe_and_issue for that.',
       inputSchema: {
@@ -352,16 +379,24 @@ export function buildToolList() {
           discardStuckReceiptAndPayFresh: {
             type: 'string',
             description:
-              'DESTRUCTIVE, and it SPENDS. Only for a payment that is genuinely stuck. While the wallet ' +
-              'holds a stuck receipt this tool can only replay it — it will never buy a new credential — ' +
-              'so this is the way to start over: it throws that payment away and pays a SECOND fee. Pass ' +
+              'DESTRUCTIVE, and it SPENDS. Only for a payment that is genuinely stuck (outcome still ' +
+              'unresolved). While the wallet holds a stuck receipt this tool can only replay it — it ' +
+              'will never buy a new credential — so this is the way to start over: it throws that ' +
+              'payment away and pays a SECOND fee. Not needed for a VOID receipt (settlement ruled ' +
+              'expired/failed): the wallet discards that one itself, with no flag and no confirmation, ' +
+              'so the next call is already an ordinary fresh purchase. Pass ' +
               'the stuck receipt id EXACTLY as check_ai_birthcert_verification or ' +
               'clear_stuck_payment_receipt reported it — never a guess, never true. A mismatched id ' +
               'discards nothing and pays nothing. Before using it, show the user the receipt id, tell ' +
               'them the first payment is forfeit and that this costs the fee again, and get their ' +
               'explicit agreement. If the receipt turns out to belong to a live session this is refused: ' +
-              'that session is already paid for, so call check_ai_birthcert_verification instead. The ' +
-              'result carries discardedPaymentReceipt — keep it, support needs it to trace the lost payment. ' +
+              'that session is already paid for, so call check_ai_birthcert_verification instead. ' +
+              'Normally the result carries the id you confirmed as discardedPaymentReceipt — keep it, ' +
+              'support needs it to trace the lost payment. But if this call ALSO threw away a void ' +
+              'receipt of its own (the fresh payment it just made was then ruled void), ' +
+              'discardedPaymentReceipt holds THAT receipt instead, and the id the user confirmed is ' +
+              'named at the end of the error text ("ALSO DISCARDED earlier on this same call") — so on ' +
+              'that path quote BOTH ids to support, not just the field. ' +
               'A receipt only counts as stuck once it is older than SETTLEMENT_STUCK_AFTER_MS (24h by ' +
               'default, e.g. SETTLEMENT_STUCK_AFTER_MS=3600000 for one hour); before that the wallet ' +
               'will say the settlement may still be in flight, and starting over is the user decision, not yours.',
@@ -433,9 +468,31 @@ export function buildToolList() {
         'telling the user to check back here genuinely moves things forward. While it is still ' +
         'clearing you get { status: "settlement_pending", paymentReceipt, message }: a payment HAS ' +
         'been made, so never call request_ai_birthcert_verification and never tell the user it ' +
-        'failed. Two cases, told apart by outcomeUnknown and by the first words of message: ' +
-        'without outcomeUnknown (message leads "PAYMENT SENT") it is queued and progressing — just ' +
-        'check again in a few minutes. With outcomeUnknown: true (message leads "OUTCOME UNKNOWN") ' +
+        'failed. With issuerRejected: true (message leads "PAYMENT SENT, BUT THE CREDENTIAL ' +
+        'SERVICE REFUSED THE REQUEST") the credential service was reached and refused the request, ' +
+        'and message quotes what it said — relay that reason to the user and tell them the ' +
+        'verification service is not completing requests right now. Do NOT describe it as a ' +
+        'settlement still processing: the settlement is not what failed. The receipt is kept and no ' +
+        'new payment was made, so it is worth checking again later — an outage on their side can ' +
+        'clear. This says NOTHING about whether the fee was taken, so never tell the user they were ' +
+        'not charged. ' +
+        'With paymentInvalid: true (message leads "PAYMENT SENT, BUT THE CREDENTIAL SERVICE SAYS ' +
+        'THIS PAYMENT DID NOT VALIDATE") the service has specifically ruled the payment or receipt ' +
+        'invalid — different from issuerRejected: do NOT say "the settlement is not what failed" ' +
+        'here, because this verdict IS about the payment. Relay what the service said, but this one ' +
+        'says NOTHING about whether the fee was taken in EITHER direction — never tell the user they ' +
+        'were not charged, and just as much, never tell them they WERE charged either. Do not pay ' +
+        'again either way. stuckFor may appear alongside EITHER issuerRejected or paymentInvalid (the ' +
+        'receipt happens to also be old) — it is just context on how long this has been retried, not ' +
+        'a reason to change any of the advice above for either case. ' +
+        'Otherwise, outcomeUnknown tells the remaining cases apart, and without it the message ' +
+        'splits again. Without outcomeUnknown the message leads "PAYMENT SENT", and that shape is ' +
+        'TWO different states you tell apart by the clause that follows. If it says "still being ' +
+        'processed" the settlement is confirmed queued and progressing — check again in a few ' +
+        'minutes. If it says "has not been confirmed yet" the outcome could not be determined at ' +
+        'all yet: do NOT describe that one as progressing and do NOT describe it as succeeded, ' +
+        'because it is indeterminate, not confirmed. Either way the receipt is saved, so do not ' +
+        'pay again, and check again later. With outcomeUnknown: true (message leads "OUTCOME UNKNOWN") ' +
         'the settlement outcome could not be determined at all and has been unresolved long enough ' +
         'that it is not coming back (stuckFor says how long). The fee was most likely ALREADY TAKEN ' +
         'and no credential was issued — say that plainly rather than implying it may still land. ' +
@@ -444,8 +501,10 @@ export function buildToolList() {
         'Separately, { status: "receipt_void" } is TERMINAL: the payment service has ruled that this ' +
         'receipt is finished (it expired, or the settlement failed), so checking again cannot help ' +
         'and no credential will come from it. That does NOT mean the fee was refunded — never tell ' +
-        'the user they were not charged; give them paymentReceipt for support. Buying the credential ' +
-        'then means paying the fee AGAIN, which needs their explicit agreement.',
+        'the user they were not charged; give them paymentReceipt for support. The wallet has already ' +
+        'DISCARDED the dead receipt, so nothing is blocking a new purchase: if the user wants the ' +
+        'credential, call request_ai_birthcert_verification again and it pays normally. That is the ' +
+        'fee AGAIN, so ask them first rather than calling it on their behalf.',
       inputSchema: { type: 'object', properties: {} },
     },
     {
@@ -455,8 +514,10 @@ export function buildToolList() {
         'holding and refusing to pay past. DESTRUCTIVE and CANNOT BE UNDONE: the payment it ' +
         'represents becomes unrecoverable — if that settlement ever completes, the funds are ' +
         'forfeit and no credential is issued. Do NOT use this as a retry. If the wallet reports ' +
-        '{ status: "settlement_pending" }, the payment is still in progress and will most likely ' +
-        'resolve on its own — call check_ai_birthcert_verification again instead; it actively ' +
+        '{ status: "settlement_pending" }, a payment has already been made and the settlement may ' +
+        'still complete by itself — but that same shape also covers an indeterminate outcome and a ' +
+        'service refusal, so do not promise the user it will resolve on its own; call ' +
+        'check_ai_birthcert_verification again instead; it actively ' +
         'advances a queued settlement. Only reach for this tool when the outcome has been stuck ' +
         'with no change for a long time and the user accepts losing the payment. ' +
         'Two steps, deliberately: call it with no arguments first and it clears NOTHING — it returns ' +
