@@ -18,12 +18,13 @@ import packageJson from '../package.json' with { type: 'json' }
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
-import { PaymentEngine } from 'x402-zetrix-client'
+import { PaymentEngine, BlobBuilder } from 'x402-zetrix-client'
+import { keypair } from 'zetrix-encryption-nodejs'
 import type { PayRequest as X402PayRequest, WalletConfigData, ZetrixNodeConfig } from 'x402-zetrix-client'
 import { X401Wallet, type ZetrixNetwork } from 'x401-zetrix-client'
 import ZtxChainSDK from 'zetrix-sdk-nodejs'
 import { loadConfig, resolveTokenAddress, type AgenticWalletConfig } from './config.js'
-import { resolveAssetSymbol, resolveAssetInfo, formatHumanAmount, type ContractQuery } from './clients/token-info-client.js'
+import { resolveAssetSymbol, resolveAssetInfo, formatHumanAmount, fetchTokenInfo, type ContractQuery } from './clients/token-info-client.js'
 import { queryContract as runContractQuery, type ContractQueryInput, type ContractQueryResult } from './clients/contract-query-client.js'
 import {
   parseNativeBalance,
@@ -39,6 +40,7 @@ import { MbiClient, type PayRequirement } from './clients/mbi-client.js'
 import { ZidResolverClient } from './clients/zid-resolver-client.js'
 import { resolveIssuerProofKeys } from './clients/resolve-issuer-proof-keys.js'
 import { createTools, type ToolDeps } from './mcp-tools.js'
+import type { TransferDeps } from './orchestrator/transfer.js'
 import type { PayFetch } from './orchestrator/pay.js'
 import { assertWithinPaymentCap, PaymentCapError, formatCapRefusal } from './payment-guard.js'
 import { payWithReadinessCheck, PaymentReadinessError } from './payment-readiness.js'
@@ -207,6 +209,33 @@ export function buildToolList() {
       },
     },
     {
+      name: 'transfer_token',
+      description:
+        'Send native ZTX or any ZTP20 token (e.g. JMYR) to a Zetrix address. THIS MOVES REAL FUNDS ' +
+        'and is irreversible. `token` accepts "ZTX", a registered symbol (resolved from the built-in ' +
+        'token list — no contract address needed), or a raw ZTP20 contract address; an unregistered ' +
+        "symbol returns needsTokenAddress:true, at which point ask the user for the contract address " +
+        "rather than guessing. State the amount as `amountHuman` (\"1.5\", converted using the token's " +
+        'on-chain decimals) or `amount` (raw base units) — if you pass both they must agree, which is ' +
+        'the cheapest way to catch a 1-vs-1000000 error. Nothing is signed until `confirm: true`: ' +
+        'call once without it (or with dryRun:true) to get the resolved amount, destination and fee, ' +
+        'SHOW THOSE TO THE USER, and only then re-call with confirm:true. If the result has ' +
+        'outcomeUnknown:true the transaction may already be on chain — do NOT retry; check the ' +
+        'reported nonce first.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          token: { type: 'string', description: '"ZTX" for the native coin, a registered symbol (e.g. "JMYR"), or a ZTP20 contract address.' },
+          to: { type: 'string', description: 'Destination Zetrix address.' },
+          amountHuman: { type: 'string', description: 'Human-readable amount, e.g. "1.5". Converted using the token\'s on-chain decimals. Preferred over `amount`.' },
+          amount: { type: 'string', description: 'Amount in the token\'s raw base units, e.g. "1500000" for 1.5 of a 6-decimal token.' },
+          confirm: { type: 'boolean', description: 'Must be true to actually send. Never infer this — the user must have seen the amount and destination.' },
+          dryRun: { type: 'boolean', description: 'Resolve and price the transfer, then stop without signing or sending.' },
+        },
+        required: ['token', 'to'],
+      },
+    },
+    {
       name: 'query_contract',
       description:
         'Read-only query against a Zetrix contract or account — call an arbitrary contract method ' +
@@ -350,7 +379,25 @@ export function buildToolList() {
         'it is two states, only one of which is confirmed, so read `message` there too rather than ' +
         'assuming success from the shape alone. ' +
         'If the user did NOT ask for a "verified" credential specifically, they most likely want the ' +
-        'self-declared, non-verified Basic AI Birthcert instead — use subscribe_and_issue for that.',
+        'self-declared, non-verified Basic AI Birthcert instead — use subscribe_and_issue for that. ' +
+        'BEFORE this pays or starts a session, it checks whether this holder already has a Verified ' +
+        'AI Birthcert — found in the local cache, or (if the cache has not seen it yet) resolved from ' +
+        'a previously-issued session. If one exists and is STILL VALID, nothing is paid and no session ' +
+        'is started — you get back { existingVerifiedVc: { vcId, validUntil }, message } instead. Show ' +
+        'that existing credential to the user and ask whether they actually want to replace it; only ' +
+        'call this tool again, with confirmReplaceExistingVc set to exactly existingVerifiedVc.vcId, if ' +
+        'they explicitly say yes. Never pass confirmReplaceExistingVc on your own judgement. If the ' +
+        'existing VC has already EXPIRED, this proceeds automatically — no confirmation needed — and ' +
+        'the result carries replacedExpiredVc: { vcId, validUntil } naming the one it replaced. That ' +
+        'field can appear on a settled session, on a payment still settling, or on an EARLIER call\'s ' +
+        'still-pending session simply being returned unchanged — so treat it only as "the holder\'s old ' +
+        'VC had expired", never as proof that THIS call itself just spent money; read the rest of the ' +
+        'result (an error, a settled session, or settlementPending) to know what this call actually did. ' +
+        'It can also return { error } specifically because an already-issued VC exists but could not be ' +
+        'confirmed as valid or expired (a resolution problem, not a payment problem) — nothing is paid ' +
+        'on that path either; relay `error` as given, since it names the concrete next step (retry ' +
+        'check_ai_birthcert_verification, or as a last resort clear_stuck_payment_receipt with the ' +
+        'user\'s explicit agreement).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -407,6 +454,17 @@ export function buildToolList() {
               'REFUSES this parameter outright — nothing is discarded and nothing is paid — so do not ' +
               'offer the user this option for a receipt that is not stuck yet. A bare "retry" or "yes" ' +
               'from the user is not agreement to pay again.',
+          },
+          confirmReplaceExistingVc: {
+            type: 'string',
+            description:
+              'Only for replacing a Verified AI Birthcert VC that is STILL VALID (not expired). Pass ' +
+              'the exact vcId from a prior existingVerifiedVc response — never a guess, never made up. ' +
+              'Only set this after the user has SEEN that existing credential and explicitly asked to ' +
+              'replace it; omit it otherwise. A mismatched or unconfirmed value is ignored: nothing is ' +
+              'paid and no session is started, and you get the same existingVerifiedVc block again. ' +
+              'Not needed at all when the existing VC has already expired — that case replaces itself ' +
+              'automatically.',
           },
         },
         required: ['agentName'],
@@ -465,7 +523,20 @@ export function buildToolList() {
         'the credential — myid returns vcId ONLY when status is "issued", never otherwise. On ' +
         '{ status: "issued" }, the wallet also fetches the credential from MBI, verifies it, and caches ' +
         'it locally, returning it as `vc` — it is then also visible via wallet_status and usable by ' +
-        'prove_identity without any further call. If `cacheError` is present instead of `vc`, the ' +
+        'prove_identity without any further call. ' +
+        'When `vc` is present, show the user the FULL credential, not a partial summary — render a ' +
+        '"Credential Details" table covering vcId (label it "VC ID"), validUntil ("Valid Until"), and ' +
+        'EVERY claim under `vc.credentialSubject` (whatever nested object holds them) — do not cherry-pick ' +
+        'a few and drop the rest. Use these labels for the claim keys you recognise: agentName -> "Agent ' +
+        'Name", ownerName -> "Owner Name", ownerId -> "Owner ID", dob -> "Date of Birth", ownerVerified -> ' +
+        '"Owner Verified", evidenceMethod -> "Evidence Method", evidenceProvider -> "Evidence Provider", ' +
+        'evidenceDate -> "Evidence Date"; for any other key present, title-case it rather than omitting it ' +
+        '— the template can carry optional claims (agentPurpose, ownerType, countryOfOrigin, ' +
+        'additionalDetails, etc.) that were not enumerated here. If `vcPassImagePaths` is also present, ' +
+        'the credential\'s own pass-design image(s) came back attached to this result — tell the user ' +
+        'their credential\'s official pass design is shown below and display the image(s); do not ' +
+        'silently drop them from your summary just because they are not text. ' +
+        'If `cacheError` is present instead of `vc`, the ' +
         'credential WAS issued successfully but could not be fetched/verified/cached yet (e.g. a ' +
         'transient MBI error) — this is NOT the same as issuance failing, so do not retry ' +
         'request_ai_birthcert_verification; call check_ai_birthcert_verification again instead. Returns ' +
@@ -600,11 +671,85 @@ type Payer = (accept: PayRequirement) => Promise<string>
  * `makePay` is injected rather than called directly so this is testable without the live
  * dependencies (contract queries, Wallet BE) `makePay` itself closes over in `main()`.
  *
- * See R2-M01: an earlier version of this (`resolvePaymentCapWiring`) pinned which map was which,
+ * An earlier version of this (`resolvePaymentCapWiring`) pinned which map was which,
  * but `main()` still separately wrote `makePay(payCaps)` / `makePay(payForCredentialCaps)` at the
  * call site — an unguarded pairing a swap there could still flip with every test green. Folding
  * the `makePay(...)` calls in here removes that call site entirely.
  */
+/**
+ * The wallet's address validator. Two identical defaults exist — this one and
+ * buildTransferSafetyWiring's — and both are pinned by tests, so they cannot drift silently; they
+ * are not, however, "one place".
+ *
+ * `checkAddress` is a DEFAULT rather than something a call site passes, so the default itself is
+ * what a test exercises and what ships. That closes the mutation class at the CONSUMER: replacing
+ * `isValidAddress` inside `mcp-tools.ts` now fails a test.
+ *
+ * WHAT IT DOES NOT CLOSE, and an earlier version of this comment wrongly claimed it did: the
+ * `...buildAddressValidator()` spread in `main()` is itself an expression, and DELETING it still
+ * passes the suite — `deps.isValidAddress` becomes undefined and every ADDRESS check degrades to
+ * `notChecked`. `main()`'s dep objects are untested as a whole, a gap shared with
+ * buildTransferSafetyWiring's own call site rather than one this introduced. Closing it means
+ * extracting main()'s ToolDeps construction into something a test can call. Tracked, not done here.
+ * Do not read "there is no expression to mutate" into this: there is one, a level up.
+ *
+ * policy_preflight's ADDRESS gate was wired as
+ * `isValidAddress: deps.transferDeps?.isValidAddress` at the mcp-tools call site. Replacing that
+ * with `undefined` or `() => true` silently disabled the whole gate and left 1204/1204 green,
+ * because every test supplied its own validator locally. That is the class the preceding commit
+ * existed to close, so this extends the pattern rather than adding a seam beside it.
+ */
+export function buildAddressValidator(
+  checkAddress: (address: string) => boolean = (address) => keypair.checkAddress(address),
+): { isValidAddress: (address: string) => boolean } {
+  return { isValidAddress: (address) => checkAddress(address) }
+}
+
+/**
+ * The two safety-critical halves of the TRANSFER wiring: the address validator transfer_token
+ * uses, and the submit wrapper that flags a node rejection.
+ *
+ * Its original docblock was orphaned when buildAddressValidator was inserted between the two —
+ * this is a replacement, not the original text.
+ *
+ * Note this validator is SEPARATE from buildAddressValidator above. Same body, different object:
+ * this one reaches transfer_token through TransferDeps, that one reaches policy_preflight through
+ * ToolDeps. Neither is shared with the other, and comments claiming otherwise were a real
+ * finding.
+ *
+ * checkAddress is a DEFAULT rather than a call-site argument, so the default is what a test
+ * exercises and what ships.
+ */
+export function buildTransferSafetyWiring(
+  submitTransaction: (args: {
+    blob: string
+    signature: Array<{ signData: string; publicKey: string }>
+  }) => Promise<{ errorCode?: number; errorDesc?: string; result?: { hash?: string } }>,
+  checkAddress: (address: string) => boolean = (address) => keypair.checkAddress(address),
+): Pick<TransferDeps, 'isValidAddress' | 'submit'> {
+  return {
+    // The SDK's own checksum validator — the same one zetrix-sdk-nodejs uses for its
+    // `address: true` schema fields. A shape regex accepts a one-character Base58 typo; this does
+    // not.
+    isValidAddress: (address) => checkAddress(address),
+    submit: async ({ blob, signBlob, publicKey }) => {
+      const res = await submitTransaction({ blob, signature: [{ signData: signBlob, publicKey }] })
+      if (res.errorCode !== 0) {
+        // REJECTED, not indeterminate: the node answered and refused. Flagged on a FIELD so the
+        // orchestrator can tell it apart from a lost response without reading the message —
+        // prose matching is a mistake this design deliberately unpicked.
+        throw Object.assign(
+          new Error(`submit rejected with errorCode ${res.errorCode}${res.errorDesc ? `: ${res.errorDesc}` : ''}`),
+          { submitRejected: true as const, errorCode: res.errorCode },
+        )
+      }
+      const hash = res.result?.hash
+      if (!hash) throw new Error('submit returned no transaction hash')
+      return { hash }
+    },
+  }
+}
+
 export function buildPayers(
   config: { maxPaymentAmount: Record<string, string>; credentialIssuanceCaps: Record<string, string> },
   makePay: (caps: Record<string, string>) => Payer,
@@ -619,7 +764,7 @@ export function buildPayers(
 /**
  * The config-derived half of the Verified AI Birthcert deps, extracted so it is observable.
  *
- * R2-L03: written inline in `main()`, `settlementWaitBudgetMs: config.settlementWaitBudgetMs` could
+ * Written inline in `main()`, `settlementWaitBudgetMs: config.settlementWaitBudgetMs` could
  * be deleted with the whole suite still green — `SETTLEMENT_WAIT_BUDGET_MS` would parse, validate
  * and warn exactly as tested, then never reach the retry loop. Same class as the cap wiring in
  * `buildPayers`, and the same remedy: the mapping lives in one place a test can call.
@@ -817,7 +962,7 @@ async function main(): Promise<void> {
   // refuse-all on mainnet; credential issuance pays a known issuer for a known credential, so it
   // may carry the credential-fee allowance there. An explicit MAX_PAYMENT_AMOUNT collapses the two
   // back into one identical ceiling (see config.ts). Which map goes to which closure/consumer is
-  // decided entirely inside buildPayers below — see R2-M01 for why that pairing must not be
+  // decided entirely inside buildPayers below, which is why that pairing must not be
   // written out again at this call site.
   const makePay = (caps: Record<string, string>) => async (accept: PayRequirement): Promise<string> => {
     const rawAsset = String(accept.asset ?? '')
@@ -897,9 +1042,9 @@ async function main(): Promise<void> {
 
   // MBI's pass-design PNG(s) for an issued VC (extraData.vcPassBase64 from /v1/vc/ext/download).
   // Shared across both the Verified AI Birthcert flow and basic subscribe_and_issue — the download
-  // is one-shot per vcId (SEC-11/APP-C01, see ssivc-download-quarantine-store.ts), so both paths
+  // is one-shot per vcId (see ssivc-download-quarantine-store.ts), so both paths
   // must guard against re-downloading the same vcId through the same quarantine store.
-  // R2-M01: a DIRECTORY, not a single file — one quarantine file per vcId, so a later download can
+  // A DIRECTORY, not a single file — one quarantine file per vcId, so a later download can
   // never overwrite an earlier, still-needed preserved credential.
   const downloadQuarantine = createFsDownloadQuarantineStore(join(config.stateDir, 'ssivc-download-quarantine'))
   const passImagesDir = join(config.stateDir, 'vc-pass-images')
@@ -913,7 +1058,7 @@ async function main(): Promise<void> {
   // gated by x402 instead (see docs/verified-birthcert-vc/SPEC.md §5.0), so payment readiness/cap
   // checks (this same `pay` closure) are what gate spending. Wiring itself is gated on
   // `config.ssivcBaseUrl` being set: it's undefined on mainnet unless explicitly overridden
-  // (APP-M04 — the mainnet host was never actually confirmed reachable), so the feature reports
+  // (the mainnet host was never actually confirmed reachable), so the feature reports
   // itself as not configured there rather than being wired against an unverified endpoint.
   const verifyAiBirthcert = config.ssivcBaseUrl
     ? (() => {
@@ -933,7 +1078,7 @@ async function main(): Promise<void> {
           cache: vcCache,
           quarantine: downloadQuarantine,
           // gasPreference, maxSettlementAttempts, settlementWaitBudgetMs and verifiedTemplateId —
-          // see buildSettlementWiring (R2-L03).
+          // see buildSettlementWiring.
           ...buildSettlementWiring(config),
           formatAssetAmount,
           passImagesDir,
@@ -1002,6 +1147,45 @@ async function main(): Promise<void> {
       { signer, vc: new MbiVpAdapter(mbi, walletBeSignerFn, messageSigner, zetrixAddress, resolveIssuerKeys, present), submitAuth },
     )
 
+  // transfer_token deps. Blob construction is BlobBuilder — the same tested code x402 payments
+  // use — and signing is the same Wallet BE HSM path; the only genuinely new primitive is
+  // submission, since nothing else in this server ever broadcasts a transaction itself.
+  const transferDeps: TransferDeps = {
+    sourceAddress: zetrixAddress,
+    // isValidAddress and submit BOTH come from buildTransferSafetyWiring, which is where they are
+    // tested. Writing either here again recreates the same unguarded call site problem.
+    ...buildTransferSafetyWiring((args) => sdk.transaction.submit(args)),
+    resolveTokenAddress: (symbol) => resolveTokenAddress(symbol, config.network),
+    fetchDecimals: async (contractAddress) => {
+      const info = await fetchTokenInfo(contractAddress, contractQuery)
+      // `decimals` is 0 both for a genuine 0-decimal token and for an unreadable field, so the
+      // flag is what makes the orchestrator's refusal possible at all.
+      return info && info.decimalsReadable ? info.decimals : null
+    },
+    queryBalance: (token) => runTokenBalanceQuery(tokenBalanceDeps, token),
+    fetchNativeBalance,
+    fetchNonce: (address) => PaymentEngine.fetchNonce(address, node),
+    buildOperation: (asset, payTo, amount, clientAddress) => BlobBuilder.buildOperation(asset, payTo, amount, clientAddress),
+    estimateFee: (p) => PaymentEngine.estimateFee(p, node),
+    buildBlob: (p) => BlobBuilder.build(p),
+    sign: walletBeSignerFn,
+    /**
+     * ADVISORY ONLY — this is not the control that governs a transfer.
+     *
+     * Per the 2026-09-22 scope decision, transfer is governed by the POLICY ENGINE, and Wallet BE
+     * is the enforcement point: it consults the policy decision service and refuses to sign — see
+     * `docs/policy-engine/DESIGN.md` §7, which already routes transfer enforcement there. That
+     * refusal is authoritative and this check cannot replace it, because a client-side ceiling is
+     * only as honest as the client.
+     *
+     * It is kept, and wired to the general MAX_PAYMENT_AMOUNT bucket rather than the credential
+     * one, for two reasons. It fails fast, so an obviously-doomed transfer never reaches the
+     * signer. And Wallet BE does not enforce policy yet — until it does, removing this would leave
+     * transfers bounded by nothing at all.
+     */
+    assertWithinCap: (asset, amount) => assertWithinPaymentCap({ asset, maxAmountRequired: amount }, config.maxPaymentAmount),
+  }
+
   const deps: ToolDeps = {
     config: {
       holderDid,
@@ -1026,6 +1210,10 @@ async function main(): Promise<void> {
       passImagesDir,
     },
     // The RAW seam, for the policy client, which reads the query_rets envelope itself.
+    transferDeps,
+    // policy_preflight's validator. transfer_token has its OWN, from buildTransferSafetyWiring
+    // above — two identical-bodied defaults, not one shared instance.
+    ...buildAddressValidator(),
     chainQuery: contractQuery,
     queryContract: (input: ContractQueryInput): Promise<ContractQueryResult> => runContractQuery(input, contractQuery),
     queryTokenBalance,

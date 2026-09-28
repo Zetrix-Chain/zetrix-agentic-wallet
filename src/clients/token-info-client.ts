@@ -11,7 +11,20 @@
 
 export interface TokenInfo {
   symbol: string
+  /**
+   * Decimals as the contract reported them, or `0` when the field was absent or unreadable.
+   * *Check {@link TokenInfo.decimalsReadable} before doing arithmetic with this.*
+   */
   decimals: number
+  /**
+   * FALSE when `decimals` is the 0 fallback rather than a value the contract actually reported.
+   *
+   * A display path can live with the fallback — it renders a number either way. A path that
+   * CONVERTS an amount cannot: unreadable-as-0 is indistinguishable from a genuine 0-decimal token,
+   * and "send 10 JMYR" then means 10 base units, or 0.00001 JMYR, while the caller is told 10 was
+   * sent. transfer_token refuses on `false` rather than convert against a guess.
+   */
+  decimalsReadable: boolean
 }
 
 /** The read-only contract query seam (a `sdk.contract.call`-shaped call). Injectable for tests. */
@@ -48,7 +61,10 @@ export async function fetchTokenInfo(contractAddress: string, query: ContractQue
     const info = (parsed.contractInfo ?? parsed) as Record<string, unknown>
     if (typeof info.symbol !== 'string' || info.symbol === '') return null
     const decimals = Number(info.decimals)
-    return { symbol: info.symbol, decimals: Number.isFinite(decimals) ? decimals : 0 }
+    // A non-integer or negative decimals is as unusable as a missing one — `toHumanAmount` with
+    // -1 happily returns a wrong answer rather than failing, so it is rejected here, at the read.
+    const readable = Number.isInteger(decimals) && decimals >= 0
+    return { symbol: info.symbol, decimals: readable ? decimals : 0, decimalsReadable: readable }
   } catch {
     return null
   }
@@ -77,10 +93,13 @@ const ZTX_DECIMALS = 6
  * failed contract lookup, so a payment amount is never lost even when it can't be humanized.
  */
 export async function resolveAssetInfo(asset: string, query: ContractQuery): Promise<TokenInfo> {
-  if (asset === 'ZTX') return { symbol: 'ZTX', decimals: ZTX_DECIMALS }
-  if (asset === '') return { symbol: '', decimals: 0 }
+  // Native decimals are a constant, not a contract read, so they are genuinely known.
+  if (asset === 'ZTX') return { symbol: 'ZTX', decimals: ZTX_DECIMALS, decimalsReadable: true }
+  // These two ARE the 0 fallback this display path tolerates — flagged so that a caller which
+  // CONVERTS an amount cannot mistake them for a genuine 0-decimal token.
+  if (asset === '') return { symbol: '', decimals: 0, decimalsReadable: false }
   const info = await fetchTokenInfo(asset, query)
-  return info ?? { symbol: asset, decimals: 0 }
+  return info ?? { symbol: asset, decimals: 0, decimalsReadable: false }
 }
 
 /**

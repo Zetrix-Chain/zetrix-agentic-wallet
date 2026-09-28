@@ -73,6 +73,22 @@ export function windowRuleFor(attributeName: string): WindowRule | undefined {
 /**
  * Always INFORMATIONAL, never enforced. Presenting either as a control is false assurance, so
  * preflight says so in words whenever one appears in a draft.
+ *
+ * BOTH CONFIRMED REAL in the v1 vocabulary — `AttributeName` in the ms-zetrix policy registry
+ * (`developv2`, read 2026-09-25) declares `SETTLEMENT_CHANNEL` and `APPROVAL_POLICY`. That read is
+ * UNVERIFIED from this repo: ms-zetrix is not vendored here, so the citation is the whole of the
+ * evidence.
+ *
+ * Neither appears in `native-v1` or `ztp20-v1`, and being honest about why: nothing explains it.
+ * `approvalPolicy` is ZTP20_ONLY so `native-v1` could never carry it, but that says nothing about
+ * `ztp20-v1`, and `settlementChannel` applies to BOTH scopes and is in neither. A template declares
+ * a SUBSET of the vocabulary and needs no reason to omit a name, so the likeliest answer is simply
+ * that these two were not wanted in the first two templates. Keeping this logic rather than deleting
+ * it on the evidence of two templates was still the right call.
+ *
+ * What makes them informational is negative evidence, so it is worth stating: `AttributeEvaluator`
+ * has no implementation for either — there is no SettlementChannelEvaluator and no
+ * ApprovalPolicyEvaluator — so nothing in the decision path can refuse on them.
  */
 export const INFORMATIONAL_ATTRIBUTES: ReadonlySet<string> = new Set(['approvalPolicy', 'settlementChannel'])
 
@@ -87,19 +103,80 @@ export const QUALIFIER_ATTRIBUTES: ReadonlySet<string> = new Set([
 ])
 
 /**
- * An empty one of these denies everything: `[].contains(recipient)` is always false.
- *
- * BOTH naming conventions are matched, deliberately. The first cut required an underscore
- * (`RECIPIENT_LIST`), but every attribute name this repo actually handles is camelCase
- * (`cumulativeMax`, `assetScope`), so a camelCase `recipientAllowList` holding `[]` sailed past the
- * deny-everything blocker AND still counted as enforceable, so the qualifiers-only check did not
- * catch it either (APP-M03).
- *
- * The real on-chain casing is NOT yet confirmed — no template is registered on testnet, so there is
- * nothing to read it from. Matching both is the fail-safe reading: the cost of a false positive is
- * one explainable blocker on an empty list, and the cost of a false negative is a policy that
- * silently denies everything.
+ * The attribute TYPES the deployed Template contract accepts, as its own `VALID_ATTRIBUTE_TYPES`
+ * declares them. Read from the contract payload 2026-09-25, not from a field guide.
  */
-export function isListAttribute(attributeName: string): boolean {
-  return /_list$/i.test(attributeName) || /[a-z0-9]List$/.test(attributeName)
+export const ATTRIBUTE_TYPES = {
+  ADDRESS: 'ADDRESS',
+  STRING: 'STRING',
+  NUMBER: 'NUMBER',
+  ADDRESS_LIST: 'ADDRESS_LIST',
+  STRING_LIST: 'STRING_LIST',
+  NUMBER_LIST: 'NUMBER_LIST',
+} as const
+
+/**
+ * Which way a list POINTS. The type says a value is a list; it says nothing about whether listing
+ * something permits it or blocks it, and those are opposite meanings.
+ *
+ * SOURCE: `policyregistry/strategy/impl/*Evaluator.java` in the ms-zetrix policy registry, read
+ * from `developv2` on 2026-09-25. Each evaluator IS the polarity, in one line:
+ *
+ * ```java
+ * RecipientAllowlistEvaluator  allowlist.contains(recipient) -> allow, else RECIPIENT_NOT_ALLOWLISTED
+ * RecipientDenylistEvaluator   denylist.contains(recipient)  -> RECIPIENT_DENYLISTED
+ * PayToAllowlistEvaluator      allowlist.contains(payTo)     -> allow, else PAY_TO_NOT_ALLOWLISTED
+ * AllowedMethodsEvaluator      allowed.contains(method)      -> allow, else METHOD_NOT_ALLOWED
+ * ```
+ *
+ * This replaces an earlier inference. The four rows were originally derived from the English in the
+ * attribute names, which is exactly the kind of guess that reading the real chain data exists to stamp
+ * out — the names happened to be honest, and that is luck rather than method. The evaluators are the
+ * authority, so they are cited.
+ *
+ * It is NOT obtainable from chain: `getTemplate` returns only `{attributeName, attributeType}` and
+ * `templateAttributeIds`, with no `role`, `polarity` or `emptyMeans` field anywhere in the payload.
+ *
+ * TRIPWIRE, NOT A GUARANTEE — the same honesty {@link WINDOW_RULES} carries. There is no shared CI
+ * with ms-zetrix, so nothing here fails automatically when an evaluator changes. Changing polarity
+ * on this side means deliberately editing a test that names those files, which raises the chance
+ * someone notices. It does not ensure it.
+ *
+ * An attribute NOT in this map still gets NO meaning claim at all. Telling a user that listing an
+ * address BLOCKS it when it in fact ALLOWS it is worse than telling them nothing.
+ */
+export type ListPolarity = 'allow' | 'deny'
+
+export const LIST_POLARITY: ReadonlyMap<string, ListPolarity> = new Map<string, ListPolarity>([
+  ['recipientAllowlist', 'allow'],
+  ['recipientDenylist', 'deny'],
+  // Neither template declares payToAllowlist yet, but it is in the v1 vocabulary and live in the
+  // decision path — `POST /policy/decisions` requires `payTo` when a policy carries one. Scoping
+  // this table to the two shipped templates would have left it silently uninterpreted.
+  ['payToAllowlist', 'allow'],
+  ['allowedMethods', 'allow'],
+])
+
+export function listPolarity(attributeName: string): ListPolarity | undefined {
+  return LIST_POLARITY.get(attributeName)
+}
+
+/**
+ * Is this a LIST attribute?
+ *
+ * Keyed on the declared TYPE, never on the attribute name. The first cut guessed at naming
+ * conventions — `_LIST`, then camelCase `List` — and the real templates use neither:
+ * `recipientAllowlist`, `recipientDenylist` and `allowedMethods` all matched nothing, so the
+ * empty-list blocker never fired on a single real attribute. List-ness was always a
+ * property of the type, and the type is unambiguous.
+ *
+ * What an empty one MEANS depends on which way the list points, which the type cannot tell you —
+ * see {@link LIST_POLARITY}. An empty allow-list denies everything; an empty deny-list denies
+ * nothing. An earlier version of this comment asserted the former for every list, which is the
+ * inversion this fix was about.
+ */
+export function isListType(attributeType: string): boolean {
+  return attributeType === ATTRIBUTE_TYPES.ADDRESS_LIST
+    || attributeType === ATTRIBUTE_TYPES.STRING_LIST
+    || attributeType === ATTRIBUTE_TYPES.NUMBER_LIST
 }

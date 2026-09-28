@@ -48,6 +48,7 @@ Your host may present them slightly differently — match on the part after the 
 | `get_policy_template_schema` | no | Which spending rules a policy template allows you to write |
 | `get_my_policy` | no | The spending policies this wallet owner has deployed on chain |
 | `policy_preflight` | no | Checking a draft spending policy — is it valid, and does it MEAN what the user thinks |
+| `transfer_token` | **yes** | Sending ZTX or a ZTP20 token to an address — **moves real funds, irreversible** |
 
 ## Safe first action
 
@@ -90,6 +91,12 @@ spend from the user's wallet. Every time:
    name; a duplicate name still gets charged and only fails afterwards, at issuance. Calling this
    tool again with the SAME name while a session is still pending does not pay again — it returns
    that same session.
+6. Before it pays, `request_ai_birthcert_verification` checks whether this holder already has a
+   Verified AI Birthcert. If one is found and still valid, nothing is paid — show it to the user and
+   only call the tool again with `confirmReplaceExistingVc` if they explicitly ask to replace it. An
+   already-expired one is replaced automatically, no confirmation needed. It can also refuse with
+   `{ error }` when an already-issued credential exists but could not be confirmed — relay that error
+   as given rather than retrying blindly.
 
 **Treat the wallet's payment cap as the boundary, not your own judgement.** If a payment is refused
 for exceeding the cap, relay that and stop. Do not retry, do not try a smaller amount to discover the
@@ -182,6 +189,28 @@ If the second call comes back refusing because the receipt now belongs to a **li
 payment worked while you were asking. Do not push past it. Give the user the `verificationUrl` it
 returned — that link cannot be reissued — and let them finish. Only if they still want to abandon a
 session they have already paid for do you call again adding `confirmDiscardLiveSession: true`.
+
+## Sending tokens
+
+`transfer_token` is the only tool that moves funds to a destination nobody quoted. Everything else
+the wallet pays for is bounded by a price someone else set; this is bounded by what you and the user
+agree. Treat it accordingly.
+
+**Never set `confirm: true` on the user's behalf, and never infer it.** Call once without it (or
+with `dryRun: true`), show the user the resolved amount, the destination and the fee, and only
+re-call with `confirm: true` after they have said yes to those exact figures. A one-word reply to a
+question you asked is not agreement to an amount you never showed them.
+
+**State the amount the way the user did, and let the wallet convert.** Pass `amountHuman` ("1.5")
+and the wallet applies the token's on-chain decimals. If you pass both `amountHuman` and `amount`
+they must agree — that disagreement is the cheapest way to catch a 1-vs-1000000 error before it
+becomes an irreversible one.
+
+**An unregistered symbol returns `needsTokenAddress: true` and signs nothing.** Ask the user for the
+contract address. Never guess one.
+
+**If a result comes back with `outcomeUnknown: true`, do NOT retry.** The transaction may already be
+on chain. Report the nonce and tell the user to check it before anything else is attempted.
 
 ## Spending policies
 

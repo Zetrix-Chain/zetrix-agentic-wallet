@@ -2,7 +2,7 @@
  * DownloadQuarantineStore — persists MBI's `/v1/vc/ext/download` raw response BEFORE any
  * validation (subject match, `validUntil` presence, vcId lookup).
  *
- * SEC-11 / APP-C01: the download is one-shot — a second live call for the same `vcId` returns 404,
+ * The download is one-shot — a second live call for the same `vcId` returns 404,
  * not the credential again (see docs/verified-birthcert-vc/SPEC.md §5.4 REQ-25). A validation
  * rejection, a `cache.set` failure, or a process crash between download and cache must never
  * destroy a credential that was already paid for and fetched. Writing the raw response here,
@@ -10,7 +10,7 @@
  * this local copy instead of re-hitting MBI — and a human can recover the raw entries from disk even
  * if every automated path rejects them.
  *
- * R2-M01: keyed by `vcId`, one file per vcId (mirroring `vc-cache.ts`'s per-templateId files), NOT a
+ * Keyed by `vcId`, one file per vcId (mirroring `vc-cache.ts`'s per-templateId files), NOT a
  * single shared slot. With a single slot, quarantining agent 2's download would silently destroy
  * agent 1's still-needed preserved credential. Entries are never expired or cleaned up — a
  * quarantined credential is paid-for and irrecoverable once deleted, so files living forever is the
@@ -38,7 +38,7 @@ export interface DownloadQuarantineStore {
   /** The concrete on-disk path a given vcId's raw response lives at — surfaced in operator-facing error messages. */
   filePathFor(vcId: string): string
   /**
-   * Serializes callers racing on the same vcId's check-then-fetch (APP-L03): both the verified and
+   * Serializes callers racing on the same vcId's check-then-fetch: both the verified and
    * basic-birthcert paths do `get` then, on a miss, download-and-`set` — two concurrent calls for
    * the same vcId can both miss and both hit MBI's one-shot `/v1/vc/ext/download`, and one gets a
    * 404. `withLock` runs `fn` exclusively per vcId within this process; a caller still does its own

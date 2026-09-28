@@ -14,7 +14,7 @@ describe('fetchTokenInfo', () => {
       ok(JSON.stringify({ contractInfo: { name: 'MyEG Ringgit', symbol: 'JMYR', decimals: '6', protocol: 'ztp20' } })),
     )
     const info = await fetchTokenInfo(CONTRACT, query)
-    expect(info).toEqual({ symbol: 'JMYR', decimals: 6 })
+    expect(info).toEqual({ symbol: 'JMYR', decimals: 6, decimalsReadable: true })
     expect(query).toHaveBeenCalledWith({
       contractAddress: CONTRACT,
       input: JSON.stringify({ method: 'contractInfo', params: {} }),
@@ -77,23 +77,23 @@ describe('resolveAssetSymbol', () => {
 describe('resolveAssetInfo', () => {
   it('returns ZTX with its 6 decimals, no contract call', async () => {
     const query = vi.fn()
-    expect(await resolveAssetInfo('ZTX', query)).toEqual({ symbol: 'ZTX', decimals: 6 })
+    expect(await resolveAssetInfo('ZTX', query)).toEqual({ symbol: 'ZTX', decimals: 6, decimalsReadable: true })
     expect(query).not.toHaveBeenCalled()
   })
 
   it('resolves a ZTP20 contract to its real symbol and decimals', async () => {
     const query = vi.fn().mockResolvedValue(ok(JSON.stringify({ contractInfo: { symbol: 'JMYR', decimals: '6' } })))
-    expect(await resolveAssetInfo(CONTRACT, query)).toEqual({ symbol: 'JMYR', decimals: 6 })
+    expect(await resolveAssetInfo(CONTRACT, query)).toEqual({ symbol: 'JMYR', decimals: 6, decimalsReadable: true })
   })
 
   it('falls back to the raw address with decimals 0 when the lookup fails', async () => {
     const query = vi.fn().mockResolvedValue({ errorCode: 151, result: {} })
-    expect(await resolveAssetInfo(CONTRACT, query)).toEqual({ symbol: CONTRACT, decimals: 0 })
+    expect(await resolveAssetInfo(CONTRACT, query)).toEqual({ symbol: CONTRACT, decimals: 0, decimalsReadable: false })
   })
 
   it('returns empty symbol and decimals 0 for an empty asset, without calling out', async () => {
     const query = vi.fn()
-    expect(await resolveAssetInfo('', query)).toEqual({ symbol: '', decimals: 0 })
+    expect(await resolveAssetInfo('', query)).toEqual({ symbol: '', decimals: 0, decimalsReadable: false })
     expect(query).not.toHaveBeenCalled()
   })
 })

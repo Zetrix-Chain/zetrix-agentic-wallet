@@ -124,8 +124,8 @@ const PUBLISHER = 'ZTX3YzAyKBxjbSaMPeaPKEBpV93wjzN4SjTaN'
 const TEMPLATE_BODY = {
   found: true,
   attributes: [
-    { attributeName: 'x402', attributeType: 'uint' },
-    { attributeName: 'maxTransactionCount', attributeType: 'uint' },
+    { attributeName: 'cumulativeMax', attributeType: 'NUMBER' },
+    { attributeName: 'maxTransactionCount', attributeType: 'NUMBER' },
   ],
   templateAttributeIds: ['a1', 'a2'],
 }
@@ -135,15 +135,15 @@ describe('template reads', () => {
     // Two hops: the Template contract answers first, the Registry last. The bodies DIFFER,
     // so an implementation reading [0] fails — identical bodies would pass either way and pin
     // nothing at all (APP-L03).
-    const inner = JSON.stringify({ ...TEMPLATE_BODY, attributes: [{ attributeName: 'innerOnly', attributeType: 'uint' }] })
+    const inner = JSON.stringify({ ...TEMPLATE_BODY, attributes: [{ attributeName: 'innerOnly', attributeType: 'NUMBER' }] })
     const query = vi.fn().mockResolvedValue(rets(inner, JSON.stringify(TEMPLATE_BODY)))
-    const result = await getTemplateViaRegistry(PUBLISHER, 'x402', REGISTRY, query)
+    const result = await getTemplateViaRegistry(PUBLISHER, 'cumulativeMax', REGISTRY, query)
     expect(result).toMatchObject({ found: true })
-    expect([...declaredVocabulary((result as Extract<typeof result, { found: true }>).value).keys()]).toEqual(['x402', 'maxTransactionCount'])
+    expect([...declaredVocabulary((result as Extract<typeof result, { found: true }>).value).keys()]).toEqual(['cumulativeMax', 'maxTransactionCount'])
     expect(query.mock.calls[0][0].contractAddress).toBe(REGISTRY)
     expect(JSON.parse(query.mock.calls[0][0].input)).toEqual({
       method: 'getTemplate',
-      params: { publisher: PUBLISHER, policyKey: 'x402' },
+      params: { publisher: PUBLISHER, policyKey: 'cumulativeMax' },
     })
   })
 
@@ -156,7 +156,7 @@ describe('template reads', () => {
 
   it('keeps templateAttributeIds, which the id-only read omits', async () => {
     const query = vi.fn().mockResolvedValue(rets(JSON.stringify(TEMPLATE_BODY)))
-    const result = await getTemplateViaRegistry(PUBLISHER, 'x402', REGISTRY, query)
+    const result = await getTemplateViaRegistry(PUBLISHER, 'cumulativeMax', REGISTRY, query)
     expect((result as { value: { templateAttributeIds?: string[] } }).value.templateAttributeIds).toEqual(['a1', 'a2'])
   })
 
@@ -174,15 +174,15 @@ describe('template reads', () => {
     // misconfiguration, and telling the user their template does not exist would send them
     // chasing the wrong problem entirely.
     const query = vi.fn().mockResolvedValue({ errorCode: 151 })
-    const result = await getTemplateViaRegistry(PUBLISHER, 'x402', REGISTRY, query)
+    const result = await getTemplateViaRegistry(PUBLISHER, 'cumulativeMax', REGISTRY, query)
     expect(result).toMatchObject({ error: 'query_failed' })
     expect('found' in result).toBe(false)
   })
 
   it('extracts attributeName -> attributeType as the declared vocabulary', () => {
     const vocab = declaredVocabulary(TEMPLATE_BODY as never)
-    expect([...vocab.keys()]).toEqual(['x402', 'maxTransactionCount'])
-    expect(vocab.get('x402')).toBe('uint')
+    expect([...vocab.keys()]).toEqual(['cumulativeMax', 'maxTransactionCount'])
+    expect(vocab.get('cumulativeMax')).toBe('NUMBER')
   })
 
   it('returns an empty vocabulary for a template that declares nothing, rather than throwing', () => {
@@ -192,33 +192,39 @@ describe('template reads', () => {
 
   it('skips malformed attribute entries instead of admitting a nameless attribute', () => {
     const vocab = declaredVocabulary({
-      attributes: [{ attributeName: '' }, { attributeType: 'uint' }, { attributeName: 'x402', attributeType: 'uint' }],
+      attributes: [{ attributeName: '' }, { attributeType: 'NUMBER' }, { attributeName: 'cumulativeMax', attributeType: 'NUMBER' }],
     } as never)
-    expect([...vocab.keys()]).toEqual(['x402'])
+    expect([...vocab.keys()]).toEqual(['cumulativeMax'])
   })
 })
 
 describe('readOwnerPolicies', () => {
+  // The REAL getPolicy envelope: the policy is NESTED, with a policyAttributeIds sibling.
+  // Modelled flat until BT-3000 read the deployed contract, which is why every field a caller
+  // asked for came back undefined.
   const policyBody = (key: string) =>
     JSON.stringify({
       found: true,
-      attributes: [{ attributeName: key, attributeType: 'uint', value: '5' }],
-      validFromBlock: '0',
-      validToBlock: '0',
-      updatedAtBlock: 4248521,
+      policy: {
+        attributes: [{ attributeName: key, attributeType: 'NUMBER', value: '5' }],
+        validFromBlock: '0',
+        validToBlock: '0',
+        updatedAtBlock: 4248521,
+      },
+      policyAttributeIds: { [key]: 'cfddf0644e3d02a3382126b387c5b345497d28ab178e27c2e5f3a5cff8f371c6' },
     })
 
   it('walks Registry -> listPolicyKeys -> getPolicy per key', async () => {
     const query = vi
       .fn()
       .mockResolvedValueOnce(rets('{"found":true,"address":"ZTX3PolicyOfOwner"}'))
-      .mockResolvedValueOnce(rets('["x402","maxTransactionCount"]'))
-      .mockResolvedValueOnce(rets(policyBody('x402')))
-      .mockResolvedValueOnce(rets(policyBody('maxTransactionCount')))
+      .mockResolvedValueOnce(rets('["native-v1","ztp20-v1"]'))
+      .mockResolvedValueOnce(rets(policyBody('native-v1')))
+      .mockResolvedValueOnce(rets(policyBody('ztp20-v1')))
 
     const result = await readOwnerPolicies(OWNER, REGISTRY, query)
     expect(result.contract).toEqual({ found: true, value: 'ZTX3PolicyOfOwner' })
-    expect(result.policies.map((p) => p.policyKey)).toEqual(['x402', 'maxTransactionCount'])
+    expect(result.policies.map((p) => p.policyKey)).toEqual(['native-v1', 'ztp20-v1'])
     expect(query).toHaveBeenCalledTimes(4) // 2 + N
     expect(result.warning).toBeUndefined()
   })

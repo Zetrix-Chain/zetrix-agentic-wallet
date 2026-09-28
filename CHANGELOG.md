@@ -8,6 +8,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > Entries for 0.5.0 and earlier were reconstructed from commit history when this file was
 > introduced in 0.6.0, so they summarise each release rather than being exhaustive.
 
+## [0.12.3] — 28 September 2026
+
+### Fixed
+
+- **`request_ai_birthcert_verification` now checks for an existing Verified AI Birthcert VC before
+  paying for a new one.** Asking for a verified credential when the holder already had one used to
+  start a brand-new paid session unconditionally, surfacing as a confusing "name already in use"
+  error instead of reusing or asking about the existing VC. It now checks the local cache, and — if
+  the cache never saw a previously-issued session — resolves that session's VC the same way
+  `check_ai_birthcert_verification` does, rather than trusting an empty cache. A still-valid existing
+  VC blocks the request and returns `{ existingVerifiedVc: { vcId, validUntil }, message }`; replacing
+  it requires echoing its exact `vcId` back as `confirmReplaceExistingVc`. An expired existing VC is
+  replaced automatically, with the result carrying `replacedExpiredVc: { vcId, validUntil }`.
+- **After a Verified AI Birthcert is issued, the agent now shows the full credential, including its
+  pass-design image when one is available.** The response used to summarise only a handful of fields
+  (credential id, agent name, owner, valid-until, evidence) and never mentioned the credential's
+  official pass-design image, even when the wallet already had it. Every claim on the credential is
+  now shown, and the pass-design image is surfaced when present, instead of being silently dropped
+  from the summary.
+- **`policy_preflight` now validates against the real on-chain template vocabulary instead of an
+  invented one.** Its type checking and the "this policy denies everything" blocker were built from a
+  field guide written before any policy template existed on chain, so the real deployed types and
+  list-attribute names didn't match what was actually being checked for — a spending cap of
+  `"not-a-number"` could pass clean, and an empty allow-list wasn't flagged as blocking every payment.
+  Both now fire correctly against the real templates.
+- **A deny-list is no longer described as if it were an allow-list.** `policy_preflight` used to guess
+  a list attribute's meaning from its data type alone, which says nothing about which way the list
+  points — a recipient deny-list came back described as "allows ONLY the entries listed" when it
+  actually does the opposite, and an empty deny-list (which blocks nobody) was wrongly flagged as
+  blocking everything. Each list attribute's true direction is now looked up individually; one the
+  wallet can't confirm is reported as "not checked" rather than given a guessed meaning.
+- **`get_my_policy` no longer reports a policy as found when it isn't there.** A shape mismatch meant a
+  genuine "no policy deployed" answer from the credential service was read as a successful, empty
+  policy, so a real policy could look like it had no rules at all. It's now correctly reported as a
+  failed read instead.
+
 ## [0.12.2] — 24 September 2026
 
 ### Fixed

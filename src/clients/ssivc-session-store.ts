@@ -31,6 +31,16 @@ export interface StoredSsivcSession {
   evidenceAssuranceLevel?: string
   ownerType?: string
   ownerVerified?: string
+  /**
+   * The `holderDid` this session was created under. This file is NOT
+   * itself scoped per holder (unlike the VC cache, which is keyed under a per-holder directory) and
+   * is never cleared once a session reaches `issued` — so after switching holders/accounts it can
+   * still hold a PREVIOUS holder's session. `checkExistingVerifiedVc` compares this against the
+   * CURRENT `deps.holderDid` before ever treating a stored session as evidence of "this holder
+   * already has a VC" — a mismatch, or an absent value (an older record written before this field
+   * existed), must never be resolved as if it belonged to the current holder.
+   */
+  holderDid?: string
 }
 
 export interface SsivcSessionStore {
@@ -65,7 +75,8 @@ function isStoredSessionShape(value: unknown): value is StoredSsivcSession {
     isAbsentOrString(v.agentPurpose) &&
     isAbsentOrString(v.evidenceAssuranceLevel) &&
     isAbsentOrString(v.ownerType) &&
-    isAbsentOrString(v.ownerVerified)
+    isAbsentOrString(v.ownerVerified) &&
+    isAbsentOrString(v.holderDid)
   )
 }
 
@@ -76,13 +87,20 @@ export function createFsSsivcSessionStore(filePath: string): SsivcSessionStore {
         const raw = await readFile(filePath, 'utf8')
         const parsed: unknown = JSON.parse(raw)
         return isStoredSessionShape(parsed) ? parsed : null
-      } catch {
-        return null
+      } catch (err) {
+        // Only two failures mean "no usable session" — the file does not exist (ENOENT:
+        // nothing was ever stored) or its content is not valid JSON (SyntaxError: corrupt/truncated).
+        // Anything else (EPERM, EBUSY, an antivirus file-lock, ...) is an UNKNOWN state: a session
+        // may well exist. It must propagate — checkExistingVerifiedVc relies on get() rejecting to
+        // avoid paying for a second session. Do NOT collapse this back into `catch { return null }`.
+        if (err instanceof SyntaxError) return null
+        if ((err as NodeJS.ErrnoException | null)?.code === 'ENOENT') return null
+        throw err
       }
     },
 
     async set(session) {
-      // APP-M02: write-then-rename, not a direct write. A crash mid-write must never leave a
+      // Write-then-rename, not a direct write. A crash mid-write must never leave a
       // torn/corrupt file — get() would map that to "no session" and a caller would pay again for
       // a session that may already have a settled, unconsumed receipt.
       await mkdir(dirname(filePath), { recursive: true, mode: 0o700 })

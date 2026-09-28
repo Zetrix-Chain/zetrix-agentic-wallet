@@ -26,7 +26,7 @@ const walletToolNames = (() => {
 })()
 
 describe('the wallet tool list is readable', () => {
-  it('finds exactly the fourteen tools', () => {
+  it('finds exactly the fifteen tools', () => {
     expect(walletToolNames.sort()).toEqual([
       'check_ai_birthcert_verification',
       'clear_stuck_payment_receipt',
@@ -41,6 +41,7 @@ describe('the wallet tool list is readable', () => {
       'query_contract',
       'request_ai_birthcert_verification',
       'subscribe_and_issue',
+      'transfer_token',
       'wallet_status',
     ])
   })

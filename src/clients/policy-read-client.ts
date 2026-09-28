@@ -117,8 +117,15 @@ export async function getPolicyContract(
 /** A template as the chain returns it. Extra fields are preserved but not interpreted. */
 export interface TemplateRecord {
   attributes?: Array<{ attributeName?: unknown; attributeType?: unknown }>
-  /** Present only on `getTemplate`; `getTemplateById` omits it. */
-  templateAttributeIds?: string[]
+  /**
+   * Attribute name -> its computed id. Present only on `getTemplate`; `getTemplateById` omits it.
+   *
+   * A MAP, not an array. Declared `string[]` until reading a real template showed the chain returns
+   * `{"assetScope": "ae29f7ce...", "cumulativeMax": "cfddf064..."}`. This is the field the design
+   * names as the reason to prefer the Registry route, and the one the write path needs, so the
+   * shape has to be right before a permit is built on it.
+   */
+  templateAttributeIds?: Record<string, string>
   [key: string]: unknown
 }
 
@@ -181,13 +188,30 @@ export function declaredVocabulary(template: TemplateRecord): Map<string, string
   return vocab
 }
 
-/** A deployed policy as the chain returns it. Block fields are STRINGS; `updatedAtBlock` is a NUMBER. */
+/** A deployed policy as the chain stores it. Block fields are STRINGS; `updatedAtBlock` is a NUMBER. */
 export interface PolicyRecord {
   attributes?: Array<{ attributeName?: unknown; attributeType?: unknown; value?: unknown }>
   validFromBlock?: unknown
   validToBlock?: unknown
   updatedAtBlock?: unknown
+  /** Present when the policy references a template — the reference is optional on chain. */
+  templateContractAddress?: unknown
+  templateId?: unknown
   [key: string]: unknown
+}
+
+/**
+ * What `getPolicy` actually hands back. The policy is NESTED, with a `policyAttributeIds` sibling:
+ *
+ *   return { found: true, policy: policy, policyAttributeIds: _computeAttributeIds(...) }
+ *
+ * Read from the Policy Contract source the Factory deploys. This was modelled flat, so
+ * `getPolicy` returned the envelope AS the record and anything reading `.attributes` got undefined.
+ */
+export interface PolicyReadResult {
+  policy: PolicyRecord
+  /** Attribute name -> its computed id, as with a template. */
+  policyAttributeIds?: Record<string, string>
 }
 
 /** Above this many policy keys, listing is slow enough to be worth warning about (2 + N calls). */
@@ -214,19 +238,30 @@ export async function getPolicyByKey(
   policyAddress: string,
   policyKey: string,
   query: ContractQuery,
-): Promise<PolicyRead<PolicyRecord>> {
+): Promise<PolicyRead<PolicyReadResult>> {
   const raw = await queryPolicy(policyAddress, 'getPolicy', { policyKey }, query)
   if (!raw.ok) return { error: 'query_failed', detail: raw.detail }
-  const value = raw.value as (PolicyRecord & { found?: unknown }) | null
+  const value = raw.value as { found?: unknown; policy?: unknown; policyAttributeIds?: unknown } | null
   if (!value || value.found !== true) return { found: false }
-  return { found: true, value }
+  if (!value.policy || typeof value.policy !== 'object') {
+    // found:true with no policy body is a malformed reply, not a hit. Returning the envelope as
+    // the record means every field a caller reads comes back undefined.
+    return { error: 'query_failed', detail: 'getPolicy: found:true without a policy body' }
+  }
+  return {
+    found: true,
+    value: {
+      policy: value.policy as PolicyRecord,
+      ...(value.policyAttributeIds ? { policyAttributeIds: value.policyAttributeIds as Record<string, string> } : {}),
+    },
+  }
 }
 
 export interface OwnerPolicies {
   contract: PolicyRead<string>
   /** `null` when the contract was never resolved, so nothing was ever listed. */
   keys: PolicyRead<string[]> | null
-  policies: Array<{ policyKey: string; result: PolicyRead<PolicyRecord> }>
+  policies: Array<{ policyKey: string; result: PolicyRead<PolicyReadResult> }>
   /** Set when the key count is large enough that the 2 + N read cost is worth stating. */
   warning?: string
 }

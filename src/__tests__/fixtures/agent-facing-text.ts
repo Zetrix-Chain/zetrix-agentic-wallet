@@ -227,6 +227,13 @@ export const EXPECTED_AGENT_TEXT: Record<string, Record<string, readonly string[
       "That no-claim rule covers issuerRejected and paymentInvalid specifically.",
       "The plain no-flag case above is different again, and NOT simply \"known to have succeeded\" either — see the note on it above: it is two states, only one of which is confirmed, so read `message` there too rather than assuming success from the shape alone.",
       "If the user did NOT ask for a \"verified\" credential specifically, they most likely want the self-declared, non-verified Basic AI Birthcert instead — use subscribe_and_issue for that.",
+      "BEFORE this pays or starts a session, it checks whether this holder already has a Verified AI Birthcert — found in the local cache, or (if the cache has not seen it yet) resolved from a previously-issued session.",
+      "If one exists and is STILL VALID, nothing is paid and no session is started — you get back { existingVerifiedVc: { vcId, validUntil }, message } instead.",
+      "Show that existing credential to the user and ask whether they actually want to replace it; only call this tool again, with confirmReplaceExistingVc set to exactly existingVerifiedVc.vcId, if they explicitly say yes.",
+      "Never pass confirmReplaceExistingVc on your own judgement.",
+      "If the existing VC has already EXPIRED, this proceeds automatically — no confirmation needed — and the result carries replacedExpiredVc: { vcId, validUntil } naming the one it replaced.",
+      "That field can appear on a settled session, on a payment still settling, or on an EARLIER call's still-pending session simply being returned unchanged — so treat it only as \"the holder's old VC had expired\", never as proof that THIS call itself just spent money; read the rest of the result (an error, a settled session, or settlementPending) to know what this call actually did.",
+      "It can also return { error } specifically because an already-issued VC exists but could not be confirmed as valid or expired (a resolution problem, not a payment problem) — nothing is paid on that path either; relay `error` as given, since it names the concrete next step (retry check_ai_birthcert_verification, or as a last resort clear_stuck_payment_receipt with the user's explicit agreement).",
     ],
     "inputSchema.properties.agentName.description": [
       "A unique, human-readable name for this agent.",
@@ -271,6 +278,13 @@ export const EXPECTED_AGENT_TEXT: Record<string, Record<string, readonly string[
       "A receipt only counts as stuck once it is older than SETTLEMENT_STUCK_AFTER_MS (24h by default, e.g. SETTLEMENT_STUCK_AFTER_MS=3600000 for one hour); before that the wallet REFUSES this parameter outright — nothing is discarded and nothing is paid — so do not offer the user this option for a receipt that is not stuck yet.",
       "A bare \"retry\" or \"yes\" from the user is not agreement to pay again.",
     ],
+    "inputSchema.properties.confirmReplaceExistingVc.description": [
+      "Only for replacing a Verified AI Birthcert VC that is STILL VALID (not expired).",
+      "Pass the exact vcId from a prior existingVerifiedVc response — never a guess, never made up.",
+      "Only set this after the user has SEEN that existing credential and explicitly asked to replace it; omit it otherwise.",
+      "A mismatched or unconfirmed value is ignored: nothing is paid and no session is started, and you get the same existingVerifiedVc block again.",
+      "Not needed at all when the existing VC has already expired — that case replaces itself automatically.",
+    ],
   },
   "credential_preflight": {
     "description": [
@@ -302,6 +316,9 @@ export const EXPECTED_AGENT_TEXT: Record<string, Record<string, readonly string[
       "While the session is still open the result carries `verificationUrl` (the same link issued at creation) and `expiresAt` and `expiresIn` — give the user the link and `expiresIn` exactly as given, so they know how long it is good for; never work out the time remaining yourself from `expiresAt`, because your clock and timezone may differ from the server's.",
       "Returns { status: \"pending\" } while the owner has not yet completed MyDigital ID verification, or { status: \"issued\", vcId } once myid has minted the credential — myid returns vcId ONLY when status is \"issued\", never otherwise.",
       "On { status: \"issued\" }, the wallet also fetches the credential from MBI, verifies it, and caches it locally, returning it as `vc` — it is then also visible via wallet_status and usable by prove_identity without any further call.",
+      "When `vc` is present, show the user the FULL credential, not a partial summary — render a \"Credential Details\" table covering vcId (label it \"VC ID\"), validUntil (\"Valid Until\"), and EVERY claim under `vc.credentialSubject` (whatever nested object holds them) — do not cherry-pick a few and drop the rest.",
+      "Use these labels for the claim keys you recognise: agentName -> \"Agent Name\", ownerName -> \"Owner Name\", ownerId -> \"Owner ID\", dob -> \"Date of Birth\", ownerVerified -> \"Owner Verified\", evidenceMethod -> \"Evidence Method\", evidenceProvider -> \"Evidence Provider\", evidenceDate -> \"Evidence Date\"; for any other key present, title-case it rather than omitting it — the template can carry optional claims (agentPurpose, ownerType, countryOfOrigin, additionalDetails, etc.) that were not enumerated here.",
+      "If `vcPassImagePaths` is also present, the credential's own pass-design image(s) came back attached to this result — tell the user their credential's official pass design is shown below and display the image(s); do not silently drop them from your summary just because they are not text.",
       "If `cacheError` is present instead of `vc`, the credential WAS issued successfully but could not be fetched/verified/cached yet (e.g. a transient MBI error) — this is NOT the same as issuance failing, so do not retry request_ai_birthcert_verification; call check_ai_birthcert_verification again instead.",
       "Returns { status: \"no_session\" } if request_ai_birthcert_verification has never been called.",
       "If a previous payment is still clearing, this tool ACTIVELY ADVANCES it — so in that one case it can take up to ~90s to return (it is waiting on the settlement, not hung; every other case returns immediately).",
@@ -366,6 +383,37 @@ export const EXPECTED_AGENT_TEXT: Record<string, Record<string, readonly string[
       "Set true to mint a new account even though one already exists for this session — only after the user has confirmed they want a new one.",
     ],
   },
+  "transfer_token": {
+    "description": [
+      "Send native ZTX or any ZTP20 token (e.g. JMYR) to a Zetrix address.",
+      "THIS MOVES REAL FUNDS and is irreversible.",
+      "`token` accepts \"ZTX\", a registered symbol (resolved from the built-in token list — no contract address needed), or a raw ZTP20 contract address; an unregistered symbol returns needsTokenAddress:true, at which point ask the user for the contract address rather than guessing.",
+      "State the amount as `amountHuman` (\"1.5\", converted using the token's on-chain decimals) or `amount` (raw base units) — if you pass both they must agree, which is the cheapest way to catch a 1-vs-1000000 error.",
+      "Nothing is signed until `confirm: true`: call once without it (or with dryRun:true) to get the resolved amount, destination and fee, SHOW THOSE TO THE USER, and only then re-call with confirm:true.",
+      "If the result has outcomeUnknown:true the transaction may already be on chain — do NOT retry; check the reported nonce first.",
+    ],
+    "inputSchema.properties.token.description": [
+      "\"ZTX\" for the native coin, a registered symbol (e.g. \"JMYR\"), or a ZTP20 contract address.",
+    ],
+    "inputSchema.properties.to.description": [
+      "Destination Zetrix address.",
+    ],
+    "inputSchema.properties.amountHuman.description": [
+      "Human-readable amount, e.g. \"1.5\".",
+      "Converted using the token's on-chain decimals.",
+      "Preferred over `amount`.",
+    ],
+    "inputSchema.properties.amount.description": [
+      "Amount in the token's raw base units, e.g. \"1500000\" for 1.5 of a 6-decimal token.",
+    ],
+    "inputSchema.properties.confirm.description": [
+      "Must be true to actually send.",
+      "Never infer this — the user must have seen the amount and destination.",
+    ],
+    "inputSchema.properties.dryRun.description": [
+      "Resolve and price the transfer, then stop without signing or sending.",
+    ],
+  },
 }
 
 /**
@@ -386,6 +434,9 @@ export const splitAgentSentences = (text: string): string[] =>
  * sibling tool’s description, were invisible to guards that only ever read two top-level strings.
  */
 export const MONEY_TOUCHING_TOOLS: readonly string[] = [
+  // The only tool that moves funds to a destination nobody quoted — if any text belongs under
+  // the money guards, it is this.
+  'transfer_token',
   'request_ai_birthcert_verification',
   'check_ai_birthcert_verification',
   'clear_stuck_payment_receipt',

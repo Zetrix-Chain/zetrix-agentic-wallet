@@ -11,6 +11,7 @@
  */
 import { describe, it, expect, vi } from 'vitest'
 import { createTools } from '../mcp-tools'
+import { ZTP20_V1 } from './fixtures/real-policy-templates'
 
 type Handlers = Record<string, (input?: unknown) => Promise<Record<string, unknown>>>
 
@@ -18,11 +19,13 @@ const REGISTRY = 'ZTX3Z2Fgsssx5fVq5v8EnhTBh6mqxJ8FQFqnk'
 const TEMPLATE = 'ZTX3WfTbuZwsLQDWe4f7mzrfULiNdDU84BLJ5'
 const OWNER = 'ZTX3YzAyKBxjbSaMPeaPKEBpV93wjzN4SjTaN'
 
-const TEMPLATE_BODY = {
-  found: true,
-  attributes: [{ attributeName: 'x402', attributeType: 'uint' }],
-  templateAttributeIds: ['a1', 'a2'],
-}
+/**
+ * The REAL ztp20-v1 template. Was an invented body using `x402`/`uint` and an ARRAY of
+ * templateAttributeIds — a shape this repo has since confirmed on chain to be a MAP, and the exact
+ * values BT-3000 names as the fiction that caused it. Left behind when the other files moved; the
+ * only handler-level policy test is the last place it should have survived (APP-L06).
+ */
+const TEMPLATE_BODY = ZTP20_V1
 
 /** One query_rets entry per contract hop, in hop order. */
 function rets(...values: string[]) {
@@ -46,7 +49,7 @@ const MAINNET = { network: 'zetrix:mainnet' }
 
 const draft = {
   policyKey: 'spend-limits',
-  attributes: [{ attributeName: 'x402', attributeType: 'uint', value: '1000000' }],
+  attributes: [{ attributeName: 'perTransactionMax', attributeType: 'NUMBER', value: '1000000' }],
   validFromBlock: '0',
   validToBlock: '0',
 }
@@ -132,7 +135,7 @@ describe('get_policy_template_schema handler', () => {
     // APP-L01. With a pair given but no registry configured, the old message asked for the pair.
     const result = await tools({ policyTemplateAddress: TEMPLATE }).get_policy_template_schema({
       publisher: OWNER,
-      policyKey: 'x402',
+      policyKey: 'ztp20-v1',
     })
     expect(String(result.error)).toMatch(/registry/i)
     expect(String(result.error)).not.toMatch(/Provide either/i)
@@ -144,11 +147,15 @@ describe('get_policy_template_schema handler', () => {
     const chainQuery = vi.fn().mockResolvedValue(rets(JSON.stringify(TEMPLATE_BODY)))
     const result = await tools(TESTNET, chainQuery).get_policy_template_schema({
       publisher: OWNER,
-      policyKey: 'x402',
+      policyKey: 'ztp20-v1',
     })
     expect(result.found).toBe(true)
-    expect(result.templateAttributeIds).toEqual(['a1', 'a2'])
-    expect(result.declared).toEqual([{ name: 'x402', type: 'uint' }])
+    // A MAP, not an array — confirmed on chain.
+    expect(Array.isArray(result.templateAttributeIds)).toBe(false)
+    expect((result.templateAttributeIds as Record<string,string>).cumulativeMax).toBe(ZTP20_V1.templateAttributeIds.cumulativeMax)
+    expect(result.declared).toContainEqual({ name: 'cumulativeMax', type: 'NUMBER' })
+    expect(result.declared).toContainEqual({ name: 'recipientAllowlist', type: 'ADDRESS_LIST' })
+    expect(result.declared).toHaveLength(13)
   })
 
   it('omits templateAttributeIds on the id-only route, which does not return them', async () => {

@@ -230,7 +230,7 @@ function uncheckable(isVerified: boolean, isFree = false): string[] {
       'Whether the agent name is still free. myid checks uniqueness at issuance, not now, so a name in use still prices normally and is only refused after payment.',
     )
   }
-  // APP-L01 (!83). `paymentRequired` is a service-wide MBI setting, not a property of this
+  // `paymentRequired` is a service-wide MBI setting, not a property of this
   // template, and suppressing the balance and cap blockers on it is what lets preflight return
   // `ready: true` for a wallet holding nothing. If payment is switched back on between this quote
   // and the apply, that answer was wrong and the user finds out at issuance. The suppression is

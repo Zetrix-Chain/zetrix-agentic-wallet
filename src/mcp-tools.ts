@@ -1,5 +1,5 @@
 /**
- * createTools — the 11 agent-facing tools.
+ * createTools — the 15 agent-facing tools.
  *
  * Pure wiring: each tool composes an orchestrator + config. The concrete deps
  * (X401Wallet, x402 payer, MBI + Wallet-BE sign/pay) are built in index.ts
@@ -16,6 +16,10 @@
  *   check_ai_birthcert_verification     — poll that session; advances a queued settlement; caches the VC once issued
  *   clear_stuck_payment_receipt         — last-resort, confirmation-gated discard of a stuck payment receipt
  *   credential_preflight                — free readiness/price check before a paid issuance
+ *   get_policy_template_schema          — free read of a POLICY template's declared vocabulary
+ *   get_my_policy                       — free read of the owner's deployed on-chain policies
+ *   policy_preflight                    — free validation and plain-words reading of a draft policy
+ *   transfer_token                      — send native ZTX or any ZTP20 token to an address
  */
 
 import type { X401Wallet } from 'x401-zetrix-client'
@@ -46,6 +50,7 @@ import {
   readOwnerPolicies,
 } from './clients/policy-read-client.js'
 import { policyPreflight, unavailableResult, type DraftPolicy } from './orchestrator/policy-preflight.js'
+import { transferToken, type TransferDeps, type TransferOpts } from './orchestrator/transfer.js'
 
 export interface ToolDeps {
   config: {
@@ -79,6 +84,24 @@ export interface ToolDeps {
   chainQuery: ContractQuery
   /** Read-only contract/account query, backing the query_contract tool. */
   queryContract: (input: ContractQueryInput) => Promise<ContractQueryResult>
+  /**
+   * Deps for the transfer_token tool. Optional: omit to leave the server unable to move funds at
+   * all, which is the safe default for a deployment that only needs identity + x402.
+   */
+  transferDeps?: TransferDeps
+  /**
+   * Checksum validator for `policy_preflight`, built by `buildAddressValidator`.
+   *
+   * NOT shared with `transfer_token`, despite several earlier comments in this repo saying it
+   * was — including one in the round that set out to remove them, which miscounted the sites.
+   * transfer_token takes `deps.transferDeps` and uses `TransferDeps.isValidAddress`, wired
+   * separately from `buildTransferSafetyWiring` — a different object with its own identical-bodied
+   * default. Setting this field to `() => true` would not touch transfer_token's gate at all.
+   *
+   * Two defaults, same body, each pinned by its own test. Worth consolidating one day; worth not
+   * believing they already are.
+   */
+  isValidAddress?: (address: string) => boolean
   createAccount: CreateAccount
   /**
    * Persists a freshly created account locally so create_holder_account survives a restart.
@@ -143,10 +166,10 @@ async function loadValidCachedCredentials(cache?: VcCacheStore) {
   return all.filter((entry) => isVcValid(entry))
 }
 
-/** Shared by both AI Birthcert verification tools when verifyAiBirthcert isn't wired (see ToolDeps) — the live wallet (index.ts) wires it whenever SSIVC_BASE_URL resolves (always on testnet; on mainnet only once set explicitly, APP-M04). */
+/** Shared by both AI Birthcert verification tools when verifyAiBirthcert isn't wired (see ToolDeps) — the live wallet (index.ts) wires it whenever SSIVC_BASE_URL resolves (always on testnet; on mainnet only once set explicitly). */
 const AI_BIRTHCERT_NOT_CONFIGURED_ERROR =
   'AI Birthcert verification is not configured on this wallet. On mainnet this is expected until ' +
-  'SSIVC_BASE_URL is set explicitly (the mainnet host was never confirmed reachable — APP-M04); on ' +
+  'SSIVC_BASE_URL is set explicitly (the mainnet host was never confirmed reachable); on ' +
   'testnet it means verifyAiBirthcert was not wired at all.'
 
 export function createTools(deps: ToolDeps) {
@@ -213,8 +236,8 @@ export function createTools(deps: ToolDeps) {
       // template-aliases.ts), never a wallet-wide default: resolved fresh per call so an unrelated
       // template's issuance never carries along a mismatched pass-design id. Explicitly setting the
       // key to undefined (rather than a conditional spread) matters if deps.subscribeDeps ever
-      // carries an inherited value of its own — a spread can only add the key, never clear it
-      // (APP-L02), which would otherwise let a stale id leak into the signed data payload.
+      // carries an inherited value of its own — a spread can only add the key, never clear it —
+      // which would otherwise let a stale id leak into the signed data payload.
       const passDesignId = resolvePassDesignId(templateId, deps.config.network)
       const result = await subscribeAndIssue(
         { ...deps.subscribeDeps, passDesignId },
@@ -360,8 +383,8 @@ export function createTools(deps: ToolDeps) {
           : null
 
       if (!read) {
-        // Distinguish "you gave me too little" from "this network has no contract to ask"
-        // (APP-L01) — telling a caller to supply what they already supplied is a dead end.
+        // Distinguish "you gave me too little" from "this network has no contract to ask" —
+        // telling a caller to supply what they already supplied is a dead end.
         return {
           error: input.templateId
             ? `A templateId lookup needs the policy template contract, which is not configured on ${deps.config.network}.`
@@ -377,7 +400,7 @@ export function createTools(deps: ToolDeps) {
         declared: [...declaredVocabulary(read.value).entries()].map(([name, type]) => ({ name, type })),
         // Present only on the Registry route; the id-only read does not return them. Carried
         // through rather than dropped, since it is the stated reason to prefer that route and the
-        // write path needs it (APP-M06).
+        // write path needs it.
         ...(read.value.templateAttributeIds ? { templateAttributeIds: read.value.templateAttributeIds } : {}),
       }
     },
@@ -401,7 +424,7 @@ export function createTools(deps: ToolDeps) {
         // A full PolicyPreflightResult, NOT a bare {error}. The design states twice that
         // notChecked appears on every result, precisely so a clean preflight is never read as
         // permission to spend — and mainnet, where no contract exists, is the network where that
-        // warning matters most. Returning {error} here dropped it silently (APP-C02).
+        // warning matters most. Returning {error} here dropped it silently.
         return unavailableResult(
           typeof input?.policyKey === 'string' ? input.policyKey : '',
           `Policy contracts are not deployed on ${network}, so this draft could not be checked against a template.`,
@@ -412,10 +435,14 @@ export function createTools(deps: ToolDeps) {
       return policyPreflight(
         {
           network,
+          // The same KIND of checksum gate transfer_token uses, not the same instance — see the
+          // ToolDeps field doc. Read straight off deps; built by buildAddressValidator, which is
+          // where it is tested.
+          isValidAddress: deps.isValidAddress,
           readTemplate: async (draft) =>
             // An explicit templateId wins. `draft.policyKey` is the key this policy would be
             // STORED under, which is not necessarily the template's key — preferring the pair
-            // made an explicitly supplied templateId unreachable (APP-M04).
+            // made an explicitly supplied templateId unreachable.
             draft.templateId && templateContract
               ? getTemplateById(draft.templateId, templateContract, deps.chainQuery)
               : draft.publisher && draft.policyKey && registry
@@ -427,6 +454,20 @@ export function createTools(deps: ToolDeps) {
         },
         input,
       )
+    },
+
+    /**
+     * The only tool that moves funds to an arbitrary destination. Every guard lives in the
+     * orchestrator and runs before anything is signed — see orchestrator/transfer.ts.
+     */
+    transfer_token(input: TransferOpts) {
+      if (!deps.transferDeps) {
+        return Promise.resolve({
+          sent: false,
+          reason: 'transfer_token is not configured on this server (no transfer deps wired)',
+        })
+      }
+      return transferToken(deps.transferDeps, input)
     },
 
     check_ai_birthcert_verification() {

@@ -13,7 +13,7 @@ import { join } from 'node:path'
  * Robustness bounds, not a security boundary — MBI is first-party and nothing attacker-controlled
  * reaches this field. Still worth capping: nothing else limits how many pages or how large an
  * encoded entry can be, and every page is held in memory and written to the wallet's state volume
- * in full (APP-L01). An oversized page is skipped rather than aborting the whole array, so one bad
+ * in full. An oversized page is skipped rather than aborting the whole array, so one bad
  * page cannot hide the rest.
  */
 const MAX_PASS_IMAGE_PAGES = 10

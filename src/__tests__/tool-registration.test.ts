@@ -40,13 +40,13 @@ function moneySentences(): { tool: string; path: string; sentence: string }[] {
 }
 
 describe('buildToolList', () => {
-  it('exposes exactly the 14 agent tools with the correct required inputs', () => {
+  it('exposes exactly the 15 agent tools with the correct required inputs', () => {
     const tools = buildToolList()
     expect(tools.map((t) => t.name).sort()).toEqual([
       'check_ai_birthcert_verification', 'clear_stuck_payment_receipt', 'create_holder_account', 'credential_preflight',
       'get_my_policy', 'get_policy_template_schema', 'get_template_schema', 'pay_and_fetch', 'policy_preflight',
       'prove_identity', 'query_contract', 'request_ai_birthcert_verification', 'subscribe_and_issue',
-      'wallet_status',
+      'transfer_token', 'wallet_status',
     ])
 
     const byName = Object.fromEntries(tools.map((t) => [t.name, t]))
@@ -58,6 +58,7 @@ describe('buildToolList', () => {
     expect(byName.create_holder_account.inputSchema.required).toBeUndefined()
     expect(byName.query_contract.inputSchema.required).toEqual(['contractAddress', 'method'])
     expect(byName.get_template_schema.inputSchema.required).toEqual(['templateId'])
+    expect(byName.transfer_token.inputSchema.required).toEqual(['token', 'to'])
     expect(byName.request_ai_birthcert_verification.inputSchema.required).toEqual(['agentName'])
     expect(byName.check_ai_birthcert_verification.inputSchema.type).toBe('object')
   })
@@ -670,6 +671,25 @@ describe('buildToolList', () => {
     expect(prop?.enum).toEqual(['sponsored', 'self'])
     const required = (tool?.inputSchema as { required?: string[] }).required ?? []
     expect(required).not.toContain('gasPayer')
+  })
+
+  // transfer_token is the only tool that moves funds to an arbitrary destination, so its
+  // description must state the confirm requirement and the raw-vs-human amount contract — an
+  // agent reading only the description is the one deciding how much to send.
+  it('advertises transfer_token as requiring explicit confirmation', () => {
+    const tool = buildToolList().find((t) => t.name === 'transfer_token')
+    expect(tool?.description).toMatch(/confirm/i)
+    expect(tool?.description).toMatch(/base units|amountHuman/i)
+    expect(tool?.inputSchema.properties.confirm).toBeDefined()
+    expect(tool?.inputSchema.properties.dryRun).toBeDefined()
+  })
+
+  it('warns that transfer_token moves real funds and is irreversible', () => {
+    // The one tool with no quoted price behind it — the description is the only place an agent
+    // learns that this is not a reversible or simulated action.
+    const tool = buildToolList().find((t) => t.name === 'transfer_token')
+    expect(tool?.description).toMatch(/real funds/i)
+    expect(tool?.description).toMatch(/irreversible/i)
   })
 
   it('advertises every policy tool as free of payment and signing', () => {

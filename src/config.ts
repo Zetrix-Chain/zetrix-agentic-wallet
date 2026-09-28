@@ -86,7 +86,7 @@ export interface AgenticWalletConfig {
    * myid's SSIVC "AI Birthcert" session API base URL — backs request_ai_birthcert_verification /
    * check_ai_birthcert_verification. Auto-derived on testnet only (the only host ever actually
    * reached and confirmed live); undefined on mainnet unless SSIVC_BASE_URL is set explicitly
-   * (APP-M04 — the mainnet host, {@link UNVERIFIED_MAINNET_SSIVC_BASE_URL}, was an assumption by
+   * (the mainnet host, {@link UNVERIFIED_MAINNET_SSIVC_BASE_URL}, was an assumption by
    * analogy, never tested). Unset means the AI Birthcert verification tools report themselves as
    * not configured rather than being wired against an unconfirmed endpoint.
    */
@@ -94,7 +94,7 @@ export interface AgenticWalletConfig {
   /**
    * The Verified AI Birthcert's on-chain templateId, distinct from the Basic Birthcert's.
    * Auto-derived on testnet only (confirmed on-chain, see deriveAiBirthcertVerifiedTemplateId);
-   * undefined on mainnet unless AI_BIRTHCERT_VERIFIED_TEMPLATE_ID is set explicitly (APP-M04 — a
+   * undefined on mainnet unless AI_BIRTHCERT_VERIFIED_TEMPLATE_ID is set explicitly (a
    * chain read at the mainnet registry address returned `result: null`, so the id was never
    * confirmed). Unset means check_ai_birthcert_verification reports a cacheError instead of
    * caching a mainnet credential under a possibly-wrong key.
@@ -157,7 +157,7 @@ function deriveTemplateRegistryAddress(network: string): string {
  * (2026-09-18): the account exists, its `query()` dispatcher exposes getPolicyContract / getPolicy /
  * getTemplate, and a live call returned a well-formed reply.
  *
- * Mainnet returns undefined because the Registry is NOT DEPLOYED there — the same APP-M04 honesty
+ * Mainnet returns undefined because the Registry is NOT DEPLOYED there — the same honesty
  * convention as {@link deriveSsivcBaseUrl}. A guessed address would make every read fail in a way
  * that reads as "you have no policy" rather than "this network has no policy system at all", which
  * is precisely the confusion the three-state read result exists to prevent.
@@ -185,7 +185,7 @@ export function derivePolicyTemplateAddress(network: string): string | undefined
 
 /**
  * The mainnet SSIVC host, by analogy with the other services' testnet/mainnet naming — but
- * UNVERIFIED (APP-M04, 2026-08-17): nobody has actually reached it and gotten a real response.
+ * UNVERIFIED (as of 2026-08-17): nobody has actually reached it and gotten a real response.
  * Kept as a named constant, not inlined, so confirming it later is a one-line change — flip
  * deriveSsivcBaseUrl's mainnet branch to return this — instead of someone having to rediscover
  * the URL from scratch. Do NOT wire this into deriveSsivcBaseUrl's return value until confirmed;
@@ -206,7 +206,7 @@ function deriveSsivcBaseUrl(network: string): string | undefined {
 /**
  * `AI_BIRTHCERT_VERIFIED` templateId, deployed 2026-08-05 (`TEMPLATE_ONCHAIN_REFERENCE.md` §2).
  * Testnet id confirmed on-chain. The mainnet id is UNVERIFIED — a chain read at the mainnet
- * registry address returned `result: null` — so this returns undefined on mainnet (APP-M04,
+ * registry address returned `result: null` — so this returns undefined on mainnet (as of
  * 2026-08-17) rather than a guessed id a mainnet credential could get cached under incorrectly.
  * Set AI_BIRTHCERT_VERIFIED_TEMPLATE_ID explicitly once the mainnet registry account is confirmed.
  */
@@ -283,7 +283,7 @@ const KNOWN_NETWORKS = ['zetrix:testnet', 'zetrix:mainnet'] as const
 
 /**
  * Above this, SETTLEMENT_WAIT_BUDGET_MS starts reinstating the long blocking call the 90s default
- * exists to prevent, so it is warned about on stderr (APP-L02). Not a clamp — see the loader.
+ * exists to prevent, so it is warned about on stderr. Not a clamp — see the loader.
  */
 const SETTLEMENT_WAIT_BUDGET_WARN_MS = 600_000
 
@@ -366,7 +366,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): AgenticWalletConfig {
       const attempts = Number(env.MAX_SETTLEMENT_ATTEMPTS)
       return Number.isInteger(attempts) && attempts > 0 ? attempts : 20
     })(),
-    // APP-L02: deliberately NOT clamped to a ceiling. This is the ops escape hatch for a slow
+    // Deliberately NOT clamped to a ceiling. This is the ops escape hatch for a slow
     // paymaster, and a hard cap turns a tuning knob into a wall with no way around it. Setting it
     // very high cannot restore worse-than-before behaviour on its own either: maxSettlementAttempts
     // still bounds the loop independently, so the old ~20-minute block needs BOTH knobs

@@ -309,9 +309,9 @@ async function resolveVcPassImagePaths(deps: SubscribeDeps, vcId: string): Promi
   // so a failure here (a full quarantine store, an unwritable pass-images dir) must degrade to
   // undefined rather than reject — the docblock's "never throws" promise covers the whole body,
   // not just the network call, or a filesystem error turns an already-paid issuance into a
-  // reported failure (APP-M01).
+  // reported failure.
   try {
-    // Locked per vcId (APP-L03): without this, two concurrent calls for the same vcId can both miss
+    // Locked per vcId: without this, two concurrent calls for the same vcId can both miss
     // the quarantine `get` below and both hit MBI's one-shot download, so one gets a 404. Serializing
     // here means the second (now-queued) caller's `get` sees the first caller's `set`.
     const entries = await quarantine.withLock(vcId, async (): Promise<MbiVcEntry[] | undefined> => {

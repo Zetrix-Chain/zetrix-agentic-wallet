@@ -65,7 +65,7 @@ export interface VerifyAiBirthcertDeps {
   /** Local cache of issued VCs — same store `subscribe_and_issue` writes to, under a different templateId. */
   cache?: VcCacheStore
   /**
-   * Persists MBI's raw `/v1/vc/ext/download` response BEFORE any validation — SEC-11/APP-C01. The
+   * Persists MBI's raw `/v1/vc/ext/download` response BEFORE any validation. The
    * download is one-shot; a rejection or crash after it but before caching must never destroy the
    * credential. Required, not optional: this is a money-safety property of the download path, not
    * a nice-to-have.
@@ -139,10 +139,38 @@ export interface RequestAiBirthcertVerificationInput {
    * *recommends* this once the receipt is past the stuck threshold.
    *
    * What it does not do: discard a LIVE session. That record still holds a usable verification link
-   * which SSIVC issues only once (R2-M01), so it is refused here and must go through
+   * which SSIVC issues only once, so it is refused here and must go through
    * `clear_stuck_payment_receipt`, which asks for its own separate confirmation.
    */
   discardStuckReceiptAndPayFresh?: string
+  /**
+   * Exact `vcId` of a currently-valid Verified AI Birthcert VC that the holder wants replaced anyway.
+   * Required to proceed when this holder already has one — found in the local cache, or
+   * resolved from a previously-issued session the cache hadn't yet seen (`checkExistingVerifiedVc`)
+   * — and it has not expired. Same "must echo the id you were shown" pattern as
+   * `discardStuckReceiptAndPayFresh`, so a caller cannot decide to replace a still-good credential
+   * without the holder having actually seen it first. Ignored when no existing VC is found at all, or
+   * when the one found has already expired — an expired VC is replaced automatically, with a notice,
+   * and never needs this field.
+   */
+  confirmReplaceExistingVc?: string
+}
+
+/** A cached Verified AI Birthcert VC's identifying facts, surfaced back to the caller. */
+export interface ExistingVerifiedVcNote {
+  vcId: string
+  validUntil?: string
+}
+
+/**
+ * A Verified AI Birthcert VC already exists for this holder and is still valid — nothing was paid
+ * and no new SSIVC session was started. Not an error: it is a decision point that must
+ * reach the holder before anything is replaced. Call again with `confirmReplaceExistingVc` set to
+ * exactly `existingVerifiedVc.vcId` to replace it anyway.
+ */
+export interface ExistingVerifiedVcBlocked {
+  existingVerifiedVc: ExistingVerifiedVcNote
+  message: string
 }
 
 /**
@@ -202,13 +230,13 @@ export interface RequestVerificationPending {
    * The credential service was reached and refused the request — the settlement is not what failed,
    * and `message` quotes what it said.
    *
-   * A field rather than a prefix on `message` (R2-M01), matching `check_`'s result: the alternative
+   * A field rather than a prefix on `message`, matching `check_`'s result: the alternative
    * was asking a caller to branch on how the prose opens, which is exactly the parsing the rest of
    * this contract exists to avoid.
    */
   issuerRejected?: boolean
   /**
-   * SSIVC has specifically ruled the payment/receipt invalid (`payment_invalid`, R3-M01) — distinct
+   * SSIVC has specifically ruled the payment/receipt invalid (`payment_invalid`) — distinct
    * from `issuerRejected`, whose wording says "the settlement is not what failed", which is
    * backwards for this case. `message` quotes what SSIVC said; it makes no claim about whether the
    * fee was taken, in either direction.
@@ -217,14 +245,26 @@ export interface RequestVerificationPending {
   message: string
   /** Set only when this call discarded a stuck receipt before this outcome. */
   discardedPaymentReceipt?: string
+  /**
+   * Set only when an existing Verified AI Birthcert VC had already expired — this call is
+   * replacing it automatically, no confirmation needed. Present here too, not only on the
+   * immediately-settled result, because sponsored settlement (the default) can just as easily land
+   * on this pending shape instead — the holder must be told either way.
+   */
+  replacedExpiredVc?: ExistingVerifiedVcNote
 }
 
 export type RequestVerificationResult =
-  /** `discardedPaymentReceipt` is set only when this call discarded a stuck receipt to pay again. */
-  | (SsivcSessionCreated & { discardedPaymentReceipt?: string })
+  /**
+   * `discardedPaymentReceipt` is set only when this call discarded a stuck receipt to pay again.
+   * `replacedExpiredVc` is set only when a cached Verified AI Birthcert VC existed but had already
+   * expired — this new session replaces it automatically, no confirmation needed.
+   */
+  | (SsivcSessionCreated & { discardedPaymentReceipt?: string; replacedExpiredVc?: ExistingVerifiedVcNote })
   | RequestVerificationFailure
   | { quote: VerificationQuote }
   | RequestVerificationPending
+  | ExistingVerifiedVcBlocked
 
 export type CheckVerificationResult =
   | { status: 'no_session'; message: string }
@@ -232,11 +272,11 @@ export type CheckVerificationResult =
    * A payment HAS been made and the wallet is holding its receipt. Distinct from
    * `no_session`: never tell the caller to start over, and never pay again.
    *
-   * R2-L01: this one status covers TWO materially different situations, and `outcomeUnknown` is
+   * This one status covers TWO materially different situations, and `outcomeUnknown` is
    * what tells them apart — `request_` keeps them structurally distinct and this surface must not
    * collapse them:
    *  - absent/false — message leads `PAYMENT SENT`, and checking again in a few minutes is the
-   *    right advice. R11-M03: this half is itself TWO states, and the flag cannot separate them —
+   *    right advice. This half is itself TWO states, and the flag cannot separate them —
    *    only the clause after the lead can. `still being processed` is a confirmed queued
    *    settlement, progressing normally; `has not been confirmed yet` is an outcome that could not
    *    be determined at all, merely too young to be called stuck ({@link SettlementOutcomeUnknownError}
@@ -262,7 +302,7 @@ export type CheckVerificationResult =
        */
       issuerRejected?: boolean
       /**
-       * SSIVC has specifically ruled the payment/receipt invalid (`payment_invalid`, R3-M01) —
+       * SSIVC has specifically ruled the payment/receipt invalid (`payment_invalid`) —
        * distinct from `issuerRejected`: that field's meaning ("the settlement is not what failed")
        * is backwards here, since `payment_invalid` IS SSIVC's verdict about the payment. `message`
        * quotes what SSIVC said and makes no claim about whether the fee was taken, in either
@@ -320,11 +360,11 @@ async function getConfirmedStatus(
  * pending — do not spawn a second session against the same payment), "pay fresh" (no stored
  * session, or the prior session for this exact agentName already reached `issued` — its receipt is
  * consumed and dead), or "blocked" (the store holds a DIFFERENT agent's still-unconsumed session —
- * APP-M01: overwriting it would silently orphan that receipt or verification link).
+ * overwriting it would silently orphan that receipt or verification link).
  */
 type PriorSessionDecision =
   | { kind: 'still_pending'; result: SsivcSessionCreated }
-  /** The record the receipt came from — APP-M03 reads its optional fields back. */
+  /** The record the receipt came from — the caller reads its optional fields back. */
   | { kind: 'replay_receipt'; receipt: string; stored: StoredSsivcSession }
   | { kind: 'pay_fresh' }
   | { kind: 'blocked'; message: string }
@@ -342,18 +382,18 @@ async function decidePriorSession(
   // path segment rather than 404ing it, so calling getConfirmedStatus here would either rethrow an
   // opaque error or silently misbehave. Short-circuit BEFORE any network call: replaying the
   // receipt is the correct resume action regardless of which agentName is on the stored record —
-  // same reasoning as R2-L03 below, the receipt is bound to the request body's signature, not to
+  // same reasoning as below, the receipt is bound to the request body's signature, not to
   // agentName.
   if (stored.sessionId === '') return { kind: 'replay_receipt', receipt: stored.paymentReceipt, stored }
 
   if (stored.agentName !== agentName) {
-    // APP-M01: the store holds exactly one record. Overwriting it below would silently destroy the
+    // The store holds exactly one record. Overwriting it below would silently destroy the
     // OTHER agent's settlement receipt (and its verificationUrl) if that payment hasn't been
     // consumed yet. Only proceed once we can confirm it's already dead (issued) or genuinely gone
     // (404). Anything still live and not issued (most concretely: `pending`, per the scenario this
     // fix was written for) blocks the switch.
     const otherStatus = await getConfirmedStatus(deps, stored.sessionId)
-    // R2-L03: a 404'd session means a settled-but-orphaned receipt, exactly as in the same-agentName
+    // A 404'd session means a settled-but-orphaned receipt, exactly as in the same-agentName
     // case below — so treat it identically and replay the receipt rather than paying again. The
     // receipt is scoped to the request body's signature (see ssivc-client.ts: `signedData` is what
     // binds a session to a specific agent key), not to agentName at the payment layer, so replaying
@@ -373,7 +413,7 @@ async function decidePriorSession(
     // Any other confirmed terminal status (e.g. "expired" — confirmed live 2026-08-28: an owner who
     // never completes the MyDigital ID link before the session's TTL elapses) is, per SEC-13
     // (SPEC.md §634), a "settled but unconsumed" case exactly like the 404/"gone" branch above — the
-    // receipt is ONLY consumed once a session reaches "issued". Same R2-L03 reasoning applies: safe
+    // receipt is ONLY consumed once a session reaches "issued". Same reasoning as above applies: safe
     // to replay under the new agentName's signed body regardless of the exact status string.
     return { kind: 'replay_receipt', receipt: stored.paymentReceipt, stored }
   }
@@ -387,7 +427,7 @@ async function decidePriorSession(
     }
   }
   if (status.status === 'issued') return { kind: 'pay_fresh' } // receipt consumed — dead
-  // APP-M03 / SEC-13: only `issued` consumes the settlement receipt (SPEC.md §634) — every other
+  // Only `issued` consumes the settlement receipt (SPEC.md §634) — every other
   // confirmed terminal status ("expired" — confirmed live 2026-08-28 for a session whose TTL elapsed
   // before the owner completed MyDigital ID verification; and by the same SEC-13 reasoning any other
   // terminal-not-issued value myid may return, e.g. a declined/failed equivalent, SPEC.md D8) leaves
@@ -397,7 +437,7 @@ async function decidePriorSession(
   return { kind: 'replay_receipt', receipt: stored.paymentReceipt, stored }
 }
 
-/** Serializes the decide → pay → persist critical section (APP-M02) — the MCP host does not
+/** Serializes the decide → pay → persist critical section — the MCP host does not
  * serialize tool calls, so two concurrent requests could otherwise both read "safe to pay" before
  * either writes, double-charging the wallet. Scoped to the whole process: the session store is a
  * single slot regardless of agentName, so only one AI Birthcert verification can usefully be
@@ -515,8 +555,7 @@ function notStuckYetMessage(receipt: string, humanAge: string, stuckAfterMs: num
 const FALLBACK_RETRY_DELAY_MS = 15_000
 
 /**
- * `retryAfterSeconds` -> a delay that is always finite, positive and within {@link MAX_RETRY_DELAY_MS}
- * (APP-M03).
+ * `retryAfterSeconds` -> a delay that is always finite, positive and within {@link MAX_RETRY_DELAY_MS}.
  *
  * `Math.min` alone only clamps the UPPER bound. NaN makes every comparison false, and a negative or
  * zero value makes the budget's overrun check false too — so the wait budget silently stopped
@@ -658,7 +697,7 @@ function unresolvedCause(err: unknown): string {
 function isIssuerRejection(err: unknown): err is SsivcError {
   if (!(err instanceof SsivcError)) return false
   if (err.httpStatus === undefined || err.httpStatus < 400 || err.httpStatus >= 500) return false
-  // The HTTP class alone is not enough (review APP-C01). SSIVC ships several settlement verdicts
+  // The HTTP class alone is not enough. SSIVC ships several settlement verdicts
   // on 400, and each already carries a `kind` saying what it means — so the kind decides, and only
   // an error that carries none, or one about something other than the settlement, counts as a
   // refusal to report through THIS wording.
@@ -670,12 +709,12 @@ function isIssuerRejection(err: unknown): err is SsivcError {
   //   never arrive here, and if a future change routes it through, it must not be reworded.
   // - `blob_already_settled` (409) most likely means the money DID move, which is the one thing
   //   this message must not talk over.
-  // - `payment_invalid` (402) is excluded from THIS classifier for the reason R2-M05 gave — this
+  // - `payment_invalid` (402) is excluded from THIS classifier because this
   //   wording's "that refusal is about the request, not about the settlement" is backwards for a
   //   verdict specifically about the payment — but it is NOT folded into the generic indeterminate
-  //   branch either (R3-M01 caught that landing there asserted "nothing has gone wrong and no
+  //   branch either, since landing there would assert "nothing has gone wrong and no
   //   funds are lost", an unsupported positive claim on the strength of SSIVC's explicit negative
-  //   one). It gets its own classifier and wording — see {@link isPaymentInvalidRejection}.
+  //   one. It gets its own classifier and wording — see {@link isPaymentInvalidRejection}.
   const notARejection: (SsivcErrorKind | undefined)[] = [
     'settlement_unconfirmed',
     'settlement_void',
@@ -700,7 +739,7 @@ function isAgentNameInUse(err: unknown): err is SsivcError {
  *
  * Says one thing about the name and makes NO claim about the fee: this name can never succeed, so
  * retrying it is pointless and the user needs a different one. Whether a fee was taken is
- * deliberately not asserted in either direction (R12-C01). SSIVC's owner has said the uniqueness
+ * deliberately not asserted in either direction. SSIVC's owner has said the uniqueness
  * check runs before the fee is deducted, but the wallet signs and hands over the payment blob before
  * it can ever see a `409/26`, and SPEC.md (§ "reusing a name already in use causes issuance to fail
  * downstream", confirmed 2026-08-13) says the opposite — so nothing here may rest on that ordering.
@@ -709,7 +748,7 @@ function isAgentNameInUse(err: unknown): err is SsivcError {
  * a new name that the message can simply describe accurately).
  *
  * `paidThisCall` because on request_'s fresh-pay route `deps.pay` has ALREADY run by the time SSIVC
- * can answer (R10-M01's rule: never deny this call's own payment). `receipt` is absent on the fresh
+ * can answer (the rule here: never deny this call's own payment). `receipt` is absent on the fresh
  * route when SSIVC returned none.
  */
 function agentNameInUseMessage(
@@ -745,7 +784,7 @@ function agentNameInUseMessage(
  * True when SSIVC has specifically ruled the payment/receipt invalid — `402` + `kind:
  * 'payment_invalid'` (SPEC.md: "payment blob invalid/expired/underpaid").
  *
- * Split out from {@link isIssuerRejection} rather than folded into it (R3-M01): that function's
+ * Split out from {@link isIssuerRejection} rather than folded into it: that function's
  * wording tells the user "that refusal is about the request, not about the settlement", which is
  * exactly backwards here — `payment_invalid` IS SSIVC's verdict about the payment. Folding it into
  * the OTHER bucket (the generic indeterminate branch) is just as wrong the other way: that branch's
@@ -824,7 +863,7 @@ const TELL_USER_QUEUED =
  * confirm on chain and the service still refuse the request that follows, which is exactly what
  * happened on the incident this came from (SPEC.md §6, REQ-19f).
  *
- * R10-M01: `paidThisCall` exists because this builder is shared by two surfaces with opposite
+ * `paidThisCall` exists because this builder is shared by two surfaces with opposite
  * truths. check_ never pays (its `deps` has no `pay`), so "no new payment was made" is always true
  * there and it passes `false`. request_'s FRESH-PAY route already ran `deps.pay` before SSIVC was
  * ever asked to settle, so on the path where the settle queues and a later poll is refused, the
@@ -858,18 +897,18 @@ function issuerRejectionMessage(
 /**
  * What to tell the user when SSIVC has specifically ruled the payment/receipt invalid
  * ({@link isPaymentInvalidRejection}) — deliberately different wording from
- * {@link issuerRejectionMessage} (R3-M01).
+ * {@link issuerRejectionMessage}.
  *
  * The generic rejection message reassures that "the refusal is about the request, not about the
  * settlement" — accurate for an upstream fault like the ZVG outage this MR was written for, but
  * backwards here: SSIVC's own classification says this IS a verdict about the payment. So this
  * wording makes no claim about the settlement either way, and — same discipline as every other
  * message on this path — makes no claim about whether the fee was taken. It also does not repeat
- * the false-safety line R3-M01 caught the generic indeterminate branch making ("nothing has gone
+ * the false-safety line the generic indeterminate branch was once caught making ("nothing has gone
  * wrong and no funds are lost"): SSIVC gave an explicit negative-leaning answer, so a positive one
  * would be asserting the opposite of what was said.
  *
- * `paidThisCall` for the same reason as {@link issuerRejectionMessage} (R10-M01): on request_'s
+ * `paidThisCall` for the same reason as {@link issuerRejectionMessage}: on request_'s
  * fresh-pay route the hardcoded "no new payment was made" was false about this very call.
  */
 function paymentInvalidMessage(
@@ -931,7 +970,7 @@ async function resolveSettlement(
     // exactly the failure the bounded wait is about, and a server-supplied retryAfterSeconds must never be
     // able to buy itself one more full MAX_RETRY_DELAY_MS past the ceiling.
     //
-    // `attempt > 0` guarantees at least one poll (APP-M01). The budget caps how LONG we wait; it must
+    // `attempt > 0` guarantees at least one poll. The budget caps how LONG we wait; it must
     // never mean "do not even ask once". Without this, a budget below the first delay produced zero
     // polls, so SETTLEMENT_WAIT_BUDGET_MS=1 silently disabled settlement polling altogether.
     if (attempt > 0 && waitedMs + delayMs > waitBudgetMs) break
@@ -1181,8 +1220,8 @@ async function requestAiBirthcertVerificationInner(
   const agentName = input.agentName.trim()
 
   // A quote takes NEITHER the request lock NOR the prior-session check, deliberately. Both exist to
-  // stop two paying requests colliding (APP-M02) or one silently orphaning another's receipt
-  // (APP-M01) — neither hazard applies to a call that cannot spend and cannot create a session.
+  // stop two paying requests colliding or one silently orphaning another's receipt —
+  // neither hazard applies to a call that cannot spend and cannot create a session.
   // Routing a quote through them would make preflight unanswerable exactly while a session is in
   // flight, which is when a user most wants to know the price.
   // Refused rather than ignored: a caller who asked to discard AND to quote has contradicted itself,
@@ -1198,7 +1237,7 @@ async function requestAiBirthcertVerificationInner(
   if (input.dryRun) return quoteVerification(deps, agentName, input)
 
   // withRequestLock must be the very next thing that happens, before any await, so a second
-  // concurrent call queues behind this one instead of racing it (APP-M02) — see its docstring.
+  // concurrent call queues behind this one instead of racing it — see its docstring.
   return withRequestLock(() => requestAiBirthcertVerificationLocked(deps, agentName, input))
 }
 
@@ -1230,7 +1269,7 @@ function optionalRequestFields(
 }
 
 async function buildSessionBody(
-  // APP-L01: narrowed to exactly what it uses, so advanceQueuedSettlement no longer needs a
+  // Narrowed to exactly what it uses, so advanceQueuedSettlement no longer needs a
   // `deps as VerifyAiBirthcertDeps` cast to call it — that cast re-widened the very type whose
   // narrowness is what makes "check_ cannot pay" structural rather than a promise.
   deps: Pick<VerifyAiBirthcertDeps, 'publicKeyHex' | 'address' | 'now' | 'holderDid' | 'signHexBlob'>,
@@ -1311,7 +1350,7 @@ async function discardStuckReceiptBeforePaying(
       },
     }
   }
-  // R2-M01's protection, kept: a record with a real sessionId still holds a verification link SSIVC
+  // This protection is kept: a record with a real sessionId still holds a verification link SSIVC
   // issued exactly once. Throwing that away needs its own deliberate confirmation, not a flag on the
   // paying tool — and the user may not need to pay at all, since that session is already bought.
   if (stored.sessionId !== '') {
@@ -1343,7 +1382,225 @@ async function discardStuckReceiptBeforePaying(
   return { discarded: stored.paymentReceipt }
 }
 
+/** {@link checkExistingVerifiedVc}'s verdict. */
+type ExistingVcCheck =
+  | { kind: 'none' }
+  /** A VC exists (cached, or resolved from a prior issued session) but has already expired — replace it automatically, with a notice. */
+  | { kind: 'expired'; note: ExistingVerifiedVcNote }
+  /** A VC exists and is still valid, and the caller has not confirmed replacing it. */
+  | { kind: 'blocked'; result: ExistingVerifiedVcBlocked }
+  /** A prior session reached `issued` but its VC could not be resolved (transient MBI error, subject mismatch, …) — never pay over that uncertainty. */
+  | { kind: 'unresolved'; result: RequestVerificationFailure }
+
+/** Builds the `blocked` verdict for a still-valid existing VC — shared by the cache-hit and session-store-fallback paths below. */
+function existingVcBlocked(note: ExistingVerifiedVcNote): ExistingVerifiedVcBlocked {
+  return {
+    existingVerifiedVc: note,
+    message:
+      `A Verified AI Birthcert already exists for this holder and is still valid` +
+      (note.validUntil ? ` until ${note.validUntil}` : '') +
+      ` (credential id ${note.vcId}). Nothing was paid and no new verification session was started. ` +
+      `Show this to the user before doing anything else. Call request_ai_birthcert_verification ` +
+      `again with confirmReplaceExistingVc set to exactly "${note.vcId}" only if the user explicitly ` +
+      `wants to replace it.`,
+  }
+}
+
+/**
+ * Before this holder pays for a brand-new Verified AI Birthcert session, look up whether
+ * one already exists for them.
+ *
+ * Checks two sources, because neither alone is trustworthy:
+ * - The local `VcCacheStore` (same store `subscribe_and_issue` reads from `deps.cache`, under
+ *   `deps.verifiedTemplateId` — the Verified Birthcert's own templateId, distinct from the Basic
+ *   one's). Holder-scoped and cheap (no network), but can go STALE: it only ever holds what a PRIOR
+ *   `check_ai_birthcert_verification` call downloaded and cached, so it never learns about a session
+ *   that has since reached `issued` without `check_` being called again — this also applies again
+ *   after the auto-replace path itself pays for a fresh session that `check_` never confirms.
+ * - The session store's last confirmed status. If it reached `issued`, its `vcId` is resolved via
+ *   `fetchAndCacheIssuedVc` — the SAME resolution `check_ai_birthcert_verification` itself uses —
+ *   whenever it might be newer than (or absent from) the cache, i.e. whenever the cache is empty or
+ *   holds a DIFFERENT `vcId`. This is what catches that gap: an `issued`
+ *   session always wins over a stale or missing cache entry, and a successful resolution also
+ *   updates the cache, so the next call is a fast cache hit.
+ *
+ * The session store is NOT holder-scoped (unlike the cache) and is never cleared once
+ * a session reaches `issued` — so after switching holders/accounts it can hold a PREVIOUS holder's
+ * issued session. An earlier fix (a subject mismatch inside `fetchAndCacheIssuedVc` means `none`, not
+ * an unresolved refusal) only caught this AFTER a successful download — a session whose VC was never
+ * downloaded at all still slipped through as an unresolved refusal. Fixed at the source
+ * instead: every stored session now records the `holderDid` it was created under, and that is checked
+ * BEFORE any network call — a mismatch, or an absent value (an older record from before this field
+ * existed), is never resolved as "this holder's VC" at all, full stop. `fetchAndCacheIssuedVc`'s own
+ * `foreignHolder` check remains as defense in depth for the rare case a same-`holderDid` record still
+ * names a different subject.
+ *
+ * Reading the session store, or confirming its session's live status, is a
+ * network/filesystem operation that can transiently fail. That must never crash a request a valid
+ * cache hit could have answered on its own — but it also must NEVER be silently treated as "nothing
+ * is stored" when the cache canNOT answer on its own (empty, or expired): swallowing every failure
+ * unconditionally (an earlier fix's first cut) reopened the double-charge hazard this whole check exists to
+ * close, since a single transient error then looked identical to "no session exists". So both lookups
+ * are wrapped, but the catch only swallows the error when the cache already holds a genuinely valid,
+ * unexpired entry (`cacheHasValidAnswer`) — otherwise it rethrows.
+ *
+ * A session still `pending` (or `gone`, or absent) is left alone — `decidePriorSession` already owns
+ * those cases correctly, and duplicating them here would only risk disagreeing with it.
+ *
+ * - Nothing found for this holder, either way: proceed exactly as before.
+ * - Found and expired: `isVcValid` fails closed on a malformed date, so this fires whenever the VC
+ *   is genuinely no longer good — the caller need not (and cannot) confirm anything, since there is
+ *   nothing left to lose by replacing a dead credential.
+ * - Found and still valid: refuse to spend or start a new session unless `confirmReplaceExistingVc`
+ *   echoes back this exact `vcId` — the same "must have been shown the id" pattern as
+ *   `discardStuckReceiptAndPayFresh`, so a caller cannot decide on the holder's behalf to replace a
+ *   still-good credential it was never shown.
+ * - Found (for THIS holder) but could not be resolved for a reason that is not itself proof of "no
+ *   VC" (transient MBI error, no match in the download, missing validUntil): refuse to pay, and name
+ *   a working way out (`clear_stuck_payment_receipt` with `confirmDiscardLiveSession: true`)
+ *   rather than a dead end — silently falling through to `pay_fresh` here is exactly the hazard
+ *   this check exists to close. `cache`/`verifiedTemplateId` being unset entirely is NOT this case — see
+ *   the guard clause below — because there is then no way to check anything at all, for any holder.
+ */
+async function checkExistingVerifiedVc(
+  deps: Pick<
+    VerifyAiBirthcertDeps,
+    'cache' | 'verifiedTemplateId' | 'now' | 'sessionStore' | 'ssivc' | 'mbi' | 'messageSigner' | 'address' | 'holderDid' | 'quarantine' | 'passImagesDir'
+  >,
+  input: RequestAiBirthcertVerificationInput,
+): Promise<ExistingVcCheck> {
+  if (!deps.cache || !deps.verifiedTemplateId) return { kind: 'none' }
+
+  const cached = await deps.cache.get(deps.verifiedTemplateId)
+  // The ONLY safe fallback for a session-store/status-lookup failure is a
+  // cache entry that is ALREADY valid and unexpired — that answer (block, or proceed on an exact
+  // confirm) is correct regardless of what the session store might have said. An empty or EXPIRED
+  // cache entry is not such an answer: silently treating a lookup failure as "nothing to see" there
+  // would resurrect the exact double-charge hazard an earlier fix (swallowing every failure
+  // unconditionally) reopened — a single transient error must not be indistinguishable from "no
+  // session exists".
+  const cacheHasValidAnswer = !!cached?.vcId && isVcValid(cached, deps.now())
+
+  // A transient failure reading the session store, or confirming its
+  // session's status, must never crash a request that a valid cache hit could have answered on its
+  // own — fall back to the cache-only verdict below exactly as if nothing were stored. Anything else
+  // propagates: the caller must not be told "pay, nothing exists" on a hazard we can't rule out.
+  let stored: StoredSsivcSession | null = null
+  try {
+    stored = await deps.sessionStore.get()
+  } catch (err) {
+    if (!cacheHasValidAnswer) throw err
+    stored = null
+  }
+
+  // The session store is NOT holder-scoped (unlike the cache) and is never
+  // cleared once a session reaches `issued`, so it can hold a PREVIOUS holder's session after an
+  // account switch — including one whose VC was never downloaded at all, which the earlier
+  // `foreignHolder`-on-subject-mismatch defense could not catch (that requires a successful download
+  // to even compare a subject). `holderDid` is recorded on the record at write time and checked here
+  // FIRST, before any network call: only ever resolve a stored session as "this holder's" when it
+  // says so explicitly. Absent (an older record written before this field existed) is treated the
+  // same as a mismatch — unverifiable, not evidence either way — so it is never resolved either;
+  // `subjectMatches`/`foreignHolder` inside `fetchAndCacheIssuedVc` remains as defense in depth for
+  // the rare case a same-holderDid record still turns out to name a different subject.
+  if (stored && stored.sessionId !== '' && stored.holderDid === deps.holderDid) {
+    let status: Awaited<ReturnType<typeof getConfirmedStatus>> | undefined
+    try {
+      status = await getConfirmedStatus(deps, stored.sessionId)
+    } catch (err) {
+      if (!cacheHasValidAnswer) throw err
+      status = undefined
+    }
+    if (status !== undefined && status !== 'gone' && status.status === 'issued' && status.vcId) {
+      const vcId = status.vcId
+      // Fast path: the cache already reflects THIS exact vcId, so trust it rather than re-download —
+      // same behaviour as before whenever nothing has changed since the last check_ call.
+      if (!cached || cached.vcId !== vcId) {
+        const resolved = await fetchAndCacheIssuedVc(deps, vcId)
+        if ('cacheError' in resolved) {
+          if (resolved.expired) {
+            return { kind: 'expired', note: { vcId, ...(resolved.validUntil ? { validUntil: resolved.validUntil } : {}) } }
+          }
+          if (!resolved.foreignHolder) {
+            return {
+              kind: 'unresolved',
+              result: {
+                error:
+                  `A Verified AI Birthcert for this holder (credential id ${vcId}) has already been ` +
+                  `issued but could not be confirmed as valid or expired (${resolved.cacheError}). ` +
+                  `Nothing was paid. Call check_ai_birthcert_verification to retry resolving it. If it ` +
+                  `keeps failing the same way, this is not a transient problem — but note this is NOT ` +
+                  `the give-up-before-a-session-exists case clear_stuck_payment_receipt otherwise ` +
+                  `handles: this session already reached "issued", so a credential most likely WAS ` +
+                  `minted from it; only confirming that here failed. Show the user payment receipt ` +
+                  `${stored.paymentReceipt} and, only with their explicit agreement, call ` +
+                  `clear_stuck_payment_receipt with confirmReceiptId set to exactly that id and ` +
+                  `confirmDiscardLiveSession set to true — this clears only this WALLET's local record ` +
+                  `of the session; it does not destroy, undo, or refund any credential that already ` +
+                  `exists. Once cleared, the next request_ai_birthcert_verification pays a SECOND fee ` +
+                  `regardless of whether a credential already exists, so make sure the user understands ` +
+                  `that before agreeing.`,
+              },
+            }
+          }
+          // foreignHolder — this session belongs to a DIFFERENT holder. Fall through
+          // to whatever the cache says for the CURRENT holder (may itself be `none`).
+        } else {
+          const note: ExistingVerifiedVcNote = { vcId, validUntil: resolved.validUntil }
+          if (input.confirmReplaceExistingVc === vcId) return { kind: 'none' }
+          return { kind: 'blocked', result: existingVcBlocked(note) }
+        }
+      }
+    }
+  }
+
+  if (cached && cached.vcId) {
+    const note: ExistingVerifiedVcNote = { vcId: cached.vcId, ...(cached.validUntil ? { validUntil: cached.validUntil } : {}) }
+    if (!isVcValid(cached, deps.now())) return { kind: 'expired', note }
+    if (input.confirmReplaceExistingVc === cached.vcId) return { kind: 'none' }
+    return { kind: 'blocked', result: existingVcBlocked(note) }
+  }
+
+  return { kind: 'none' }
+}
+
+/**
+ * True for every branch of {@link RequestVerificationResult} EXCEPT a refusal (`error` present) —
+ * i.e. a real session, or a payment that was sent and is still settling. `replacedExpiredVc` is
+ * attached whenever `checkExistingVerifiedVc` found the holder's prior VC already expired, on any
+ * non-refusal outcome of THIS call — a fresh session settled synchronously, a payment sent and still
+ * queued (dropping the note on that half meant it never reached the holder
+ * whenever sponsored settlement, the default, doesn't clear immediately), or — more subtly —
+ * `decidePriorSession` simply returning an EARLIER call's still-`pending` session unchanged, with no
+ * new payment on this call at all. The note is accurate in every case (the holder's old VC really is
+ * expired and a replacement really is what's in flight/live), but do NOT read it as "this exact call
+ * spent money" — it does not, on that last branch.
+ */
+function canCarryReplacedExpiredVc(
+  result: RequestVerificationResult,
+): result is (SsivcSessionCreated & { discardedPaymentReceipt?: string }) | RequestVerificationPending {
+  return typeof result === 'object' && result !== null && !('error' in result)
+}
+
 async function requestAiBirthcertVerificationLocked(
+  deps: VerifyAiBirthcertDeps,
+  agentName: string,
+  input: RequestAiBirthcertVerificationInput,
+): Promise<RequestVerificationResult> {
+  // Checked first, inside the lock and before either payment path below (a plain fresh
+  // pay, or discard-then-pay-fresh) — a still-valid cached Verified AI Birthcert VC must reach the
+  // holder before anything is replaced, and an expired one's replacement must say so.
+  const existingVc = await checkExistingVerifiedVc(deps, input)
+  if (existingVc.kind === 'blocked' || existingVc.kind === 'unresolved') return existingVc.result
+
+  const result = await requestAiBirthcertVerificationLockedInner(deps, agentName, input)
+  if (existingVc.kind === 'expired' && canCarryReplacedExpiredVc(result)) {
+    return { ...result, replacedExpiredVc: existingVc.note }
+  }
+  return result
+}
+
+async function requestAiBirthcertVerificationLockedInner(
   deps: VerifyAiBirthcertDeps,
   agentName: string,
   input: RequestAiBirthcertVerificationInput,
@@ -1357,11 +1614,11 @@ async function requestAiBirthcertVerificationLocked(
   if ('refusal' in outcome) return outcome.refusal
 
   // The discarded id exists nowhere else once the store is cleared, and support asks for it first —
-  // so it rides back on every result after the discard, not only the success (R8-M04). Precisely
-  // (R9-M02/R9-M03): as the `discardedPaymentReceipt` FIELD on every returned result, except when the
+  // so it rides back on every result after the discard, not only the success. Precisely:
+  // as the `discardedPaymentReceipt` FIELD on every returned result, except when the
   // call also discarded a second, void receipt of its own — that result already uses the field for
   // the void id, so the confirmed id rides in the `error`/`message` TEXT instead. A throw is the one
-  // exit that carries no result at all, so it is handled separately just below (R9-LOW).
+  // exit that carries no result at all, so it is handled separately just below.
   let result: RequestVerificationResult
   try {
     result = await payOrReplayLocked(deps, agentName, input)
@@ -1403,7 +1660,7 @@ async function payOrReplayLocked(
 
   /**
    * The optional fields this request should carry: what was already paid for, with an explicit
-   * caller value taking precedence (APP-M03).
+   * caller value taking precedence.
    *
    * Earlier work stopped check_ from dropping these, but request_'s own replay path rebuilt the body from
    * `input` alone — so a bare retry (plausible, since check_ is now the advertised resume path)
@@ -1445,9 +1702,10 @@ async function payOrReplayLocked(
         createdAt: deps.now().toISOString(),
         verificationUrl: '',
         paymentReceipt: receipt,
+        holderDid: deps.holderDid,
         // check_ai_birthcert_verification replays this receipt with no user input to work
         // from. Without these the replayed body silently drops whatever the user supplied here.
-        // APP-M03: the EFFECTIVE set, so a bare retry re-persists what was paid for instead of
+        // The EFFECTIVE set, so a bare retry re-persists what was paid for instead of
         // erasing it.
         ...effectiveOptionalFields,
       })
@@ -1464,7 +1722,7 @@ async function payOrReplayLocked(
   // check.
   const requestedGasPayer = input.gasPayer === 'self' || input.gasPayer === 'sponsored' ? input.gasPayer : undefined
 
-  // APP-M01: only the replay path (decision.kind === 'replay_receipt') makes no payment of its own —
+  // Only the replay path (decision.kind === 'replay_receipt') makes no payment of its own —
   // it just resumes a receipt already paid for on a PRIOR call. Every other path runs
   // payAndCreateSession, which calls deps.pay before SSIVC is ever asked to settle, so a
   // SettlementReceiptVoidError surfacing from THIS branch means money may have moved on THIS exact
@@ -1528,10 +1786,11 @@ async function payOrReplayLocked(
           createdAt: deps.now().toISOString(),
           verificationUrl: '',
           paymentReceipt: err.paymentReceipt,
+          holderDid: deps.holderDid,
           ...effectiveOptionalFields,
         })
       } catch {
-        // APP-C02: built independently of err.message, NOT by appending to it. err.message is the
+        // Built independently of err.message, NOT by appending to it. err.message is the
         // happy-path text — "the receipt has been saved … call check_ai_birthcert_verification" —
         // and on this branch both halves are false: the write just failed, so check_ would find
         // nothing and report no_session. This string is the only place the receipt now exists, which
@@ -1554,14 +1813,14 @@ async function payOrReplayLocked(
     // as an unhandled/opaque error either. Report it distinctly so the caller knows retrying blindly
     // won't help and a human may need to check whether the payment actually went through.
     //
-    // R8-M03: this message used to be just the raw SSIVC text, with none of the do-not-retry
+    // This message used to be just the raw SSIVC text, with none of the do-not-retry
     // language the other three money-at-risk branches (receipt-save failure, RECEIPT VOID, OUTCOME
     // UNKNOWN) all carry — leaving the tool description's "exactly as `message` itself will say"
     // false for this one branch. There is no receipt to quote here (SSIVC never returns one on a
     // 409), so the message names agentName instead — the one thing support can actually search on.
     if (isAgentNameInUse(err)) {
       // `paidThisCall` is true on every route that reaches here today (phase 1 cannot return a 409, so
-      // this is always post-payment), but it is passed rather than assumed (R12-C01).
+      // this is always post-payment), but it is passed rather than assumed.
       return { error: agentNameInUseMessage(err, agentName, paidThisCall) }
     }
     if (err instanceof SsivcError && err.kind === 'blob_already_settled') {
@@ -1597,7 +1856,7 @@ async function payOrReplayLocked(
         error:
           `RECEIPT VOID — this payment can no longer be used, and no credential was issued. The ` +
           `payment service has ruled on it: ${err.message}. ` +
-          // APP-M01: on the fresh-pay route, deps.pay already ran earlier in THIS call, before the
+          // On the fresh-pay route, deps.pay already ran earlier in THIS call, before the
           // settlement was later ruled void on a poll — that is a real payment on this call, not a
           // prior one, and must not be denied. Only the replay route truly paid nothing this call.
           (paidThisCall
@@ -1629,12 +1888,12 @@ async function payOrReplayLocked(
       )
       // Age first splits "still in flight" from "never coming back" — but only for an outcome
       // nobody knows. A refusal is a verdict about the request, and age says nothing about a
-      // verdict (R2-C01), so it is answered before the age split rather than inside one half of it.
+      // verdict, so it is answered before the age split rather than inside one half of it.
       // Left age-gated, a long-running outage of exactly the kind this branch exists for would,
       // past the threshold, tell the user "do not retry" and "the fee was most likely already
       // taken" about a receipt SPEC.md REQ-19f says is still recoverable — and point them at
       // clear_stuck_payment_receipt and a second fee.
-      // Checked ahead of the generic rejection too (R3-M01): payment_invalid needs its own
+      // Checked ahead of the generic rejection too: payment_invalid needs its own
       // wording, not the generic one ("that refusal is about the request, not about the
       // settlement" is backwards for a verdict specifically about the payment) and not the
       // young-receipt wording below either (which claims "Nothing is lost" — an unsupported
@@ -1652,7 +1911,7 @@ async function payOrReplayLocked(
           paymentReceipt: err.paymentReceipt,
           settlementPending: true,
           paymentInvalid: true,
-          // R10-M01: paidThisCall, because on the fresh-pay route deps.pay already ran on THIS call
+          // paidThisCall, because on the fresh-pay route deps.pay already ran on THIS call
           // before SSIVC ruled on the receipt. The builder's default wording denies that.
           message: paymentInvalidMessage(err.cause, err.paymentReceipt, age.humanAge, paidThisCall),
         }
@@ -1662,7 +1921,7 @@ async function payOrReplayLocked(
           paymentReceipt: err.paymentReceipt,
           settlementPending: true,
           issuerRejected: true,
-          // R10-M01: see the paymentInvalidMessage call just above.
+          // See the paymentInvalidMessage call just above.
           message: issuerRejectionMessage(err.cause, err.paymentReceipt, age.humanAge, paidThisCall),
         }
       }
@@ -1670,7 +1929,7 @@ async function payOrReplayLocked(
         return {
           paymentReceipt: err.paymentReceipt,
           settlementPending: true,
-          // R10-LOW: the paidThisCall half no longer opens with "Nothing is lost". A fee was spent on
+          // The paidThisCall half does not open with "Nothing is lost". A fee was spent on
           // this very call with an outcome nobody knows yet, so "nothing is lost" sitting against that
           // admission reads as reassurance the wallet cannot give. The replay half keeps it: there
           // nothing WAS spent on this call, which is what makes the phrase true.
@@ -1696,7 +1955,7 @@ async function payOrReplayLocked(
           `receipt ${err.paymentReceipt} could not be determined either way (${err.message}), and has ` +
           `been unresolved for ${age.humanAge} — past the point where it resolves on its own. The fee ` +
           `was most likely already taken and no credential was issued. ` +
-          // R10-LOW: the clause that follows used to start "the receipt is kept" for both halves,
+          // The clause that follows used to start "the receipt is kept" for both halves,
           // which left the paidThisCall half with a lowercase sentence start after a full stop. Each
           // half now carries its own capitalisation.
           (paidThisCall
@@ -1719,8 +1978,9 @@ async function payOrReplayLocked(
     createdAt: deps.now().toISOString(),
     verificationUrl: paid.session.verificationUrl,
     paymentReceipt: paid.paymentReceipt,
+    holderDid: deps.holderDid,
     // Benign today — a record with a real sessionId never replays — but the same latent gap as the
-    // queued writes, so it carries the fields for consistency (APP-M03).
+    // queued writes, so it carries the fields for consistency.
     ...effectiveOptionalFields,
   })
 
@@ -1768,7 +2028,7 @@ async function advanceQueuedSettlement(
 
   let settled: { session: SsivcSessionCreated; paymentReceipt: string }
   try {
-    // APP-M02: a REAL persister, not a no-op. The previous no-op leaned on "resolveSettlement only
+    // A REAL persister, not a no-op. The previous no-op leaned on "resolveSettlement only
     // ever reports the same receipt back for a replay" — an assumption about SSIVC that was never
     // confirmed, sitting right beside the receipt-changed branch that the sibling request_ path wires
     // a real writer into precisely because it can happen (REQ-35). If SSIVC ever does hand back a
@@ -1779,7 +2039,12 @@ async function advanceQueuedSettlement(
     // user has already paid for.
     const persistReplayedReceipt = async (receipt: string): Promise<void> => {
       try {
-        await deps.sessionStore.set({ ...stored, paymentReceipt: receipt })
+        // holderDid is refreshed to the CURRENT deps.holderDid, not
+        // inherited from `...stored` — this replay is being confirmed under the current holder's
+        // identity (buildBody signs with deps.holderDid/signHexBlob), so an unrefreshed tag from a
+        // holder switch mid-settlement would wrongly mark the CURRENT holder's own just-confirmed
+        // session as foreign, letting them pay again over it.
+        await deps.sessionStore.set({ ...stored, paymentReceipt: receipt, holderDid: deps.holderDid })
       } catch {
         // Swallowed deliberately — see above.
       }
@@ -1808,6 +2073,7 @@ async function advanceQueuedSettlement(
       sessionId: settled.session.sessionId,
       verificationUrl: settled.session.verificationUrl,
       paymentReceipt: settled.paymentReceipt,
+      holderDid: deps.holderDid, // Refreshed, not inherited — see persistReplayedReceipt above.
     })
   } catch {
     // Swallowed: the verificationUrl below is still valid and is what the user needs right now.
@@ -1869,7 +2135,7 @@ function unknownSettlementOutcome(
   agentName?: string,
 ): CheckVerificationResult {
   const detail = message ?? unresolvedCause(err)
-  // a taken agentName is a verdict about the NAME, so it is answered before the age split
+  // A taken agentName is a verdict about the NAME, so it is answered before the age split
   // and before the rejection wording (whose "a refusal can clear once the service recovers" is
   // wrong for a name that will never become free). `issuerRejected` because the service was
   // reached and refused the request; the message says what to do instead.
@@ -1880,14 +2146,14 @@ function unknownSettlementOutcome(
       paymentReceipt,
       issuerRejected: true,
       ...(age?.stuck ? { stuckFor: age.humanAge } : {}),
-      // `false`: this helper only serves check_, whose deps have no `pay` (R10-M01).
+      // `false`: this helper only serves check_, whose deps have no `pay`.
       message: agentNameInUseMessage(nameInUse, agentName ?? 'the requested name', false, paymentReceipt),
     }
   }
   const rejection = [cause, err].find(isIssuerRejection)
   const paymentInvalid = [cause, err].find(isPaymentInvalidRejection)
 
-  // Same age-independence as the rejection check below, and checked first (R3-M01): payment_invalid
+  // Same age-independence as the rejection check below, and checked first: payment_invalid
   // must not fall into either the generic rejection wording ("that refusal is about the request,
   // not about the settlement" — backwards for a verdict specifically about the payment) or the
   // young-receipt wording just past it ("nothing has gone wrong and no funds are lost" — an
@@ -1899,17 +2165,17 @@ function unknownSettlementOutcome(
       paymentInvalid: true,
       ...(age?.stuck ? { stuckFor: age.humanAge } : {}),
       // `false`: this helper only ever serves check_, which has no `pay` in its deps at all, so
-      // "no new payment was made" is true here by construction (R10-M01).
+      // "no new payment was made" is true here by construction.
       message: paymentInvalidMessage(paymentInvalid, paymentReceipt, age?.humanAge ?? 'some time', false),
     }
   }
 
-  // Answered BEFORE the age split, not inside its young half (R2-C01). A 4xx is a verdict, not
+  // Answered BEFORE the age split, not inside its young half. A 4xx is a verdict, not
   // silence; the age of the receipt tells you nothing about whether the service refused it. Gating
   // this on youth meant a long outage of exactly the kind this branch exists for flipped, at 24h,
   // into "do not retry" and "the fee was most likely already taken" — about a receipt SPEC.md
   // REQ-19f says is still recoverable, and with clear_stuck_payment_receipt (a second fee) offered
-  // as the way out. The outage that prompted this MR ran 19 hours; five more and the wallet would
+  // as the way out. The outage that prompted this fix ran 19 hours; five more and the wallet would
   // have advised paying twice.
   if (rejection) {
     return {
@@ -1917,7 +2183,7 @@ function unknownSettlementOutcome(
       paymentReceipt,
       issuerRejected: true,
       ...(age?.stuck ? { stuckFor: age.humanAge } : {}),
-      // `false` for the same reason as the paymentInvalid branch above (R10-M01).
+      // `false` for the same reason as the paymentInvalid branch above.
       message: issuerRejectionMessage(rejection, paymentReceipt, age?.humanAge ?? 'some time', false),
     }
   }
@@ -1941,7 +2207,7 @@ function unknownSettlementOutcome(
   return {
     status: 'settlement_pending',
     paymentReceipt,
-    // R2-L01: the machine-readable half of the OUTCOME UNKNOWN verdict. Without it the status alone
+    // The machine-readable half of the OUTCOME UNKNOWN verdict. Without it the status alone
     // reads as "queued, check back later", which is the one piece of advice this branch must not give.
     outcomeUnknown: true,
     ...(age ? { stuckFor: age.humanAge } : {}),
@@ -1968,7 +2234,7 @@ export interface ClearStuckPaymentReceiptInput {
   confirmReceiptId?: string
   /**
    * Second, separate confirmation, required only when the record has become a LIVE session since
-   * the receipt id was issued (R2-M01).
+   * the receipt id was issued.
    *
    * The receipt id alone is not a sufficient token here: `advanceQueuedSettlement` upgrades a stuck
    * record into a real session while leaving `paymentReceipt` unchanged, so an id handed out in
@@ -2017,7 +2283,7 @@ export async function clearStuckPaymentReceipt(
   deps: Pick<VerifyAiBirthcertDeps, 'sessionStore' | 'now' | 'settlementStuckAfterMs'>,
   input: ClearStuckPaymentReceiptInput,
 ): Promise<ClearStuckPaymentReceiptResult> {
-  // APP-M01: same single-slot store request_ and check_ mutate, so the same lock. Without it, this
+  // Same single-slot store request_ and check_ mutate, so the same lock. Without it, this
   // can delete a receipt in the middle of another call's replay — destroying the only handle on a
   // payment that was, at that moment, being successfully settled.
   return withRequestLock(() => clearStuckPaymentReceiptLocked(deps, input))
@@ -2084,7 +2350,7 @@ async function clearStuckPaymentReceiptLocked(
     }
   }
 
-  // R2-M01: the record may have gone LIVE between the two calls — and the path this tool's own
+  // The record may have gone LIVE between the two calls — and the path this tool's own
   // description recommends first ("call check_ai_birthcert_verification instead; it actively
   // advances a queued settlement") is exactly what makes it happen. That upgrade leaves
   // `paymentReceipt` unchanged, so the id from step 1 still matches and the id alone can no longer
@@ -2165,7 +2431,7 @@ async function checkAiBirthcertVerificationInner(deps: CheckDeps): Promise<Check
   // was ever created, so there is no sessionId to look up (SSIVC 301-redirects a lookup against an
   // empty path segment instead of 404ing it). Report this distinctly rather than calling getSession.
   //
-  // APP-M01: this branch MUTATES the store (replay + write), so it takes the same lock request_ does.
+  // This branch MUTATES the store (replay + write), so it takes the same lock request_ does.
   // check_ used to be read-only, which is why it never needed one. Two unlocked replays both win
   // their read and the last write orphans the other's session: one payment, two live SSIVC sessions,
   // and the stored verificationUrl pointing at only one of them. The store is re-read INSIDE the
@@ -2180,6 +2446,138 @@ async function checkAiBirthcertVerificationInner(deps: CheckDeps): Promise<Check
   }
 
   return checkExistingSession(deps, stored)
+}
+
+/**
+ * Fetches, validates and caches the VC for an `issued` session's `vcId` — the same work
+ * `checkAiBirthcertVerificationInner` has always done, extracted so
+ * `checkExistingVerifiedVc` can resolve an issued-but-not-yet-cached VC the identical way, rather
+ * than duplicating MBI's one-shot download semantics with its own logic.
+ *
+ * Does NOT itself consult the cache for an already-cached hit — callers check that first (it's
+ * cheaper, and the two call sites want a `validUntil`-bearing cache hit reported slightly
+ * differently). This only runs the fetch-if-not-quarantined -> validate -> cache path.
+ *
+ * `expired: true` is set on the one cacheError that means "this vcId resolved cleanly to a VC that
+ * has already expired" — distinct from every other cacheError, which means resolution genuinely
+ * could not be completed (transient MBI error, subject mismatch, missing validUntil, unconfigured
+ * cache). Existing callers ignore the flag and keep exactly the same `cacheError` text/shape as
+ * before this was extracted; `checkExistingVerifiedVc` uses it to tell "safe to auto-replace" apart
+ * from "must not silently pay again over an unresolved credential".
+ */
+async function fetchAndCacheIssuedVc(
+  deps: Pick<VerifyAiBirthcertDeps, 'mbi' | 'messageSigner' | 'address' | 'holderDid' | 'verifiedTemplateId' | 'cache' | 'quarantine' | 'passImagesDir'>,
+  vcId: string,
+): Promise<
+  | { vc: unknown; validUntil: string; vcPassImagePaths?: string[] }
+  | { cacheError: string; expired?: true; validUntil?: string; foreignHolder?: true }
+> {
+  if (!deps.verifiedTemplateId || !deps.cache) {
+    return { cacheError: 'AI Birthcert verified-template id is not configured — cannot fetch or cache the credential yet.' }
+  }
+
+  // MBI's /v1/vc/ext/download is one-shot — a second live call for the same vcId
+  // returns 404, not the credential again (SPEC.md §5.4 REQ-25). If a prior call already downloaded
+  // and quarantined this exact vcId, re-validate from that copy instead of hitting MBI again — a
+  // fresh call at this point would just fail, permanently, for no reason.
+  // The store is keyed by vcId, so this lookup either returns THIS vcId's quarantined
+  // download or null — it can never hand back some other agent's entry.
+  //
+  // Locked per vcId: a bare get-then-download-then-set here lets two concurrent callers
+  // for the same vcId (check_ai_birthcert_verification and/or request_'s own pre-check) both miss
+  // the `get` and both hit MBI's one-shot download — one gets a 404. withLock serializes them so
+  // the second (now-queued) caller's `get` sees the first caller's `set`.
+  const quarantineFilePath = deps.quarantine.filePathFor(vcId)
+  const locked = await deps.quarantine.withLock(vcId, async (): Promise<{ entries: MbiVcEntry[] } | { error: string }> => {
+    const quarantined = await deps.quarantine.get(vcId)
+    if (quarantined) return { entries: quarantined.entries as MbiVcEntry[] }
+
+    const auth: MbiVpAuth = await deps.messageSigner(deps.address).then((r) => ({ signedData: r.signBlob, publicKey: r.publicKey }))
+    let downloaded: MbiVcEntry[]
+    try {
+      downloaded = await deps.mbi.downloadVcs({ address: deps.address }, auth)
+    } catch (err) {
+      // This is exactly the "transient MBI error" the tool description already
+      // promises becomes a cacheError, not a throw — so a caller can safely retry check_ai_birthcert_verification.
+      return { error: `failed to fetch credential from MBI: ${err instanceof Error ? err.message : String(err)}` }
+    }
+    // Persist BEFORE any validation below — a rejection or a crash from here on must never destroy
+    // a credential that was already paid for and fetched (SEC-11). Every entry is quarantined, not
+    // just the one matching this vcId, since a single download response can carry more than one VC.
+    await deps.quarantine.set({ vcId, entries: downloaded, downloadedAt: new Date().toISOString() })
+    return { entries: downloaded }
+  })
+  if ('error' in locked) return { cacheError: locked.error }
+  const entries = locked.entries
+
+  const match = entries.find((e) => typeof e.vc === 'object' && e.vc !== null && (e.vc as Record<string, unknown>).id === vcId)
+
+  if (!match) {
+    return {
+      cacheError:
+        `no matching credential found in MBI's download for vcId ${vcId} — raw response ` + `preserved for recovery at ${quarantineFilePath}`,
+    }
+  }
+  if (!subjectMatches(match.vc, deps.holderDid)) {
+    return {
+      cacheError:
+        `downloaded credential subject (${observedSubjectId(match.vc)}) does not match this wallet's ` +
+        `holderDid (${deps.holderDid}) — refusing to cache; raw response preserved for recovery at ` +
+        `${quarantineFilePath}`,
+      // Distinct from every other cacheError below — this one specifically means "this vcId
+      // belongs to a DIFFERENT holder's credential, not this holder's at all", not "this holder's
+      // own credential could not be resolved". A caller pre-checking for an EXISTING VC (as opposed
+      // to check_, which is only ever called for the current holder's own just-created session) must
+      // tell these apart: the session-store record it read is not scoped to the current holder, and
+      // being unable to prove it belongs to them is not evidence that they have no VC of their own.
+      foreignHolder: true,
+    }
+  }
+
+  const validUntil = extractValidUntil(match.vc)
+  if (!validUntil) {
+    return {
+      cacheError:
+        `downloaded credential has no validUntil — refusing to cache indefinitely; raw response ` + `preserved for recovery at ${quarantineFilePath}`,
+    }
+  }
+  // The cache-hit branch above already refuses an expired entry, so caching + returning an
+  // already-expired credential here would make this tool report success on something `prove_identity`
+  // (which applies the same isVcValid gate) refuses — and the next call would reject the cache entry
+  // and land right back here, forever. Reject it once, consistently, instead.
+  if (!isVcValid({ validUntil })) {
+    return {
+      cacheError:
+        `downloaded credential expired at ${validUntil} — refusing to cache or return; raw response ` + `preserved for recovery at ${quarantineFilePath}`,
+      expired: true,
+      validUntil,
+    }
+  }
+
+  // Best-effort: MBI's pass-design PNG(s) for this VC, when configured and present. Never blocks
+  // or fails the (already-validated, already-paid-for) credential above it — a write failure
+  // (e.g. an unwritable pass-images dir) must degrade to undefined rather than reject.
+  const vcPassImagePaths = deps.passImagesDir
+    ? await (async () => {
+        try {
+          const base64Images = extractVcPassBase64(match.extraData)
+          return base64Images ? await writeVcPassImages(deps.passImagesDir!, vcId, base64Images) : undefined
+        } catch {
+          return undefined
+        }
+      })()
+    : undefined
+
+  await deps.cache.set(deps.verifiedTemplateId, {
+    templateId: deps.verifiedTemplateId,
+    vc: match.vc,
+    vcId,
+    issuedAt: new Date().toISOString(),
+    validUntil,
+    ...(vcPassImagePaths ? { vcPassImagePaths } : {}),
+  })
+
+  return { vc: match.vc, validUntil, ...(vcPassImagePaths ? { vcPassImagePaths } : {}) }
 }
 
 /** The ordinary status check for a record that already has a real session id. */
@@ -2212,108 +2610,7 @@ async function checkExistingSession(
     if (cached && cached.vcId === status.vcId && isVcValid(cached)) return { ...status, vc: cached.vc }
   }
 
-  if (!deps.verifiedTemplateId || !deps.cache) {
-    return { ...status, cacheError: 'AI Birthcert verified-template id is not configured — cannot fetch or cache the credential yet.' }
-  }
-
-  // SEC-11/APP-C01: MBI's /v1/vc/ext/download is one-shot — a second live call for the same vcId
-  // returns 404, not the credential again (SPEC.md §5.4 REQ-25). If a prior call already downloaded
-  // and quarantined this exact vcId, re-validate from that copy instead of hitting MBI again — a
-  // fresh call at this point would just fail, permanently, for no reason.
-  // R2-M01: the store is keyed by vcId, so this lookup either returns THIS vcId's quarantined
-  // download or null — it can never hand back some other agent's entry.
-  //
-  // Locked per vcId (APP-L03): a bare get-then-download-then-set here lets two concurrent
-  // check_ai_birthcert_verification calls for the same vcId both miss the `get` and both hit MBI's
-  // one-shot download — one gets a 404. withLock serializes them so the second (now-queued) caller's
-  // `get` sees the first caller's `set`.
-  const quarantineFilePath = deps.quarantine.filePathFor(vcId)
-  const locked = await deps.quarantine.withLock(vcId, async (): Promise<{ entries: MbiVcEntry[] } | { error: string }> => {
-    const quarantined = await deps.quarantine.get(vcId)
-    if (quarantined) return { entries: quarantined.entries as MbiVcEntry[] }
-
-    const auth: MbiVpAuth = await deps.messageSigner(deps.address).then((r) => ({ signedData: r.signBlob, publicKey: r.publicKey }))
-    let downloaded: MbiVcEntry[]
-    try {
-      downloaded = await deps.mbi.downloadVcs({ address: deps.address }, auth)
-    } catch (err) {
-      // APP-L02 (prior review): this is exactly the "transient MBI error" the tool description already
-      // promises becomes a cacheError, not a throw — so a caller can safely retry check_ai_birthcert_verification.
-      return { error: `failed to fetch credential from MBI: ${err instanceof Error ? err.message : String(err)}` }
-    }
-    // Persist BEFORE any validation below — a rejection or a crash from here on must never destroy
-    // a credential that was already paid for and fetched (SEC-11). Every entry is quarantined, not
-    // just the one matching this vcId, since a single download response can carry more than one VC.
-    await deps.quarantine.set({ vcId, entries: downloaded, downloadedAt: new Date().toISOString() })
-    return { entries: downloaded }
-  })
-  if ('error' in locked) return { ...status, cacheError: locked.error }
-  const entries = locked.entries
-
-  const match = entries.find((e) => typeof e.vc === 'object' && e.vc !== null && (e.vc as Record<string, unknown>).id === status.vcId)
-
-  if (!match) {
-    return {
-      ...status,
-      cacheError:
-        `no matching credential found in MBI's download for vcId ${status.vcId} — raw response ` +
-        `preserved for recovery at ${quarantineFilePath}`,
-    }
-  }
-  if (!subjectMatches(match.vc, deps.holderDid)) {
-    return {
-      ...status,
-      cacheError:
-        `downloaded credential subject (${observedSubjectId(match.vc)}) does not match this wallet's ` +
-        `holderDid (${deps.holderDid}) — refusing to cache; raw response preserved for recovery at ` +
-        `${quarantineFilePath}`,
-    }
-  }
-
-  const validUntil = extractValidUntil(match.vc)
-  if (!validUntil) {
-    return {
-      ...status,
-      cacheError:
-        `downloaded credential has no validUntil — refusing to cache indefinitely; raw response ` +
-        `preserved for recovery at ${quarantineFilePath}`,
-    }
-  }
-  // R2-M02: the cache-hit branch above already refuses an expired entry, so caching + returning an
-  // already-expired credential here would make this tool report success on something `prove_identity`
-  // (which applies the same isVcValid gate) refuses — and the next call would reject the cache entry
-  // and land right back here, forever. Reject it once, consistently, instead.
-  if (!isVcValid({ validUntil })) {
-    return {
-      ...status,
-      cacheError:
-        `downloaded credential expired at ${validUntil} — refusing to cache or return; raw response ` +
-        `preserved for recovery at ${quarantineFilePath}`,
-    }
-  }
-
-  // Best-effort: MBI's pass-design PNG(s) for this VC, when configured and present. Never blocks
-  // or fails the (already-validated, already-paid-for) credential above it — a write failure
-  // (e.g. an unwritable pass-images dir) must degrade to undefined rather than reject (APP-M01).
-  const vcPassImagePaths = deps.passImagesDir
-    ? await (async () => {
-        try {
-          const base64Images = extractVcPassBase64(match.extraData)
-          return base64Images ? await writeVcPassImages(deps.passImagesDir!, status.vcId!, base64Images) : undefined
-        } catch {
-          return undefined
-        }
-      })()
-    : undefined
-
-  await deps.cache.set(deps.verifiedTemplateId, {
-    templateId: deps.verifiedTemplateId,
-    vc: match.vc,
-    vcId: status.vcId,
-    issuedAt: new Date().toISOString(),
-    validUntil,
-    ...(vcPassImagePaths ? { vcPassImagePaths } : {}),
-  })
-
-  return { ...status, vc: match.vc, ...(vcPassImagePaths ? { vcPassImagePaths } : {}) }
+  const resolved = await fetchAndCacheIssuedVc(deps, vcId)
+  if ('cacheError' in resolved) return { ...status, cacheError: resolved.cacheError }
+  return { ...status, vc: resolved.vc, ...(resolved.vcPassImagePaths ? { vcPassImagePaths: resolved.vcPassImagePaths } : {}) }
 }

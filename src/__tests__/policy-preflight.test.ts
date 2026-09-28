@@ -1,21 +1,14 @@
 import { describe, it, expect } from 'vitest'
 import { policyPreflight } from '../orchestrator/policy-preflight'
 import type { TemplateRecord } from '../clients/policy-read-client'
+import { ZTP20_V1 } from './fixtures/real-policy-templates'
 
-const TEMPLATE: TemplateRecord = {
-  attributes: [
-    { attributeName: 'x402', attributeType: 'uint' },
-    { attributeName: 'maxTransactionCount', attributeType: 'uint' },
-    { attributeName: 'countWindow', attributeType: 'uint' },
-    { attributeName: 'cumulativeMax', attributeType: 'uint' },
-    { attributeName: 'cumulativeWindow', attributeType: 'uint' },
-    { attributeName: 'velocityCap', attributeType: 'uint' },
-    { attributeName: 'velocityWindow', attributeType: 'uint' },
-    { attributeName: 'assetScope', attributeType: 'string' },
-    { attributeName: 'approvalPolicy', attributeType: 'string' },
-    { attributeName: 'RECIPIENT_LIST', attributeType: 'string' },
-  ],
-}
+/**
+ * The REAL ztp20-v1 template, read from chain. Was an invented one using `uint` and
+ * `RECIPIENT_LIST` — values that cannot exist on chain — which is precisely how the type check and
+ * the empty-list blocker both shipped doing nothing (BT-3000).
+ */
+const TEMPLATE = ZTP20_V1 as unknown as TemplateRecord
 
 /** Every test drives preflight through a stubbed template read — no chain, no network. */
 function depsReturning(result: unknown) {
@@ -25,7 +18,7 @@ function depsReturning(result: unknown) {
 const validDraft = {
   policyKey: 'spend-limits',
   templateId: 'a'.repeat(64),
-  attributes: [{ attributeName: 'x402', attributeType: 'uint', value: '1000000' }],
+  attributes: [{ attributeName: 'perTransactionMax', attributeType: 'NUMBER', value: '1000000' }],
   validFromBlock: '0',
   validToBlock: '0',
 }
@@ -47,11 +40,11 @@ describe('policyPreflight', () => {
 
   it('names an unknown attribute AND lists the valid vocabulary', async () => {
     // The x4O2 typo (letter O) — deploys cleanly on chain and then enforces nothing.
-    const result = await policyPreflight(ok(), draftWith({ attributeName: 'x4O2', attributeType: 'uint', value: '1' }))
+    const result = await policyPreflight(ok(), draftWith({ attributeName: 'x4O2', attributeType: 'NUMBER', value: '1' }))
     expect(result.ready).toBe(false)
     const blocker = result.blockers.find((b) => b.includes('x4O2'))
     expect(blocker).toBeDefined()
-    expect(blocker).toContain('x402')
+    expect(blocker).toContain('cumulativeMax')
     expect(blocker).toContain('maxTransactionCount')
   })
 
@@ -98,14 +91,14 @@ describe('policyPreflight', () => {
     expect(inverted.blockers.join(' ')).toMatch(/after|before/i)
   })
   it('blocks a value that contradicts its declared type', async () => {
-    const result = await policyPreflight(ok(), draftWith({ attributeName: 'x402', attributeType: 'uint', value: 'lots' }))
-    expect(result.blockers.join(' ')).toContain('x402')
+    const result = await policyPreflight(ok(), draftWith({ attributeName: 'cumulativeMax', attributeType: 'NUMBER', value: 'lots' }))
+    expect(result.blockers.join(' ')).toContain('cumulativeMax')
   })
 
   it('reports every blocker at once, not one at a time', async () => {
     const result = await policyPreflight(ok(), {
       ...validDraft,
-      attributes: [{ attributeName: 'nope', attributeType: 'uint', value: 'x' }],
+      attributes: [{ attributeName: 'nope', attributeType: 'NUMBER', value: 'x' }],
       validFromBlock: 'soon',
     })
     expect(result.blockers.length).toBeGreaterThanOrEqual(2)
@@ -118,13 +111,13 @@ describe('policyPreflight', () => {
     const result = await policyPreflight(ok(), validDraft)
     expect(result.ready).toBe(true)
     expect(result.interpretation.length).toBeGreaterThan(0)
-    expect(result.interpretation.join(' ')).toContain('x402')
+    expect(result.interpretation.join(' ')).toContain('perTransactionMax')
   })
 
   it('says a cumulativeMax with no window means LIFETIME, and does not block it', async () => {
     const result = await policyPreflight(
       ok(),
-      draftWith({ attributeName: 'cumulativeMax', attributeType: 'uint', value: '500' }),
+      draftWith({ attributeName: 'cumulativeMax', attributeType: 'NUMBER', value: '500' }),
     )
     // Valid and enforced — just not what "RM500 a month" meant.
     expect(result.ready).toBe(true)
@@ -136,7 +129,7 @@ describe('policyPreflight', () => {
   it('BLOCKS a velocityCap with no window — the opposite rule, deliberately', async () => {
     const result = await policyPreflight(
       ok(),
-      draftWith({ attributeName: 'velocityCap', attributeType: 'uint', value: '5' }),
+      draftWith({ attributeName: 'velocityCap', attributeType: 'NUMBER', value: '5' }),
     )
     expect(result.ready).toBe(false)
     expect(result.blockers.join(' ')).toContain('VALUE_INVALID')
@@ -145,7 +138,7 @@ describe('policyPreflight', () => {
   it('says a maxTransactionCount with no window was NOT ASKED FOR, not "lifetime count"', async () => {
     const result = await policyPreflight(
       ok(),
-      draftWith({ attributeName: 'maxTransactionCount', attributeType: 'uint', value: '10' }),
+      draftWith({ attributeName: 'maxTransactionCount', attributeType: 'NUMBER', value: '10' }),
     )
     expect(result.ready).toBe(true)
     const line = result.interpretation.find((i) => i.includes('maxTransactionCount'))
@@ -156,9 +149,9 @@ describe('policyPreflight', () => {
 
   it('gives the three window rules three DIFFERENT outcomes', async () => {
     // A refactor that collapses them into one "missing window" rule fails here.
-    const cumulative = await policyPreflight(ok(), draftWith({ attributeName: 'cumulativeMax', attributeType: 'uint', value: '500' }))
-    const velocity = await policyPreflight(ok(), draftWith({ attributeName: 'velocityCap', attributeType: 'uint', value: '5' }))
-    const count = await policyPreflight(ok(), draftWith({ attributeName: 'maxTransactionCount', attributeType: 'uint', value: '10' }))
+    const cumulative = await policyPreflight(ok(), draftWith({ attributeName: 'cumulativeMax', attributeType: 'NUMBER', value: '500' }))
+    const velocity = await policyPreflight(ok(), draftWith({ attributeName: 'velocityCap', attributeType: 'NUMBER', value: '5' }))
+    const count = await policyPreflight(ok(), draftWith({ attributeName: 'maxTransactionCount', attributeType: 'NUMBER', value: '10' }))
     expect([cumulative.ready, velocity.ready, count.ready]).toEqual([true, false, true])
     expect(cumulative.interpretation.join(' ')).not.toEqual(count.interpretation.join(' '))
   })
@@ -167,8 +160,8 @@ describe('policyPreflight', () => {
     const result = await policyPreflight(
       ok(),
       draftWith(
-        { attributeName: 'cumulativeMax', attributeType: 'uint', value: '500' },
-        { attributeName: 'cumulativeWindow', attributeType: 'uint', value: '43200' },
+        { attributeName: 'cumulativeMax', attributeType: 'NUMBER', value: '500' },
+        { attributeName: 'cumulativeWindow', attributeType: 'NUMBER', value: '43200' },
       ),
     )
     expect(result.ready).toBe(true)
@@ -180,21 +173,21 @@ describe('policyPreflight', () => {
     expect(line).toMatch(/each|per/i)
   })
 
-  it('blocks an empty _LIST, saying it denies EVERYTHING rather than merely that it is empty', async () => {
+  it('blocks an empty list, saying it denies EVERYTHING rather than merely that it is empty', async () => {
     const result = await policyPreflight(
       ok(),
-      draftWith({ attributeName: 'RECIPIENT_LIST', attributeType: 'string', value: '[]' }),
+      draftWith({ attributeName: 'recipientAllowlist', attributeType: 'ADDRESS_LIST', value: '[]' }),
     )
     expect(result.ready).toBe(false)
-    const blocker = result.blockers.find((b) => b.includes('RECIPIENT_LIST'))
+    const blocker = result.blockers.find((b) => b.includes('recipientAllowlist'))
     expect(blocker).toMatch(/everything/i)
     expect(blocker).not.toMatch(/^.*is empty\.?$/i)
   })
 
-  it('accepts a populated _LIST', async () => {
+  it('accepts a populated list', async () => {
     const result = await policyPreflight(
       ok(),
-      draftWith({ attributeName: 'RECIPIENT_LIST', attributeType: 'string', value: '["ZTX3abc"]' }),
+      draftWith({ attributeName: 'recipientAllowlist', attributeType: 'ADDRESS_LIST', value: '["ZTX3HhtuFyHEczW6jVNJL1sw8fG9Amv5ZkudF"]' }),
     )
     expect(result.ready).toBe(true)
   })
@@ -204,25 +197,43 @@ describe('policyPreflight', () => {
       ok(),
       draftWith(
         { attributeName: 'assetScope', attributeType: 'string', value: 'JMYR' },
-        { attributeName: 'cumulativeWindow', attributeType: 'uint', value: '43200' },
+        { attributeName: 'cumulativeWindow', attributeType: 'NUMBER', value: '43200' },
       ),
     )
     expect(result.ready).toBe(false)
     expect(result.blockers.join(' ')).toContain('NO_ENFORCEABLE_CONSTRAINTS')
   })
 
-  it('describes approvalPolicy as informational and never as a control, without blocking it', async () => {
+  it('describes approvalPolicy as informational WHEN a template declares it', async () => {
+    // NEITHER real template (native-v1, ztp20-v1) declares approvalPolicy or settlementChannel, so
+    // against them this branch never runs — an undeclared attribute is rejected first, correctly.
+    // Whether they exist in v1 at all is an open question for ms-zetrix (BT-3000). The logic is
+    // kept rather than deleted on an assumption, and tested against a template that DOES declare
+    // it, so the behaviour is pinned if such a template appears.
+    const withApproval = {
+      ...ZTP20_V1,
+      attributes: [...ZTP20_V1.attributes, { attributeName: 'approvalPolicy', attributeType: 'STRING' }],
+    }
     const result = await policyPreflight(
-      ok(),
+      depsReturning({ found: true, value: withApproval }),
       draftWith(
-        { attributeName: 'x402', attributeType: 'uint', value: '1000000' },
-        { attributeName: 'approvalPolicy', attributeType: 'string', value: 'manual' },
+        { attributeName: 'perTransactionMax', attributeType: 'NUMBER', value: '1000000' },
+        { attributeName: 'approvalPolicy', attributeType: 'STRING', value: 'manual' },
       ),
     )
     // Writing one is legitimate — believing it restricts anything is not.
     expect(result.ready).toBe(true)
     const line = result.interpretation.find((i) => i.includes('approvalPolicy'))
     expect(line).toMatch(/informational|not enforced|restricts nothing/i)
+  })
+
+  it('rejects approvalPolicy against a REAL template, which does not declare it', async () => {
+    const result = await policyPreflight(
+      ok(),
+      draftWith({ attributeName: 'approvalPolicy', attributeType: 'STRING', value: 'manual' }),
+    )
+    expect(result.ready).toBe(false)
+    expect(result.blockers.join(' ')).toMatch(/not declared by this template/i)
   })
 
   it('never claims what a rule MEANS when the template could not be read', async () => {
@@ -233,7 +244,7 @@ describe('policyPreflight', () => {
     for (const template of [{ found: false }, { error: 'query_failed', detail: 'socket hang up' }]) {
       const result = await policyPreflight(
         depsReturning(template),
-        draftWith({ attributeName: 'x4O2', attributeType: 'uint', value: '1' }),
+        draftWith({ attributeName: 'x4O2', attributeType: 'NUMBER', value: '1' }),
       )
       expect(result.ready).toBe(false)
       expect(result.interpretation.join(' ')).not.toMatch(/is limited to/i)
@@ -247,7 +258,7 @@ describe('policyPreflight', () => {
     // template read does not make them unknowable.
     const result = await policyPreflight(
       depsReturning({ found: false }),
-      draftWith({ attributeName: 'velocityCap', attributeType: 'uint', value: '5' }),
+      draftWith({ attributeName: 'velocityCap', attributeType: 'NUMBER', value: '5' }),
     )
     expect(result.blockers.join(' ')).toContain('VALUE_INVALID')
   })
@@ -294,7 +305,7 @@ describe('policyPreflight', () => {
   it('puts the "nothing here is verified" note FIRST, since it governs what follows', async () => {
     const result = await policyPreflight(
       depsReturning({ found: false }),
-      draftWith({ attributeName: 'cumulativeMax', attributeType: 'uint', value: '500' }),
+      draftWith({ attributeName: 'cumulativeMax', attributeType: 'NUMBER', value: '500' }),
     )
     expect(result.interpretation.length).toBeGreaterThan(1)
     expect(result.interpretation[0]).toMatch(/could not be read|cannot be confirmed/i)

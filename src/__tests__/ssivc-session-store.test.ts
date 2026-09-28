@@ -4,13 +4,16 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createFsSsivcSessionStore } from '../clients/ssivc-session-store'
 
-// R2-L02: only `writeFile`/`rename` are spied; everything else (mkdir/readFile/...) stays real so the
-// round-trip tests below still exercise the actual filesystem.
+// R2-L02: `writeFile`/`rename`/`readFile` are spied but pass through to the real implementation, and
+// everything else (mkdir/rm/...) stays real, so the round-trip tests below still exercise the actual
+// filesystem. `readFile` is wrapped only so a test can inject a single genuine I/O failure
+// (`readFileSpy.mockRejectedValueOnce(...)`) that the real filesystem cannot reliably produce.
 const fsCalls: string[] = []
 vi.mock('node:fs/promises', async () => {
   const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')
   return {
     ...actual,
+    readFile: vi.fn(async (...args: Parameters<typeof actual.readFile>) => actual.readFile(...args)),
     writeFile: vi.fn(async (...args: Parameters<typeof actual.writeFile>) => {
       fsCalls.push('writeFile')
       return actual.writeFile(...args)
@@ -24,6 +27,7 @@ vi.mock('node:fs/promises', async () => {
 const fsp = await import('node:fs/promises')
 const writeFileSpy = vi.mocked(fsp.writeFile)
 const renameSpy = vi.mocked(fsp.rename)
+const readFileSpy = vi.mocked(fsp.readFile)
 
 let dir: string
 
@@ -32,7 +36,15 @@ beforeEach(() => {
   fsCalls.length = 0
   writeFileSpy.mockClear()
   renameSpy.mockClear()
+  readFileSpy.mockClear()
 })
+
+/** A Node.js-style fs error (what `readFile` really rejects with), carrying an errno `code`. */
+function fsError(code: string): NodeJS.ErrnoException {
+  const err = new Error(`${code}: simulated fs failure`) as NodeJS.ErrnoException
+  err.code = code
+  return err
+}
 
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true })
@@ -134,6 +146,32 @@ describe('createFsSsivcSessionStore', () => {
     writeFileSync(filePath, JSON.stringify({ sessionId: 's-1', agentName: 'Old', createdAt: '2026-08-13T09:00:00Z' }))
     const store = createFsSsivcSessionStore(filePath)
     expect(await store.get()).toBeNull()
+  })
+
+  // BT-3009: get() used to map EVERY failure to null, so a genuine I/O error (EPERM, an antivirus
+  // file-lock, ...) read as "no session exists" — checkExistingVerifiedVc would then pay for a
+  // second session for a holder who may already have one. Only "file absent" and "file content
+  // unusable" are safe to report as null; an unknown-state read failure must propagate.
+  it('propagates a genuine read failure (EPERM) instead of reporting no stored session', async () => {
+    const filePath = join(dir, 'ssivc-session.json')
+    const store = createFsSsivcSessionStore(filePath)
+    await store.set(sample)
+    const eperm = fsError('EPERM')
+    readFileSpy.mockRejectedValueOnce(eperm)
+
+    await expect(store.get()).rejects.toBe(eperm)
+    // ...and the failure was a one-off: the stored session is still readable afterwards.
+    expect(await store.get()).toEqual(sample)
+  })
+
+  it('reports no stored session when the read fails with ENOENT (file absent)', async () => {
+    const filePath = join(dir, 'ssivc-session.json')
+    const store = createFsSsivcSessionStore(filePath)
+    await store.set(sample)
+    readFileSpy.mockRejectedValueOnce(fsError('ENOENT'))
+
+    expect(await store.get()).toBeNull()
+    expect(readFileSpy).toHaveBeenCalledTimes(1)
   })
 
   // APP-M02: a crash mid-write must never leave a torn/corrupt file that reads as "no session" and

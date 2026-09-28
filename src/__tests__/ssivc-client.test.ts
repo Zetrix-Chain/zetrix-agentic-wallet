@@ -82,7 +82,7 @@ describe('SsivcClient', () => {
       await expect(ssivc.createSessionSettle(requestBody, 'X')).rejects.toMatchObject({ name: 'SsivcError', httpStatus: 409, kind: 'blob_already_settled' })
     })
 
-    // a 409 that SSIVC labels status_code 26 is a taken agentName, not a settled payment -
+    // BT-2974: a 409 that SSIVC labels status_code 26 is a taken agentName, not a settled payment -
     // the two must not be conflated, because one says "your fee was taken" and the other says no fee was.
     it('classifies a 409 with status_code 26 as kind "agent_name_in_use", not blob_already_settled', async () => {
       vi.stubGlobal('fetch', vi.fn().mockResolvedValue(resp(409, { status_code: '26', errors: ['agentName already in use'] })))

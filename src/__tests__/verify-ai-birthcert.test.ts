@@ -131,7 +131,7 @@ describe('requestAiBirthcertVerification', () => {
     const out = await requestAiBirthcertVerification(deps as never, { agentName: 'Procurement Assistant' })
     expect(sessionStore.set).toHaveBeenCalledWith({
       sessionId: 's-1', agentName: 'Procurement Assistant', createdAt: '2026-08-17T09:00:00.000Z',
-      verificationUrl: 'https://zvg.test/verify/tok', paymentReceipt: 'receipt-1',
+      verificationUrl: 'https://zvg.test/verify/tok', paymentReceipt: 'receipt-1', holderDid: 'did:zid:owner123',
     })
     expect(out).toEqual({ sessionId: 's-1', verificationUrl: 'https://zvg.test/verify/tok', expiresAt: '2026-08-17T09:30:00+00:00', expiresInSeconds: 1800, expiresIn: 'about 30 minutes' })
   })
@@ -250,6 +250,11 @@ describe('requestAiBirthcertVerification', () => {
       verificationUrl: 'https://zvg.test/verify/old-tok', paymentReceipt: 'receipt-old',
     })
     getSession.mockResolvedValue({ sessionId: 's-old', status: 'issued', expiresAt: '2026-08-17T08:30:00+00:00', vcId: 'did:zid:vc-old' })
+    // BT-3009/APP-C01: the cache is empty, so the pre-payment existing-VC check resolves this
+    // issued session's VC via MBI before deciding whether to pay — expired, so it auto-replaces.
+    deps.mbi.downloadVcs.mockResolvedValue([
+      { vc: { id: 'did:zid:vc-old', credentialSubject: { id: 'did:zid:owner123' }, validUntil: '2026-01-01T00:00:00Z' } },
+    ])
 
     await requestAiBirthcertVerification(deps as never, { agentName: 'Procurement Assistant' })
 
@@ -269,6 +274,10 @@ describe('requestAiBirthcertVerification', () => {
       verificationUrl: 'https://zvg.test/verify/old-tok', paymentReceipt: 'receipt-old',
     })
     getSession.mockResolvedValue({ sessionId: 's-old', status: 'issued', expiresAt: '2026-08-17T08:30:00+00:00', vcId: 'did:zid:vc-old' })
+    // BT-3009/APP-C01: same as above — resolved as expired, so the pre-payment check auto-replaces.
+    deps.mbi.downloadVcs.mockResolvedValue([
+      { vc: { id: 'did:zid:vc-old', credentialSubject: { id: 'did:zid:owner123' }, validUntil: '2026-01-01T00:00:00Z' } },
+    ])
 
     await requestAiBirthcertVerification(deps as never, { agentName: 'Procurement Assistant' })
 
@@ -483,10 +492,10 @@ async function runRequestRaw(overrides: Partial<Record<string, unknown>> = {}) {
 // subscribe_and_issue already reports a shortfall as structured `insufficientFunds` alongside its
 // prose reason. This path returned prose only, so a caller had to parse the sentence to learn which
 // asset was short and by how much — and the skill renders guidance per shortfall `reason`.
-// the live incident. SSIVC's expiry was labelled +08:00 (16:11:24) while the wallet's clock -
+// BT-2993: the live incident. SSIVC's expiry was labelled +08:00 (16:11:24) while the wallet's clock -
 // like the host agent's - is naturally UTC. The agent subtracted across the two and reported 8 hours;
 // the true window was 15 minutes. The wallet now hands over the answer itself.
-describe('session expiry is worked out by the wallet, across timezones', () => {
+describe('session expiry is worked out by the wallet, across timezones (BT-2993)', () => {
   const NOW = new Date('2026-09-24T07:56:24Z')
   const expiring = { sessionId: 's-tz', verificationUrl: 'https://zvg.test/verify/tz', expiresAt: '2026-09-24T16:11:24+08:00' }
 
@@ -655,6 +664,515 @@ describe('dryRun: quote without paying (R2)', () => {
   })
 })
 
+describe('an existing Verified Birthcert VC is checked before paying for a new one (BT-3009)', () => {
+  it('no cached VC: proceeds to pay as normal', async () => {
+    const { deps, pay } = makeDeps()
+    deps.cache.get.mockResolvedValue(null)
+
+    const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'Procurement Assistant' })) as Record<string, unknown>
+
+    expect(pay).toHaveBeenCalledTimes(1)
+    expect(out.sessionId).toBe('s-1')
+  })
+
+  it('cached VC is still valid: does not pay, shows the existing VC, and asks for explicit confirmation', async () => {
+    const { deps, pay } = makeDeps()
+    deps.cache.get.mockResolvedValue({
+      templateId: 'did:zid:verified-template',
+      vc: {},
+      vcId: 'did:zid:existing-vc-1',
+      issuedAt: '2026-01-01T00:00:00Z',
+      validUntil: '2027-01-01T00:00:00Z',
+    })
+
+    const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'Procurement Assistant' })) as Record<string, unknown>
+
+    expect(pay).not.toHaveBeenCalled()
+    expect(deps.ssivc.createSessionChallenge).not.toHaveBeenCalled()
+    expect(out.existingVerifiedVc).toEqual({ vcId: 'did:zid:existing-vc-1', validUntil: '2027-01-01T00:00:00Z' })
+    expect(out.message).toMatch(/already exists.*still valid/i)
+    expect(out.message).toContain('did:zid:existing-vc-1')
+    // R1-L01 (round-2 review): pin the wording that says nothing was actually paid, and the exact
+    // confirm instruction (with the id embedded) — not just that the id appears somewhere.
+    expect(out.message).toContain('Nothing was paid')
+    expect(out.message).toContain('confirmReplaceExistingVc set to exactly "did:zid:existing-vc-1"')
+  })
+
+  it('cached VC is still valid, but the caller echoes back its exact vcId to confirm replacement: pays fresh', async () => {
+    const { deps, pay } = makeDeps()
+    deps.cache.get.mockResolvedValue({
+      templateId: 'did:zid:verified-template',
+      vc: {},
+      vcId: 'did:zid:existing-vc-1',
+      issuedAt: '2026-01-01T00:00:00Z',
+      validUntil: '2027-01-01T00:00:00Z',
+    })
+
+    const out = (await requestAiBirthcertVerification(deps as never, {
+      agentName: 'Procurement Assistant',
+      confirmReplaceExistingVc: 'did:zid:existing-vc-1',
+    })) as Record<string, unknown>
+
+    expect(pay).toHaveBeenCalledTimes(1)
+    expect(out.sessionId).toBe('s-1')
+    expect(out.existingVerifiedVc).toBeUndefined()
+  })
+
+  it('cached VC has already expired: pays fresh automatically, but the result says the old one expired', async () => {
+    const { deps, pay } = makeDeps()
+    deps.cache.get.mockResolvedValue({
+      templateId: 'did:zid:verified-template',
+      vc: {},
+      vcId: 'did:zid:expired-vc-1',
+      issuedAt: '2025-01-01T00:00:00Z',
+      validUntil: '2026-01-01T00:00:00Z', // before makeDeps' now() of 2026-08-17
+    })
+
+    const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'Procurement Assistant' })) as Record<string, unknown>
+
+    expect(pay).toHaveBeenCalledTimes(1)
+    expect(out.sessionId).toBe('s-1')
+    expect(out.replacedExpiredVc).toEqual({ vcId: 'did:zid:expired-vc-1', validUntil: '2026-01-01T00:00:00Z' })
+  })
+
+  it('a mismatched confirmReplaceExistingVc is ignored, not treated as confirmation (APP-M02)', async () => {
+    const { deps, pay, createSessionChallenge } = makeDeps()
+    deps.cache.get.mockResolvedValue({
+      templateId: 'did:zid:verified-template',
+      vc: {},
+      vcId: 'did:zid:existing-vc-1',
+      issuedAt: '2026-01-01T00:00:00Z',
+      validUntil: '2027-01-01T00:00:00Z',
+    })
+
+    const out = (await requestAiBirthcertVerification(deps as never, {
+      agentName: 'Procurement Assistant',
+      confirmReplaceExistingVc: 'did:zid:some-other-vc',
+    })) as Record<string, unknown>
+
+    expect(pay).not.toHaveBeenCalled()
+    expect(createSessionChallenge).not.toHaveBeenCalled()
+    expect(out.existingVerifiedVc).toEqual({ vcId: 'did:zid:existing-vc-1', validUntil: '2027-01-01T00:00:00Z' })
+  })
+
+  it('verifiedTemplateId is not configured: skips the check entirely and pays as before (APP-L03)', async () => {
+    const { deps, pay } = makeDeps({ verifiedTemplateId: undefined })
+
+    const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'Procurement Assistant' })) as Record<string, unknown>
+
+    expect(deps.cache.get).not.toHaveBeenCalled()
+    expect(pay).toHaveBeenCalledTimes(1)
+    expect(out.sessionId).toBe('s-1')
+  })
+
+  it('a cached entry with no vcId is treated as no cache hit, not as an existing VC (APP-L03)', async () => {
+    const { deps, pay } = makeDeps()
+    deps.cache.get.mockResolvedValue({ templateId: 'did:zid:verified-template', vc: {}, issuedAt: '2026-01-01T00:00:00Z' })
+
+    const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'Procurement Assistant' })) as Record<string, unknown>
+
+    expect(pay).toHaveBeenCalledTimes(1)
+    expect(out.sessionId).toBe('s-1')
+    expect(out.existingVerifiedVc).toBeUndefined()
+  })
+
+  it('looks the cache up under the Verified template id, not any other key (APP-M03)', async () => {
+    const { deps } = makeDeps()
+    deps.cache.get.mockResolvedValue(null)
+
+    await requestAiBirthcertVerification(deps as never, { agentName: 'Procurement Assistant' })
+
+    expect(deps.cache.get).toHaveBeenCalledWith('did:zid:verified-template')
+  })
+
+  describe('the cache missed but a prior session was already issued (APP-C01)', () => {
+    it('resolves the issued vcId via MBI, finds it still valid: blocks payment and shows it, exactly like a cache hit', async () => {
+      const { deps, pay, createSessionChallenge, sessionStore, getSession } = makeDeps()
+      deps.cache.get.mockResolvedValue(null)
+      await sessionStore.set({ sessionId: 's-prior', agentName: 'Old Name', createdAt: '2026-01-01T00:00:00Z', verificationUrl: 'u', paymentReceipt: 'r', holderDid: 'did:zid:owner123' })
+      getSession.mockResolvedValue({ sessionId: 's-prior', status: 'issued', expiresAt: '2026-01-01T00:30:00Z', vcId: 'did:zid:issued-not-cached' })
+      const vc = { id: 'did:zid:issued-not-cached', credentialSubject: { id: 'did:zid:owner123' }, validUntil: '2027-06-01T00:00:00Z' }
+      deps.mbi.downloadVcs.mockResolvedValue([{ vc }])
+
+      const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'Procurement Assistant' })) as Record<string, unknown>
+
+      expect(pay).not.toHaveBeenCalled()
+      expect(createSessionChallenge).not.toHaveBeenCalled()
+      expect(out.existingVerifiedVc).toEqual({ vcId: 'did:zid:issued-not-cached', validUntil: '2027-06-01T00:00:00Z' })
+      // Resolving it also caches it, so a follow-up call is a cheap cache hit rather than downloading again.
+      expect(deps.cache.set).toHaveBeenCalledWith('did:zid:verified-template', expect.objectContaining({ vcId: 'did:zid:issued-not-cached' }))
+    })
+
+    it('resolves the issued vcId via MBI, finds it already expired: pays fresh automatically with a notice', async () => {
+      const { deps, pay, sessionStore, getSession } = makeDeps()
+      deps.cache.get.mockResolvedValue(null)
+      await sessionStore.set({ sessionId: 's-prior', agentName: 'Old Name', createdAt: '2026-01-01T00:00:00Z', verificationUrl: 'u', paymentReceipt: 'r', holderDid: 'did:zid:owner123' })
+      getSession.mockResolvedValue({ sessionId: 's-prior', status: 'issued', expiresAt: '2026-01-01T00:30:00Z', vcId: 'did:zid:issued-expired' })
+      const vc = { id: 'did:zid:issued-expired', credentialSubject: { id: 'did:zid:owner123' }, validUntil: '2026-01-01T00:00:00Z' }
+      deps.mbi.downloadVcs.mockResolvedValue([{ vc }])
+
+      const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'Procurement Assistant' })) as Record<string, unknown>
+
+      expect(pay).toHaveBeenCalledTimes(1)
+      expect(out.sessionId).toBe('s-1')
+      expect(out.replacedExpiredVc).toEqual({ vcId: 'did:zid:issued-expired', validUntil: '2026-01-01T00:00:00Z' })
+    })
+
+    it('cannot resolve the issued vcId (MBI failure): refuses to pay rather than risk a silent double-issue', async () => {
+      const { deps, pay, createSessionChallenge, sessionStore, getSession } = makeDeps()
+      deps.cache.get.mockResolvedValue(null)
+      await sessionStore.set({ sessionId: 's-prior', agentName: 'Old Name', createdAt: '2026-01-01T00:00:00Z', verificationUrl: 'u', paymentReceipt: 'r', holderDid: 'did:zid:owner123' })
+      getSession.mockResolvedValue({ sessionId: 's-prior', status: 'issued', expiresAt: '2026-01-01T00:30:00Z', vcId: 'did:zid:unresolvable' })
+      deps.mbi.downloadVcs.mockRejectedValue(new Error('MBI unavailable'))
+
+      const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'Procurement Assistant' })) as Record<string, unknown>
+
+      expect(pay).not.toHaveBeenCalled()
+      expect(createSessionChallenge).not.toHaveBeenCalled()
+      expect(out.error).toMatch(/did:zid:unresolvable/)
+      expect(out.error).toMatch(/check_ai_birthcert_verification/)
+    })
+
+    it('does not consult the session store when a session is still pending — decidePriorSession already owns that case', async () => {
+      const { deps, pay, sessionStore, getSession } = makeDeps()
+      deps.cache.get.mockResolvedValue(null)
+      await sessionStore.set({ sessionId: 's-prior', agentName: 'Procurement Assistant', createdAt: '2026-01-01T00:00:00Z', verificationUrl: 'u', paymentReceipt: 'r' })
+      getSession.mockResolvedValue({ sessionId: 's-prior', status: 'pending', expiresAt: '2026-01-01T00:30:00Z' })
+
+      const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'Procurement Assistant' })) as Record<string, unknown>
+
+      expect(pay).not.toHaveBeenCalled()
+      expect(deps.mbi.downloadVcs).not.toHaveBeenCalled()
+      expect(out.sessionId).toBe('s-prior') // still_pending, returned as-is by decidePriorSession
+    })
+
+    // R1-C01 (round-2 review): a stale cached VC must not hide a NEWER issued session's VC. This
+    // happens naturally after the expired-auto-replace path pays for a fresh session and check_ is
+    // never called: the cache still holds the old (expired) entry, while the session store now
+    // points at the new, already-issued one.
+    it('a stale cached VC does not hide a newer issued VC from the session store: shows the newer one (R1-C01)', async () => {
+      const { deps, pay, createSessionChallenge, sessionStore, getSession } = makeDeps()
+      deps.cache.get.mockResolvedValue({
+        templateId: 'did:zid:verified-template', vc: {}, vcId: 'did:zid:stale-vc-a',
+        issuedAt: '2025-01-01T00:00:00Z', validUntil: '2026-01-01T00:00:00Z', // expired relative to makeDeps' now() (2026-08-17)
+      })
+      await sessionStore.set({ sessionId: 's-newer', agentName: 'Procurement Assistant', createdAt: '2026-06-01T00:00:00Z', verificationUrl: 'u', paymentReceipt: 'r', holderDid: 'did:zid:owner123' })
+      getSession.mockResolvedValue({ sessionId: 's-newer', status: 'issued', expiresAt: '2026-06-01T00:30:00Z', vcId: 'did:zid:newer-vc-b' })
+      const vc = { id: 'did:zid:newer-vc-b', credentialSubject: { id: 'did:zid:owner123' }, validUntil: '2027-06-01T00:00:00Z' }
+      deps.mbi.downloadVcs.mockResolvedValue([{ vc }])
+
+      const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'Procurement Assistant' })) as Record<string, unknown>
+
+      expect(pay).not.toHaveBeenCalled()
+      expect(createSessionChallenge).not.toHaveBeenCalled()
+      // Shows the NEWER, still-valid vc-B — not the stale, already-expired cached vc-A.
+      expect(out.existingVerifiedVc).toEqual({ vcId: 'did:zid:newer-vc-b', validUntil: '2027-06-01T00:00:00Z' })
+    })
+
+    it('a stale cached VC vs a newer issued one: confirming the STALE id is not treated as confirmation (R1-M02)', async () => {
+      const { deps, pay, createSessionChallenge, sessionStore, getSession } = makeDeps()
+      deps.cache.get.mockResolvedValue({
+        templateId: 'did:zid:verified-template', vc: {}, vcId: 'did:zid:stale-vc-a',
+        issuedAt: '2025-01-01T00:00:00Z', validUntil: '2026-01-01T00:00:00Z',
+      })
+      await sessionStore.set({ sessionId: 's-newer', agentName: 'Procurement Assistant', createdAt: '2026-06-01T00:00:00Z', verificationUrl: 'u', paymentReceipt: 'r', holderDid: 'did:zid:owner123' })
+      getSession.mockResolvedValue({ sessionId: 's-newer', status: 'issued', expiresAt: '2026-06-01T00:30:00Z', vcId: 'did:zid:newer-vc-b' })
+      const vc = { id: 'did:zid:newer-vc-b', credentialSubject: { id: 'did:zid:owner123' }, validUntil: '2027-06-01T00:00:00Z' }
+      deps.mbi.downloadVcs.mockResolvedValue([{ vc }])
+
+      const out = (await requestAiBirthcertVerification(deps as never, {
+        agentName: 'Procurement Assistant',
+        confirmReplaceExistingVc: 'did:zid:stale-vc-a', // the OLD id, not the one actually shown
+      })) as Record<string, unknown>
+
+      expect(pay).not.toHaveBeenCalled()
+      expect(createSessionChallenge).not.toHaveBeenCalled()
+      expect(out.existingVerifiedVc).toEqual({ vcId: 'did:zid:newer-vc-b', validUntil: '2027-06-01T00:00:00Z' })
+    })
+
+    it('confirming the CORRECT (newer) vcId pays fresh, replacing the newer VC as intended', async () => {
+      const { deps, pay, sessionStore, getSession } = makeDeps()
+      deps.cache.get.mockResolvedValue({
+        templateId: 'did:zid:verified-template', vc: {}, vcId: 'did:zid:stale-vc-a',
+        issuedAt: '2025-01-01T00:00:00Z', validUntil: '2026-01-01T00:00:00Z',
+      })
+      await sessionStore.set({ sessionId: 's-newer', agentName: 'Procurement Assistant', createdAt: '2026-06-01T00:00:00Z', verificationUrl: 'u', paymentReceipt: 'r', holderDid: 'did:zid:owner123' })
+      getSession.mockResolvedValue({ sessionId: 's-newer', status: 'issued', expiresAt: '2026-06-01T00:30:00Z', vcId: 'did:zid:newer-vc-b' })
+      const vc = { id: 'did:zid:newer-vc-b', credentialSubject: { id: 'did:zid:owner123' }, validUntil: '2027-06-01T00:00:00Z' }
+      deps.mbi.downloadVcs.mockResolvedValue([{ vc }])
+
+      const out = (await requestAiBirthcertVerification(deps as never, {
+        agentName: 'Procurement Assistant',
+        confirmReplaceExistingVc: 'did:zid:newer-vc-b',
+      })) as Record<string, unknown>
+
+      expect(pay).toHaveBeenCalledTimes(1)
+      expect(out.sessionId).toBe('s-1')
+    })
+
+    it('when the cache already matches the session store\'s issued vcId and is valid, does not re-download from MBI (fast path preserved)', async () => {
+      const { deps, sessionStore, getSession } = makeDeps()
+      deps.cache.get.mockResolvedValue({
+        templateId: 'did:zid:verified-template', vc: {}, vcId: 'did:zid:in-sync-vc',
+        issuedAt: '2026-01-01T00:00:00Z', validUntil: '2027-01-01T00:00:00Z',
+      })
+      await sessionStore.set({ sessionId: 's-x', agentName: 'Procurement Assistant', createdAt: '2026-01-01T00:00:00Z', verificationUrl: 'u', paymentReceipt: 'r', holderDid: 'did:zid:owner123' })
+      getSession.mockResolvedValue({ sessionId: 's-x', status: 'issued', expiresAt: '2026-01-01T00:30:00Z', vcId: 'did:zid:in-sync-vc' })
+
+      await requestAiBirthcertVerification(deps as never, { agentName: 'Procurement Assistant' })
+
+      expect(deps.mbi.downloadVcs).not.toHaveBeenCalled()
+    })
+
+    // R1-C02/R2-M01 (round-2/round-3 review): the session store is NOT holder-scoped (unlike the VC
+    // cache) and is never cleared once a session reaches "issued". A holder with NO credential of
+    // their own must not be permanently blocked just because the single-slot session store still
+    // holds a PREVIOUS holder's issued session — that regresses AC-1 ("no existing VC -> unchanged")
+    // for anyone who switches holders/accounts. R2-M01: the round-2 fix only caught this via a subject
+    // mismatch AFTER a successful MBI download — a session whose VC was NEVER downloaded at all still
+    // slipped through. The round-3 fix checks the session's recorded `holderDid` FIRST, before any
+    // network call, so this now proceeds to pay without ever calling MBI.
+    it('a previous holder\'s issued session — never downloaded at all — is not treated as this holder\'s VC: proceeds to pay, no MBI call (R2-M01)', async () => {
+      const { deps, pay, createSessionChallenge, sessionStore, getSession } = makeDeps()
+      deps.cache.get.mockResolvedValue(null)
+      await sessionStore.set({
+        sessionId: 's-foreign', agentName: 'Some Prior Holder Agent', createdAt: '2026-01-01T00:00:00Z',
+        verificationUrl: 'u', paymentReceipt: 'r', holderDid: 'did:zid:previous-holder',
+      })
+      getSession.mockResolvedValue({ sessionId: 's-foreign', status: 'issued', expiresAt: '2026-01-01T00:30:00Z', vcId: 'did:zid:foreign-vc' })
+
+      const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'Procurement Assistant' })) as Record<string, unknown>
+
+      expect(deps.mbi.downloadVcs).not.toHaveBeenCalled()
+      expect(pay).toHaveBeenCalledTimes(1)
+      expect(createSessionChallenge).toHaveBeenCalledTimes(1)
+      expect(out.sessionId).toBe('s-1')
+      expect(out.error).toBeUndefined()
+      expect(out.existingVerifiedVc).toBeUndefined()
+    })
+
+    // Defense in depth: even if a record's `holderDid` somehow matches (e.g. one written by an older
+    // build before this field was validated end-to-end) but the downloaded VC's own subject does not,
+    // `fetchAndCacheIssuedVc`'s `foreignHolder` signal must still catch it.
+    it('same holderDid tag but the downloaded VC subject still mismatches: proceeds to pay normally', async () => {
+      const { deps, pay, createSessionChallenge, sessionStore, getSession } = makeDeps()
+      deps.cache.get.mockResolvedValue(null)
+      await sessionStore.set({
+        sessionId: 's-foreign', agentName: 'Some Prior Holder Agent', createdAt: '2026-01-01T00:00:00Z',
+        verificationUrl: 'u', paymentReceipt: 'r', holderDid: 'did:zid:owner123',
+      })
+      getSession.mockResolvedValue({ sessionId: 's-foreign', status: 'issued', expiresAt: '2026-01-01T00:30:00Z', vcId: 'did:zid:foreign-vc' })
+      const vc = { id: 'did:zid:foreign-vc', credentialSubject: { id: 'did:zid:someone-else' }, validUntil: '2027-06-01T00:00:00Z' }
+      deps.mbi.downloadVcs.mockResolvedValue([{ vc }])
+
+      const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'Procurement Assistant' })) as Record<string, unknown>
+
+      expect(pay).toHaveBeenCalledTimes(1)
+      expect(createSessionChallenge).toHaveBeenCalledTimes(1)
+      expect(out.sessionId).toBe('s-1')
+      expect(out.error).toBeUndefined()
+      expect(out.existingVerifiedVc).toBeUndefined()
+    })
+
+    // Legacy records written before `holderDid` existed on the store must never be trusted as "this
+    // holder's" — unverifiable is treated the same as a mismatch, not as a free pass.
+    it('a legacy session record with no holderDid tag at all is not resolved either: proceeds to pay, no MBI call', async () => {
+      const { deps, pay, createSessionChallenge, sessionStore, getSession } = makeDeps()
+      deps.cache.get.mockResolvedValue(null)
+      await sessionStore.set({ sessionId: 's-legacy', agentName: 'Some Agent', createdAt: '2026-01-01T00:00:00Z', verificationUrl: 'u', paymentReceipt: 'r' })
+      getSession.mockResolvedValue({ sessionId: 's-legacy', status: 'issued', expiresAt: '2026-01-01T00:30:00Z', vcId: 'did:zid:legacy-vc' })
+
+      const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'Procurement Assistant' })) as Record<string, unknown>
+
+      expect(deps.mbi.downloadVcs).not.toHaveBeenCalled()
+      expect(pay).toHaveBeenCalledTimes(1)
+      expect(out.sessionId).toBe('s-1')
+    })
+
+    // R2-L02 (round-3 review): a transient failure reading the session store, or confirming its
+    // session's live status, must never crash a request a valid cache hit could have answered.
+    it('a transient session-store failure does not block a cache-hit verdict (R2-L02)', async () => {
+      const { deps, pay } = makeDeps()
+      deps.cache.get.mockResolvedValue({
+        templateId: 'did:zid:verified-template', vc: {}, vcId: 'did:zid:existing-vc-1',
+        issuedAt: '2026-01-01T00:00:00Z', validUntil: '2027-01-01T00:00:00Z',
+      })
+      deps.sessionStore.get.mockRejectedValue(new Error('disk read failed'))
+
+      const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'Procurement Assistant' })) as Record<string, unknown>
+
+      expect(pay).not.toHaveBeenCalled()
+      expect(out.existingVerifiedVc).toEqual({ vcId: 'did:zid:existing-vc-1', validUntil: '2027-01-01T00:00:00Z' })
+    })
+
+    it('a transient getSession failure (for this holder\'s own session) does not block a cache-hit verdict (R2-L02)', async () => {
+      const { deps, pay, sessionStore, getSession } = makeDeps()
+      deps.cache.get.mockResolvedValue({
+        templateId: 'did:zid:verified-template', vc: {}, vcId: 'did:zid:existing-vc-1',
+        issuedAt: '2026-01-01T00:00:00Z', validUntil: '2027-01-01T00:00:00Z',
+      })
+      await sessionStore.set({ sessionId: 's-x', agentName: 'Procurement Assistant', createdAt: '2026-01-01T00:00:00Z', verificationUrl: 'u', paymentReceipt: 'r', holderDid: 'did:zid:owner123' })
+      getSession.mockRejectedValue(new Error('SSIVC unavailable'))
+
+      const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'Procurement Assistant' })) as Record<string, unknown>
+
+      expect(pay).not.toHaveBeenCalled()
+      expect(out.existingVerifiedVc).toEqual({ vcId: 'did:zid:existing-vc-1', validUntil: '2027-01-01T00:00:00Z' })
+    })
+
+    // R2-L01 (round-3 review): pin the "Nothing was paid" reassurance on the unresolved-refusal path
+    // too, mirroring the pin already added for the blocked (still-valid) path.
+    it('the unresolved refusal also says nothing was paid (R2-L01)', async () => {
+      const { deps, sessionStore, getSession } = makeDeps()
+      deps.cache.get.mockResolvedValue(null)
+      await sessionStore.set({ sessionId: 's-prior', agentName: 'Old Name', createdAt: '2026-01-01T00:00:00Z', verificationUrl: 'u', paymentReceipt: 'r', holderDid: 'did:zid:owner123' })
+      getSession.mockResolvedValue({ sessionId: 's-prior', status: 'issued', expiresAt: '2026-01-01T00:30:00Z', vcId: 'did:zid:no-match' })
+      deps.mbi.downloadVcs.mockResolvedValue([])
+
+      const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'Procurement Assistant' })) as Record<string, unknown>
+
+      expect(out.error).toContain('Nothing was paid')
+    })
+
+    // R2-L01 (round-3 review): `replacedExpiredVc` must not be attached on a genuine refusal (e.g. an
+    // unrelated insufficient-funds error) even when an existing VC was found expired.
+    it('replacedExpiredVc is not attached when the fresh payment itself fails', async () => {
+      const { deps, pay } = makeDeps()
+      deps.cache.get.mockResolvedValue({
+        templateId: 'did:zid:verified-template', vc: {}, vcId: 'did:zid:expired-vc-1',
+        issuedAt: '2025-01-01T00:00:00Z', validUntil: '2026-01-01T00:00:00Z',
+      })
+      pay.mockRejectedValue(new PaymentReadinessError('insufficient ZTX for gas', { asset: 'ZTX', required: '100', available: '10', reason: 'gas' }))
+
+      const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'Procurement Assistant' })) as Record<string, unknown>
+
+      expect(out.error).toBeDefined()
+      expect(out.replacedExpiredVc).toBeUndefined()
+    })
+
+    // R3-M01 (round-4 review): R2-L02's fix swallowed EVERY session-store/status-lookup failure
+    // unconditionally, which reopened the double-charge hazard whenever the cache could not itself
+    // supply a safe answer (empty, or expired) — a single transient error then looked identical to
+    // "no session exists". It must propagate instead of being silently treated as "pay fresh".
+    it('a transient session-store failure with an EMPTY cache is NOT swallowed: it propagates rather than paying blindly (R3-M01)', async () => {
+      const { deps, pay } = makeDeps()
+      deps.cache.get.mockResolvedValue(null)
+      deps.sessionStore.get.mockRejectedValue(new Error('disk read failed'))
+
+      await expect(requestAiBirthcertVerification(deps as never, { agentName: 'Procurement Assistant' })).rejects.toThrow(/disk read failed/)
+      expect(pay).not.toHaveBeenCalled()
+    })
+
+    it('a transient session-store failure with an EXPIRED cache entry is NOT swallowed either (R3-M01)', async () => {
+      const { deps, pay } = makeDeps()
+      deps.cache.get.mockResolvedValue({
+        templateId: 'did:zid:verified-template', vc: {}, vcId: 'did:zid:expired-vc-1',
+        issuedAt: '2025-01-01T00:00:00Z', validUntil: '2026-01-01T00:00:00Z',
+      })
+      deps.sessionStore.get.mockRejectedValue(new Error('disk read failed'))
+
+      await expect(requestAiBirthcertVerification(deps as never, { agentName: 'Procurement Assistant' })).rejects.toThrow(/disk read failed/)
+      expect(pay).not.toHaveBeenCalled()
+    })
+
+    it('a transient getSession failure with an EMPTY cache is NOT swallowed (R3-M01)', async () => {
+      const { deps, pay, sessionStore, getSession } = makeDeps()
+      deps.cache.get.mockResolvedValue(null)
+      await sessionStore.set({ sessionId: 's-x', agentName: 'Procurement Assistant', createdAt: '2026-01-01T00:00:00Z', verificationUrl: 'u', paymentReceipt: 'r', holderDid: 'did:zid:owner123' })
+      getSession.mockRejectedValue(new Error('SSIVC unavailable'))
+
+      await expect(requestAiBirthcertVerification(deps as never, { agentName: 'Procurement Assistant' })).rejects.toThrow(/SSIVC unavailable/)
+      expect(pay).not.toHaveBeenCalled()
+    })
+
+    // R3-L01 (round-4 review): the give-up (sponsored-default) record must carry holderDid too — not
+    // just the immediately-settled write already pinned above.
+    it('tags the queued give-up record with the current holderDid on the sponsored (default) path (R3-L01)', async () => {
+      const { deps, sessionStore } = makeDeps({
+        ssivc: {
+          createSessionChallenge: vi.fn().mockResolvedValue({ x402Version: 2, accepts: [sponsoredAccept] }),
+          createSessionSettle: vi.fn().mockResolvedValue({ kind: 'queued', paymentReceipt: 'r-queued', retryAfterSeconds: 1 }),
+          createSessionWithReceipt: vi.fn().mockResolvedValue({ kind: 'queued', paymentReceipt: 'r-queued', retryAfterSeconds: 1 }),
+          getSession: vi.fn(),
+        },
+        sleep: vi.fn().mockResolvedValue(undefined),
+      })
+
+      await requestAiBirthcertVerification(deps as never, { agentName: 'Procurement Assistant' })
+
+      expect(sessionStore.set).toHaveBeenCalledWith(expect.objectContaining({ sessionId: '', paymentReceipt: 'r-queued', holderDid: 'did:zid:owner123' }))
+    })
+
+    // R3-L02 (round-4 review): advanceQueuedSettlement upgrades a give-up record into a real session
+    // by spreading the ORIGINAL stored record — if holderDid isn't refreshed to the CURRENT holder,
+    // a holder switch mid-queue leaves the upgraded record tagged with the OLD holder, so the new
+    // holder's own just-confirmed session would wrongly look "foreign" on the next request and get
+    // paid for again.
+    it('refreshes holderDid (not the stale one from the give-up record) when a queued settlement resolves via check_ (R3-L02)', async () => {
+      const stored: { value: Record<string, unknown> | null } = { value: null }
+      const sessionStore = {
+        get: vi.fn().mockImplementation(async () => stored.value),
+        set: vi.fn().mockImplementation(async (s: Record<string, unknown>) => { stored.value = s }),
+        clear: vi.fn().mockImplementation(async () => { stored.value = null }),
+      }
+      await sessionStore.set({
+        sessionId: '', agentName: 'Procurement Assistant', createdAt: '2026-08-17T08:00:00.000Z',
+        verificationUrl: '', paymentReceipt: 'r-queued', holderDid: 'did:zid:old-holder',
+      })
+      const deps = {
+        ssivc: {
+          createSessionChallenge: vi.fn(),
+          createSessionSettle: vi.fn(),
+          createSessionWithReceipt: vi.fn().mockResolvedValue({
+            kind: 'settled',
+            session: { sessionId: 's-resumed', verificationUrl: 'https://zvg.test/verify/resumed', expiresAt: '2026-08-17T09:30:00+00:00' },
+            paymentReceipt: 'r-queued',
+          }),
+          getSession: vi.fn(),
+        },
+        signHexBlob: vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'b001pk' }),
+        messageSigner: vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'b001pk' }),
+        mbi: { downloadVcs: vi.fn().mockResolvedValue([]) },
+        publicKeyHex: 'b001abec8ba07df4359362f9d2337d3dad3a85a1ae060d7d4e2e2c792106d54cc815344f524b',
+        address: 'ZTX3F7fCN3zDga7qPxwxfpRRXiVa2pDdGCgxw',
+        // The CURRENT holder — different from the give-up record's tag ('did:zid:old-holder'), as
+        // after a holder switch mid-queue.
+        holderDid: 'did:zid:new-holder',
+        now: () => new Date('2026-08-17T09:00:00.000Z'),
+        sessionStore,
+        verifiedTemplateId: 'did:zid:verified-template',
+        cache: { get: vi.fn().mockResolvedValue(null), set: vi.fn(), list: vi.fn() },
+        quarantine: {
+          get: vi.fn().mockResolvedValue(null), set: vi.fn(),
+          filePathFor: vi.fn((vcId: string) => `/state/ssivc-download-quarantine/${vcId}.json`),
+          withLock: vi.fn((_vcId: string, fn: () => Promise<unknown>) => fn()),
+        },
+      }
+
+      await checkAiBirthcertVerification(deps as never)
+
+      expect(sessionStore.set).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 's-resumed', holderDid: 'did:zid:new-holder' }))
+    })
+
+    // R1-M01 (round-2 review): a deterministic (non-transient) resolution failure must not be a dead
+    // end — the refusal must name a working way out.
+    it('an unresolvable issued session names the stuck payment receipt and the clear_stuck_payment_receipt escape hatch (R1-M01)', async () => {
+      const { deps, pay, sessionStore, getSession } = makeDeps()
+      deps.cache.get.mockResolvedValue(null)
+      await sessionStore.set({ sessionId: 's-prior', agentName: 'Old Name', createdAt: '2026-01-01T00:00:00Z', verificationUrl: 'u', paymentReceipt: 'receipt-stuck-1', holderDid: 'did:zid:owner123' })
+      getSession.mockResolvedValue({ sessionId: 's-prior', status: 'issued', expiresAt: '2026-01-01T00:30:00Z', vcId: 'did:zid:no-match-anywhere' })
+      deps.mbi.downloadVcs.mockResolvedValue([]) // no matching entry — deterministic, not transient
+
+      const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'Procurement Assistant' })) as Record<string, unknown>
+
+      expect(pay).not.toHaveBeenCalled()
+      expect(out.error).toMatch(/receipt-stuck-1/)
+      expect(out.error).toMatch(/clear_stuck_payment_receipt/)
+      expect(out.error).toMatch(/confirmDiscardLiveSession/)
+    })
+  })
+})
+
 describe('sponsored settlement retry', () => {
   it('retries with the receipt until settled, then returns the session', async () => {
     const ssivc = {
@@ -734,7 +1252,7 @@ describe('sponsored settlement retry', () => {
       expect(pay).toHaveBeenCalledTimes(1) // never re-paid
     })
 
-    // the agent's own gloss on this state ("this is normal", "will be picked up automatically")
+    // BT-2993: the agent's own gloss on this state ("this is normal", "will be picked up automatically")
     // was the other half of the confusion, so it is handed a sentence to relay instead.
     it('gives the agent a sentence to relay that claims nothing beyond sent / still processing / saved / do not pay again', async () => {
       const out = await runRequestRaw({ ssivc: queuedSsivc(1), sleep: vi.fn().mockResolvedValue(undefined) })
@@ -754,6 +1272,27 @@ describe('sponsored settlement retry', () => {
       expect(out.message).toMatch(/check_ai_birthcert_verification/)
       // Must never read as a failure — this is what the QA-run agent got wrong.
       expect(out.message).not.toMatch(/failed|did not go through/i)
+    })
+
+    // APP-M01 (BT-3009 review): the expired-VC notice was only attached to the immediately-settled
+    // branch. Sponsored gas is the default, and a queued settlement is a normal outcome on that
+    // path — dropping the note there means the holder is never told their old VC expired whenever
+    // settlement doesn't clear synchronously.
+    it('carries replacedExpiredVc even when the fresh payment settles as queued/pending, not immediately (APP-M01)', async () => {
+      const out = await runRequestRaw({
+        ssivc: queuedSsivc(1),
+        sleep: vi.fn().mockResolvedValue(undefined),
+        cache: {
+          get: vi.fn().mockResolvedValue({
+            templateId: 'did:zid:verified-template', vc: {}, vcId: 'did:zid:expired-vc-1',
+            issuedAt: '2025-01-01T00:00:00Z', validUntil: '2026-01-01T00:00:00Z',
+          }),
+          set: vi.fn(), list: vi.fn(),
+        },
+      })
+
+      expect(out.settlementPending).toBe(true)
+      expect(out.replacedExpiredVc).toEqual({ vcId: 'did:zid:expired-vc-1', validUntil: '2026-01-01T00:00:00Z' })
     })
 
     // R2-M02 / R2-M03. The request_ surface had the same rejection branch as check_, and none of
@@ -1474,11 +2013,11 @@ describe('R10: the paid-this-call wording is pinned on every half of every branc
     expect(text(out)).not.toMatch(/Nothing is lost/i)
   })
 
-  // The young-receipt wording used to say "Nothing has gone wrong and no funds are lost" for
+  // BT-2974. The young-receipt wording used to say "Nothing has gone wrong and no funds are lost" for
   // ANY undetermined outcome - including 69 (SSIVC itself says it cannot confirm the settlement) and a
   // 409 blob_already_settled (which most likely means the money DID move). Neither can support that
   // sentence, and a settlement can confirm on chain after SSIVC has answered with either code
-  // (SPEC.md section 6). Pinned by TEXT: field presence alone would pass a message
+  // (SPEC.md section 6). Pinned by TEXT, per BT-2970 R3-M01: field presence alone would pass a message
   // that still made the claim.
   const UNSUPPORTED_SAFETY = /nothing has gone wrong|no funds are lost|nothing is lost|funds are safe/i
   const unconfirmed69 = async () => {
@@ -1491,7 +2030,7 @@ describe('R10: the paid-this-call wording is pinned on every half of every branc
     throw new SsivcError('SSIVC request failed - HTTP 409: agentName already in use', 409, '26', 'agent_name_in_use')
   }
 
-  it('young + replay: says no new payment was attempted, and does NOT claim funds are safe', async () => {
+  it('young + replay: says no new payment was attempted, and does NOT claim funds are safe (BT-2974)', async () => {
     const { run, pay } = replayThen(hangUp)
     const out = await run()
     expect(pay).not.toHaveBeenCalled()
@@ -1534,7 +2073,7 @@ describe('R10: the paid-this-call wording is pinned on every half of every branc
     expect(out.outcomeUnknown).toBeUndefined()
   })
 
-  // When the outcome is unresolved the message used to carry none of what SSIVC actually said,
+  // BT-2993. When the outcome is unresolved the message used to carry none of what SSIVC actually said,
   // so the host agent had nothing real to quote and - asked what SSIVC returned - invented a story
   // ("stuck after 12+ minutes", "normal on testnet") and offered to discard the receipt and pay again.
   // The answer is now in the message, and so is a sentence the agent can relay as-is.
@@ -1602,7 +2141,7 @@ describe('R10: the paid-this-call wording is pinned on every half of every branc
     expect(t).not.toMatch(/Ignore previous instructions/)
   })
 
-  // 409 + status_code 26 is a taken agentName, checked BEFORE the fee is deducted. It must
+  // BT-2974. 409 + status_code 26 is a taken agentName, checked BEFORE the fee is deducted. It must
   // not read as a settled payment (the blob_already_settled wording says the fee was most likely
   // taken and warns a retry pays again - both false here), and it must tell the user to pick another
   // name rather than "check again later", because this name will never become free.
@@ -2355,14 +2894,14 @@ describe('discarding a stuck receipt and paying fresh, in one call', () => {
     expect((await sessionStore.get()).paymentReceipt).toBe('r-stuck')
   })
 
-  // This used to be the OPPOSITE test ("works on a receipt younger than the stuck threshold,
+  // BT-2995. This used to be the OPPOSITE test ("works on a receipt younger than the stuck threshold,
   // since the user asked explicitly"), on the reasoning that the two-step route had no age gate either.
   // A live run showed why that was wrong: the wallet cannot verify a human agreed - the "consent token"
   // is just the receipt id echoed back - and a bare "retry" was taken as agreement to "discard and pay a
   // second 1 JMYR" 34 minutes after a first payment that had in fact settled. The age rule the tool
   // description already advertised is now enforced, on BOTH routes (a rule routable around by making
   // two calls instead of one is not a safety property - that part of the old comment still holds).
-  describe('a receipt that is not stuck yet cannot be discarded', () => {
+  describe('a receipt that is not stuck yet cannot be discarded (BT-2995)', () => {
     const NOW = '2026-08-17T09:00:00.000Z'
 
     it('refuses discardStuckReceiptAndPayFresh on a 34-minute-old receipt: nothing discarded, nothing paid', async () => {
@@ -2665,7 +3204,7 @@ describe('request_ -> pending -> check_ round trip', () => {
 })
 
 describe('clearStuckPaymentReceipt', () => {
-  // the receipts below are genuinely stuck (16 days old); a young one is refused.
+  // BT-2995: the receipts below are genuinely stuck (16 days old); a young one is refused.
   const now = () => new Date('2026-08-17T09:00:00.000Z')
   const stuck = {
     sessionId: '',
