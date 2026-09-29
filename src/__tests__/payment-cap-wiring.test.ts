@@ -27,13 +27,17 @@ describe('buildPayers', () => {
       return async () => (caps === maxPaymentAmount ? 'built-from-maxPaymentAmount' : 'built-from-credentialIssuanceCaps')
     }
 
-    const { pay, payForCredential, preflightCaps } = buildPayers({ maxPaymentAmount, credentialIssuanceCaps }, fakeMakePay)
+    const { pay, payForCredential, payForPolicyWrite, preflightCaps } = buildPayers({ maxPaymentAmount, credentialIssuanceCaps }, fakeMakePay)
 
-    expect(received).toEqual([maxPaymentAmount, credentialIssuanceCaps])
+    // Three consumers now. payForPolicyWrite takes the GENERAL cap, not the credential one: the
+    // credential allowance is granted so a wallet may buy credentials, and a policy write drawing
+    // on it would spend an allowance meant for something else (BT-2793).
+    expect(received).toEqual([maxPaymentAmount, credentialIssuanceCaps, maxPaymentAmount])
     expect(preflightCaps).toBe(credentialIssuanceCaps)
     return Promise.all([
       pay({} as never).then((r) => expect(r).toBe('built-from-maxPaymentAmount')),
       payForCredential({} as never).then((r) => expect(r).toBe('built-from-credentialIssuanceCaps')),
+      payForPolicyWrite({} as never).then((r) => expect(r).toBe('built-from-maxPaymentAmount')),
     ])
   })
 

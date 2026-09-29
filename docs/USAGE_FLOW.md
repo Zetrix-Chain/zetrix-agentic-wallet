@@ -85,10 +85,13 @@ ZTP20 token instead (e.g. `JMYR`). Pass `dryRun: true` to stop right after this 
 
 **A still-valid VC for this `templateId` is cached locally** — call `subscribe_and_issue` again
 later (even after restarting the MCP) and it returns the cached VC directly with `fromCache: true`
-and **no payment made**, instead of paying and issuing again. Pass `forceReissue: true` to bypass
-the cache and pay for a fresh one regardless. You can still hold onto `vc` from the response
-yourself and pass it explicitly on future `prove_identity` calls if you prefer not to rely on
-the cache (e.g. presenting a credential obtained elsewhere).
+and **no payment made**, instead of paying and issuing again. Passing `forceReissue: true` on its
+own does **not** pay for a fresh one — it returns that same cached VC as `{ issued: false,
+fromCache: true, reason }` instead, so it can be shown to you first. Only calling again with
+`confirmReplaceExistingVc` also set to the exact `vcId` you were shown actually pays and reissues.
+You can still hold onto `vc` from the response yourself and pass it explicitly on future
+`prove_identity` calls if you prefer not to rely on the cache (e.g. presenting a credential
+obtained elsewhere).
 
 ---
 

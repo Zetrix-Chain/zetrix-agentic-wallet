@@ -67,6 +67,33 @@ export interface AgenticWalletConfig {
    * not proxy. `undefined` on mainnet for the same reason as {@link policyRegistryAddress}.
    */
   policyTemplateAddress?: string
+  /**
+   * Base URL of the Policy DECISION service (ms-zetrix). Separate from every other URL here
+   * because it is the one endpoint the wallet cannot currently reach: `/policy/**` carries no
+   * entry in the server's `PUBLIC_PATHS`, so it inherits `anyRequest().authenticated()`, and this
+   * wallet holds no BaaS token. `undefined` until POLICY_DECISION_URL is set, which is how a
+   * developer points it at a reachable instance today.
+   */
+  policyDecisionUrl?: string
+  /**
+   * `Authorization` header value for the decision service, when one is available. Optional on
+   * purpose: with none, the call is still made and the 401 is reported as "we could not tell",
+   * which is the honest answer and a far better failure than refusing to try.
+   */
+  policyDecisionAuth?: string
+  /**
+   * Base URL of the pay-gated policy WRITE endpoint.
+   *
+   * Public by construction: the two paths live under `/pay/**`, which is gated by on-chain
+   * payment rather than by a JWT, and the ticket confirmed exactly
+   * `/api/pay/policy/adopt-template` and `…/collect` through ms-public-proxy on 2026-09-24 —
+   * two exact paths, deliberately not a `/policy/**` wildcard.
+   *
+   * Derived per network like every other service URL. Absent on a network where the policy
+   * module is not deployed, so the tool refuses with "nothing was paid" rather than failing
+   * against a guessed host.
+   */
+  policyWriteUrl?: string
   /** ZID resolver base URL (issuer DID → BBS+/Ed25519 verification keys) — auto-derived from network when not set. */
   zidResolverBaseUrl: string
   /**
@@ -179,6 +206,19 @@ export function derivePolicyRegistryAddress(network: string): string | undefined
  * reading a Template contract the Registry does not recognise. Verified live (2026-09-18) as the
  * address the staging Registry itself proxies to.
  */
+/**
+ * The pay-gated policy write host, through ms-public-proxy.
+ *
+ * Testnet is the sandbox proxy, which is where the flow was verified end to end on 2026-09-22.
+ * Mainnet returns undefined for the same reason {@link derivePolicyRegistryAddress} does: the
+ * policy module is NOT enabled there (`POLICY_REGISTRY_ADDRESS` is empty in the prod profile), so
+ * a guessed host would turn "this network has no policy system" into a connection error — and on
+ * a write path, a confusing failure is one a user may respond to by trying again and paying.
+ */
+export function derivePolicyWriteUrl(network: string): string | undefined {
+  return isTestnet(network) ? 'https://public-api-sandbox.zetrix.com/api' : undefined
+}
+
 export function derivePolicyTemplateAddress(network: string): string | undefined {
   return isTestnet(network) ? 'ZTX3WfTbuZwsLQDWe4f7mzrfULiNdDU84BLJ5' : undefined
 }
@@ -321,6 +361,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): AgenticWalletConfig {
   }
 
   const oid4vpBaseUrlOverride = opt('OID4VP_BASE_URL')
+  const policyDecisionUrlOverride = opt('POLICY_DECISION_URL')
+  const policyWriteUrlOverride = opt('POLICY_WRITE_URL')
 
   const explicitCaps = parsePaymentCaps(opt('MAX_PAYMENT_AMOUNT'), {
     resolveSymbol: (symbol) => resolveTokenAddress(symbol, network),
@@ -345,6 +387,11 @@ export function loadConfig(env: NodeJS.ProcessEnv): AgenticWalletConfig {
     templateRegistryAddress: opt('ZETRIX_TEMPLATE_REGISTRY_ADDRESS') ?? deriveTemplateRegistryAddress(network),
     zidResolverBaseUrl: stripTrailingSlash(opt('ZID_RESOLVER_BASE_URL') ?? deriveZidResolverBaseUrl(network)),
     policyRegistryAddress: opt('POLICY_REGISTRY_ADDRESS') ?? derivePolicyRegistryAddress(network),
+    policyDecisionUrl: policyDecisionUrlOverride ? stripTrailingSlash(policyDecisionUrlOverride) : undefined,
+    policyDecisionAuth: opt('POLICY_DECISION_AUTH'),
+    policyWriteUrl: policyWriteUrlOverride
+      ? stripTrailingSlash(policyWriteUrlOverride)
+      : derivePolicyWriteUrl(network),
     policyTemplateAddress: opt('POLICY_TEMPLATE_ADDRESS') ?? derivePolicyTemplateAddress(network),
     // Fail closed: an unset cap means "spend nothing", not "spend anything". A wallet that starts
     // with no configuration at all must not be able to auto-pay a hostile x402 challenge. Raising

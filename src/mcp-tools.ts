@@ -19,6 +19,9 @@
  *   get_policy_template_schema          — free read of a POLICY template's declared vocabulary
  *   get_my_policy                       — free read of the owner's deployed on-chain policies
  *   policy_preflight                    — free validation and plain-words reading of a draft policy
+ *   check_policy_decision               — would this spend be permitted right now? (asks the PDP)
+ *   write_policy                        — deploy a policy on chain, paying the fee over x402
+ *   check_policy_write                  — resume a paid-for policy write from its receipt
  *   transfer_token                      — send native ZTX or any ZTP20 token to an address
  */
 
@@ -50,6 +53,15 @@ import {
   readOwnerPolicies,
 } from './clients/policy-read-client.js'
 import { policyPreflight, unavailableResult, type DraftPolicy } from './orchestrator/policy-preflight.js'
+import { checkPolicyDecision } from './orchestrator/policy-decision.js'
+import type { DecisionRequest, PolicyDecisionClient } from './clients/policy-decision-client.js'
+import {
+  writePolicy,
+  checkPolicyWrite,
+  type CheckPolicyWriteInput,
+  type WritePolicyDeps,
+  type WritePolicyInput,
+} from './orchestrator/write-policy.js'
 import { transferToken, type TransferDeps, type TransferOpts } from './orchestrator/transfer.js'
 
 export interface ToolDeps {
@@ -102,6 +114,20 @@ export interface ToolDeps {
    * believing they already are.
    */
   isValidAddress?: (address: string) => boolean
+  /**
+   * The Policy Decision Point client. Absent when no decision service is configured, which is the
+   * normal state today — see `Config.policyDecisionUrl`. Its absence produces an `undetermined`
+   * answer, never a permitted one.
+   */
+  policyDecisionClient?: PolicyDecisionClient
+  /**
+   * Everything `write_policy` and `check_policy_write` need, assembled in index.ts.
+   *
+   * Absent when no policy write service is configured for this network — its `client` field is
+   * what carries that, so the tools still answer rather than disappearing from the tool list on
+   * one network and not another.
+   */
+  policyWriteDeps?: WritePolicyDeps
   createAccount: CreateAccount
   /**
    * Persists a freshly created account locally so create_holder_account survives a restart.
@@ -454,6 +480,48 @@ export function createTools(deps: ToolDeps) {
         },
         input,
       )
+    },
+
+    /**
+     * Would this spend be permitted right now? Asks the PDP, which is the only party that knows —
+     * the cumulative spend a cap is measured against is off-chain state no contract read can see.
+     *
+     * Free of charge, but NOT free of consequence: an ALLOW reserves capacity for ~15 minutes.
+     */
+    async check_policy_decision(input: DecisionRequest) {
+      return checkPolicyDecision(
+        { client: deps.policyDecisionClient, network: deps.config.network },
+        input,
+      )
+    },
+
+    /**
+     * Deploy a policy on chain, paying the fee over x402. PAYS REAL MONEY.
+     *
+     * Three phases: a free pre-check, a payment that writes nothing, and a collect that polls
+     * until the settlement confirms. Between the second and third the money has moved and no
+     * policy exists — that window is normal, and reporting it as failure is how a caller ends up
+     * paying twice.
+     */
+    async write_policy(input: WritePolicyInput) {
+      if (!deps.policyWriteDeps) {
+        return {
+          state: 'unavailable' as const,
+          message: `Policy writes are not available on ${deps.config.network}. Nothing was paid.`,
+        }
+      }
+      return writePolicy(deps.policyWriteDeps, input)
+    },
+
+    /** Resume phase 3 from a stored receipt. FREE — this tool never pays, on any path. */
+    async check_policy_write(input: CheckPolicyWriteInput = {}) {
+      if (!deps.policyWriteDeps) {
+        return {
+          state: 'unavailable' as const,
+          message: `Policy writes are not available on ${deps.config.network}.`,
+        }
+      }
+      return checkPolicyWrite(deps.policyWriteDeps, input)
     },
 
     /**

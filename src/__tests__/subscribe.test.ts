@@ -726,7 +726,30 @@ describe('subscribeAndIssue', () => {
     }))
   })
 
-  it('forceReissue bypasses a valid cache entry and pays fresh, then overwrites the cache', async () => {
+  it('forceReissue alone (no confirmation) is blocked: shows the existing VC, asks for confirmation, pays nothing', async () => {
+    const mbi = {
+      applyChallenge: vi.fn().mockResolvedValue({ x402Version: 2, accepts: [accept], paymentId: 'pid-1' }),
+      applySettle: vi.fn(),
+    }
+    const sign = vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' })
+    const pay = vi.fn().mockResolvedValue('X-PAYMENT-B64')
+    const resolveSymbol = vi.fn().mockResolvedValue('JMYR')
+    const validCached = {
+      templateId: 'did:zid:t-1', vc: { id: 'old' }, vcId: 'did:zid:vc-old',
+      issuedAt: '2026-01-01T00:00:00Z', validUntil: '2099-01-01T00:00:00Z',
+    }
+    const cache = { get: vi.fn().mockResolvedValue(validCached), set: vi.fn().mockResolvedValue(undefined), list: vi.fn() }
+
+    const out = await subscribeAndIssue({ mbi, sign, pay, resolveSymbol, holderDid, cache }, { ...opts, forceReissue: true })
+
+    expect(pay).not.toHaveBeenCalled()
+    expect(mbi.applyChallenge).not.toHaveBeenCalled()
+    expect(out).toMatchObject({ issued: false, vcId: 'did:zid:vc-old', vc: { id: 'old' }, fromCache: true })
+    expect(out.reason).toContain('did:zid:vc-old')
+    expect(out.reason).toContain('confirmReplaceExistingVc')
+  })
+
+  it('forceReissue with confirmReplaceExistingVc matching the cached vcId pays fresh and overwrites the cache', async () => {
     const mbi = {
       applyChallenge: vi.fn().mockResolvedValue({ x402Version: 2, accepts: [accept], paymentId: 'pid-1' }),
       applySettle: vi.fn().mockResolvedValue({ vcId: 'did:zid:vc-new', txHash: '0xnew', verifiableCredential: { id: 'fresh-vc' } }),
@@ -735,15 +758,205 @@ describe('subscribeAndIssue', () => {
     const pay = vi.fn().mockResolvedValue('X-PAYMENT-B64')
     const resolveSymbol = vi.fn().mockResolvedValue('JMYR')
     const validCached = {
-      templateId: 'did:zid:t-1', vc: { id: 'old' }, issuedAt: '2026-01-01T00:00:00Z', validUntil: '2099-01-01T00:00:00Z',
+      templateId: 'did:zid:t-1', vc: { id: 'old' }, vcId: 'did:zid:vc-old',
+      issuedAt: '2026-01-01T00:00:00Z', validUntil: '2099-01-01T00:00:00Z',
     }
     const cache = { get: vi.fn().mockResolvedValue(validCached), set: vi.fn().mockResolvedValue(undefined), list: vi.fn() }
 
-    const out = await subscribeAndIssue({ mbi, sign, pay, resolveSymbol, holderDid, cache }, { ...opts, forceReissue: true })
+    const out = await subscribeAndIssue(
+      { mbi, sign, pay, resolveSymbol, holderDid, cache },
+      { ...opts, forceReissue: true, confirmReplaceExistingVc: 'did:zid:vc-old' },
+    )
 
     expect(pay).toHaveBeenCalled()
     expect(out).toMatchObject({ issued: true, vc: { id: 'fresh-vc' }, vcId: 'did:zid:vc-new' })
     expect(cache.set).toHaveBeenCalledWith('did:zid:t-1', expect.objectContaining({ vc: { id: 'fresh-vc' } }))
+  })
+
+  it('forceReissue with a mismatched/stale confirmReplaceExistingVc is not treated as confirmation: pays nothing', async () => {
+    const mbi = {
+      applyChallenge: vi.fn().mockResolvedValue({ x402Version: 2, accepts: [accept], paymentId: 'pid-1' }),
+      applySettle: vi.fn(),
+    }
+    const sign = vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' })
+    const pay = vi.fn().mockResolvedValue('X-PAYMENT-B64')
+    const validCached = {
+      templateId: 'did:zid:t-1', vc: { id: 'old' }, vcId: 'did:zid:vc-old',
+      issuedAt: '2026-01-01T00:00:00Z', validUntil: '2099-01-01T00:00:00Z',
+    }
+    const cache = { get: vi.fn().mockResolvedValue(validCached), set: vi.fn().mockResolvedValue(undefined), list: vi.fn() }
+
+    const out = await subscribeAndIssue(
+      { mbi, sign, pay, holderDid, cache },
+      { ...opts, forceReissue: true, confirmReplaceExistingVc: 'did:zid:some-other-vc' },
+    )
+
+    expect(pay).not.toHaveBeenCalled()
+    expect(out).toMatchObject({ issued: false, vcId: 'did:zid:vc-old', fromCache: true })
+  })
+
+  it('without forceReissue, a valid cache hit is still served automatically (unchanged) even if confirmReplaceExistingVc happens to be set', async () => {
+    const mbi = { applyChallenge: vi.fn(), applySettle: vi.fn() }
+    const sign = vi.fn()
+    const pay = vi.fn()
+    const validCached = {
+      templateId: 'did:zid:t-1', vc: { id: 'old' }, vcId: 'did:zid:vc-old',
+      issuedAt: '2026-01-01T00:00:00Z', validUntil: '2099-01-01T00:00:00Z',
+    }
+    const cache = { get: vi.fn().mockResolvedValue(validCached), set: vi.fn().mockResolvedValue(undefined), list: vi.fn() }
+
+    const out = await subscribeAndIssue({ mbi, sign, pay, holderDid, cache }, { ...opts, confirmReplaceExistingVc: 'did:zid:vc-old' })
+
+    expect(pay).not.toHaveBeenCalled()
+    expect(out).toMatchObject({ issued: true, vc: { id: 'old' }, vcId: 'did:zid:vc-old', fromCache: true })
+  })
+
+  // A cached entry can be valid but carry no `vcId` (an older record, or a writer that omitted it)
+  // — the gate falls back to the VC document's own `id`, and must still fail CLOSED (no pay)
+  // without the matching confirmation.
+  it('a valid cached VC with no recorded vcId falls back to the VC document\'s own id, and still refuses without confirmation', async () => {
+    const mbi = { applyChallenge: vi.fn(), applySettle: vi.fn() }
+    const sign = vi.fn()
+    const pay = vi.fn()
+    const validCachedNoVcId = {
+      templateId: 'did:zid:t-1', vc: { id: 'did:zid:vc-from-body' },
+      issuedAt: '2026-01-01T00:00:00Z', validUntil: '2099-01-01T00:00:00Z',
+    }
+    const cache = { get: vi.fn().mockResolvedValue(validCachedNoVcId), set: vi.fn().mockResolvedValue(undefined), list: vi.fn() }
+
+    const out = await subscribeAndIssue({ mbi, sign, pay, holderDid, cache }, { ...opts, forceReissue: true })
+
+    expect(pay).not.toHaveBeenCalled()
+    expect(mbi.applyChallenge).not.toHaveBeenCalled()
+    expect(out.issued).toBe(false)
+    // R1-L01: the blocked response must carry the fallback id under `vcId` too, not only in `reason`
+    // text — docs/tool description all point the model at a `vcId` field to echo back.
+    expect(out.vcId).toBe('did:zid:vc-from-body')
+  })
+
+  it('a valid cached VC with no recorded vcId, confirmed against the VC document\'s own id, pays fresh', async () => {
+    const mbi = {
+      applyChallenge: vi.fn().mockResolvedValue({ x402Version: 2, accepts: [accept], paymentId: 'pid-1' }),
+      applySettle: vi.fn().mockResolvedValue({ vcId: 'did:zid:vc-new', txHash: '0xnew', verifiableCredential: { id: 'fresh-vc' } }),
+    }
+    const sign = vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' })
+    const pay = vi.fn().mockResolvedValue('X-PAYMENT-B64')
+    const validCachedNoVcId = {
+      templateId: 'did:zid:t-1', vc: { id: 'did:zid:vc-from-body' },
+      issuedAt: '2026-01-01T00:00:00Z', validUntil: '2099-01-01T00:00:00Z',
+    }
+    const cache = { get: vi.fn().mockResolvedValue(validCachedNoVcId), set: vi.fn().mockResolvedValue(undefined), list: vi.fn() }
+
+    const out = await subscribeAndIssue(
+      { mbi, sign, pay, holderDid, cache },
+      { ...opts, forceReissue: true, confirmReplaceExistingVc: 'did:zid:vc-from-body' },
+    )
+
+    expect(pay).toHaveBeenCalled()
+    expect(out).toMatchObject({ issued: true, vc: { id: 'fresh-vc' } })
+  })
+
+  // R1-M01 (round-3 review): distinct from the fallback tests above — this cached entry has NO
+  // usable id anywhere (`vcId` absent, `vc` carries none either), so it must reach the true
+  // "refuse outright" branch, not the fallback-then-mismatch branch. Genuinely rare (every real
+  // MBI-issued VC has an `id`), but the refusal code path itself needs its own test or its removal
+  // would silently reopen the fail-open this whole gate exists to close.
+  it('a valid cached VC with NO usable id anywhere (no vcId, no vc.id) refuses to replace it at all, even with forceReissue', async () => {
+    const mbi = { applyChallenge: vi.fn(), applySettle: vi.fn() }
+    const sign = vi.fn()
+    const pay = vi.fn()
+    const validCachedNoUsableId = {
+      templateId: 'did:zid:t-1', vc: {},
+      issuedAt: '2026-01-01T00:00:00Z', validUntil: '2099-01-01T00:00:00Z',
+    }
+    const cache = { get: vi.fn().mockResolvedValue(validCachedNoUsableId), set: vi.fn().mockResolvedValue(undefined), list: vi.fn() }
+
+    const out = await subscribeAndIssue({ mbi, sign, pay, holderDid, cache }, { ...opts, forceReissue: true })
+
+    expect(pay).not.toHaveBeenCalled()
+    expect(mbi.applyChallenge).not.toHaveBeenCalled()
+    expect(out).toMatchObject({ issued: false })
+    expect(out.reason).toContain('no confirmable credential id')
+    // Confirming with ANY value must not bypass this — there is nothing to confirm against.
+    const outWithConfirm = await subscribeAndIssue(
+      { mbi, sign, pay, holderDid, cache },
+      { ...opts, forceReissue: true, confirmReplaceExistingVc: 'anything' },
+    )
+    expect(pay).not.toHaveBeenCalled()
+    expect(outWithConfirm.issued).toBe(false)
+  })
+
+  // APP-M02 (round-2 review): forceReissue must still be a no-op against an expired or empty
+  // cache — pays fresh exactly as it always did with no cached VC to protect.
+  it('forceReissue against an EXPIRED cache entry still pays fresh and overwrites the cache (APP-M02)', async () => {
+    const mbi = {
+      applyChallenge: vi.fn().mockResolvedValue({ x402Version: 2, accepts: [accept], paymentId: 'pid-1' }),
+      applySettle: vi.fn().mockResolvedValue({ vcId: 'did:zid:vc-new', txHash: '0xnew', verifiableCredential: { id: 'fresh-vc' } }),
+    }
+    const sign = vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' })
+    const pay = vi.fn().mockResolvedValue('X-PAYMENT-B64')
+    const expiredCached = {
+      templateId: 'did:zid:t-1', vc: { id: 'old' }, vcId: 'did:zid:vc-old',
+      issuedAt: '2020-01-01T00:00:00Z', validUntil: '2020-02-01T00:00:00Z',
+    }
+    const cache = { get: vi.fn().mockResolvedValue(expiredCached), set: vi.fn().mockResolvedValue(undefined), list: vi.fn() }
+
+    const out = await subscribeAndIssue({ mbi, sign, pay, holderDid, cache }, { ...opts, forceReissue: true })
+
+    expect(pay).toHaveBeenCalled()
+    expect(out).toMatchObject({ issued: true, vc: { id: 'fresh-vc' } })
+    expect(cache.set).toHaveBeenCalledWith('did:zid:t-1', expect.objectContaining({ vc: { id: 'fresh-vc' } }))
+  })
+
+  it('forceReissue against an EMPTY cache still pays fresh (APP-M02)', async () => {
+    const mbi = {
+      applyChallenge: vi.fn().mockResolvedValue({ x402Version: 2, accepts: [accept], paymentId: 'pid-1' }),
+      applySettle: vi.fn().mockResolvedValue({ vcId: 'did:zid:vc-new', txHash: '0xnew', verifiableCredential: { id: 'fresh-vc' } }),
+    }
+    const sign = vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' })
+    const pay = vi.fn().mockResolvedValue('X-PAYMENT-B64')
+    const cache = { get: vi.fn().mockResolvedValue(null), set: vi.fn().mockResolvedValue(undefined), list: vi.fn() }
+
+    const out = await subscribeAndIssue({ mbi, sign, pay, holderDid, cache }, { ...opts, forceReissue: true })
+
+    expect(pay).toHaveBeenCalled()
+    expect(out).toMatchObject({ issued: true, vc: { id: 'fresh-vc' } })
+  })
+
+  // APP-L04 (round-2 review): the cache-hit and blocked-replace responses must carry the cached
+  // pass-design image too, not only a fresh issuance — otherwise the "show the pass design" tool
+  // instruction has nothing to act on whenever the VC came from cache.
+  it('a plain cache hit carries the cached vcPassImagePaths (APP-L04)', async () => {
+    const mbi = { applyChallenge: vi.fn(), applySettle: vi.fn() }
+    const sign = vi.fn()
+    const pay = vi.fn()
+    const validCached = {
+      templateId: 'did:zid:t-1', vc: { id: 'old' }, vcId: 'did:zid:vc-old',
+      issuedAt: '2026-01-01T00:00:00Z', validUntil: '2099-01-01T00:00:00Z',
+      vcPassImagePaths: ['/state/vc-pass/did:zid:vc-old-0.png'],
+    }
+    const cache = { get: vi.fn().mockResolvedValue(validCached), set: vi.fn().mockResolvedValue(undefined), list: vi.fn() }
+
+    const out = await subscribeAndIssue({ mbi, sign, pay, holderDid, cache }, opts)
+
+    expect(out.vcPassImagePaths).toEqual(['/state/vc-pass/did:zid:vc-old-0.png'])
+  })
+
+  it('the blocked (forceReissue, unconfirmed) response also carries the cached vcPassImagePaths (APP-L04)', async () => {
+    const mbi = { applyChallenge: vi.fn(), applySettle: vi.fn() }
+    const sign = vi.fn()
+    const pay = vi.fn()
+    const validCached = {
+      templateId: 'did:zid:t-1', vc: { id: 'old' }, vcId: 'did:zid:vc-old',
+      issuedAt: '2026-01-01T00:00:00Z', validUntil: '2099-01-01T00:00:00Z',
+      vcPassImagePaths: ['/state/vc-pass/did:zid:vc-old-0.png'],
+    }
+    const cache = { get: vi.fn().mockResolvedValue(validCached), set: vi.fn().mockResolvedValue(undefined), list: vi.fn() }
+
+    const out = await subscribeAndIssue({ mbi, sign, pay, holderDid, cache }, { ...opts, forceReissue: true })
+
+    expect(out.issued).toBe(false)
+    expect(out.vcPassImagePaths).toEqual(['/state/vc-pass/did:zid:vc-old-0.png'])
   })
 
   it('short-circuits on a free template that MBI issues synchronously at phase 1 (challenge.issued), without calling pay/applySettle', async () => {

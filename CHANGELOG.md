@@ -8,6 +8,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > Entries for 0.5.0 and earlier were reconstructed from commit history when this file was
 > introduced in 0.6.0, so they summarise each release rather than being exhaustive.
 
+## [0.13.0] — 29 September 2026
+
+### Added
+
+- **`check_policy_decision` — ask whether a specific spend is permitted right now.** The one policy
+  question no chain read can answer, because a cap is measured against cumulative spend held
+  off-chain. Three outcomes: `permitted`, `refused` and `undetermined`, where undetermined is
+  neither a refusal nor permission — it means nothing was evaluated, and every failure produces it,
+  so no transport error, bad envelope or unknown verdict can ever yield a permitted answer. There is
+  no step-up verdict, because the decision service has none.
+
+  **A permitted answer reserves the owner's budget for fifteen minutes**, with no way to release it
+  early, so the tool tells the agent not to poll it and not to probe amounts — every permitted
+  answer along the way reserves again, and the owner's next real payment can be refused by their own
+  agent. New optional settings: `POLICY_DECISION_URL` and `POLICY_DECISION_AUTH`. Without a URL the
+  tool answers `undetermined` and says so, rather than failing against a guessed host.
+- **`write_policy` / `check_policy_write` — deploy a spending policy on chain, pay-gated over x402.**
+  Three phases: a free pre-check, a payment that writes nothing, and a collect that finishes the
+  write once the settlement confirms. Two tools rather than one, because the settlement queue can
+  outlast a single call. A `202` here is not a failure — between the payment and a confirmed
+  settlement, a payment has been made and no policy exists yet, and that window is the normal case;
+  `settling` and `submitted` both mean a payment has been made, so the agent is told to call
+  `check_policy_write` rather than retry `write_policy`. `submitted` carries a `txHash` and is still
+  not a written policy — the block hasn't confirmed it. A `receipt_void` result is the one state
+  where paying again is correct.
+
+### Fixed
+
+- **The wallet's own follow-up guidance no longer promises the agent will "check again shortly" on
+  its own.** QA saw an agent claim it had "set up an automation to check every 60 seconds" after a
+  Verified AI Birthcert session came back pending — no such capability exists. Investigation found
+  the wallet's own ready-made "Tell the user:" sentences ended the same way, and the new hardening
+  text in the tool descriptions had nowhere near the reach of a sentence the model is told to relay
+  verbatim. Every such sentence now asks the user to message back, never claims the agent will act
+  between messages, and — since a link that has already expired (or is about to) makes "message back
+  in a few minutes" actively wrong — the wording now depends on how much time is actually left on the
+  verification link.
+- **`request_ai_birthcert_verification` and `subscribe_and_issue` now explicitly instruct the agent
+  to ask the human owner for an agent name, rather than inventing one.** The same QA session showed
+  an agent silently picking its own agent name in both the Verified and Basic AI Birthcert flows.
+  The "ask the user, never invent" rule previously lived only in a skill-layer document that not
+  every MCP client loads; it is now in the MCP tool schemas themselves, including at the specific
+  field the model fills in.
+
 ## [0.12.3] — 28 September 2026
 
 ### Fixed

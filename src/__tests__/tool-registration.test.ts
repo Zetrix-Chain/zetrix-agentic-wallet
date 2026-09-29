@@ -40,13 +40,14 @@ function moneySentences(): { tool: string; path: string; sentence: string }[] {
 }
 
 describe('buildToolList', () => {
-  it('exposes exactly the 15 agent tools with the correct required inputs', () => {
+  it('exposes exactly the 18 agent tools with the correct required inputs', () => {
     const tools = buildToolList()
     expect(tools.map((t) => t.name).sort()).toEqual([
-      'check_ai_birthcert_verification', 'clear_stuck_payment_receipt', 'create_holder_account', 'credential_preflight',
-      'get_my_policy', 'get_policy_template_schema', 'get_template_schema', 'pay_and_fetch', 'policy_preflight',
-      'prove_identity', 'query_contract', 'request_ai_birthcert_verification', 'subscribe_and_issue',
-      'transfer_token', 'wallet_status',
+      'check_ai_birthcert_verification', 'check_policy_decision', 'check_policy_write', 'clear_stuck_payment_receipt',
+      'create_holder_account', 'credential_preflight', 'get_my_policy', 'get_policy_template_schema',
+      'get_template_schema', 'pay_and_fetch', 'policy_preflight', 'prove_identity',
+      'query_contract', 'request_ai_birthcert_verification', 'subscribe_and_issue', 'transfer_token',
+      'wallet_status', 'write_policy',
     ])
 
     const byName = Object.fromEntries(tools.map((t) => [t.name, t]))
@@ -817,5 +818,55 @@ describe('the docs agree with the tool descriptions about money', () => {
         /payment is safe|funds are safe|unspent|has not been spent|was not charged/i,
       )
     }
+  })
+
+  // BT-3029 round-1 review, LOW finding 5: the exact-snapshot test above pins wording, but a future
+  // fixture edit that dropped a rule's WORDS while keeping the fixture in sync with the code would
+  // sail through it silently. These are semantic (regex) guards on the underlying rule, independent
+  // of exact phrasing, so either rule going missing from any of these surfaces fails on its own merit.
+  describe('the no-fabricated-follow-up and ask-for-agentName rules survive independently of exact wording', () => {
+    const NO_AUTO_FOLLOWUP = /no background[/ ]?(automatic )?polling|nothing keeps running after|no automatic re-check/i
+    const ASK_FOR_NAME = /ask the human owner directly|ALWAYS ask the human owner/i
+
+    it.each([
+      ['request_ai_birthcert_verification', 'description'],
+      ['check_ai_birthcert_verification', 'description'],
+    ])('%s.%s states the no-fabricated-follow-up rule', (tool, path) => {
+      const hit = agentStrings(tool).find((s) => s.path === path)
+      expect(hit?.text, `${tool}.${path} is missing`).toBeDefined()
+      expect(hit!.text).toMatch(NO_AUTO_FOLLOWUP)
+    })
+
+    it.each([
+      ['request_ai_birthcert_verification', 'description'],
+      ['request_ai_birthcert_verification', 'inputSchema.properties.agentName.description'],
+      ['subscribe_and_issue', 'inputSchema.properties.attributes.description'],
+    ])('%s.%s states the ask-the-user-for-a-name rule', (tool, path) => {
+      const hit = agentStrings(tool).find((s) => s.path === path)
+      expect(hit?.text, `${tool}.${path} is missing`).toBeDefined()
+      expect(hit!.text).toMatch(ASK_FOR_NAME)
+    })
+
+    it('SKILL.md states both rules', () => {
+      expect(skill).toMatch(/no background polling|nothing keeps running after/i)
+      expect(skill).toMatch(/never invent/i)
+    })
+
+    // R2-L03: the exact defect this MR exists to remove — an AGENT-first-person promise to act again
+    // on its own ("I will/I'll check/alert/notify ... shortly/later/automatically/every") — sailed
+    // through every OTHER guard in this file, and was only caught because the exact strings it lived
+    // in happened to also be pinned. This scans every tool's agent-facing text for the pattern
+    // directly, so a future edit that reintroduces it anywhere fails on its own, independent of any
+    // fixture snapshot.
+    it('no tool anywhere makes a first-person promise to act again later on its own', () => {
+      const FABRICATED_FOLLOWUP = /\b(I|I'll|I will|we will)\b[^.]*\b(check|alert|notify|let you know)\b[^.]*\b(shortly|later|automatically|every)\b/i
+      const allToolNames = buildToolList().map((t) => t.name)
+      for (const tool of allToolNames) {
+        for (const { path, text } of agentStrings(tool)) {
+          expect(text, `${tool}.${path} makes a first-person auto-follow-up promise`).not.toMatch(FABRICATED_FOLLOWUP)
+        }
+      }
+      expect(skill, 'SKILL.md makes a first-person auto-follow-up promise').not.toMatch(FABRICATED_FOLLOWUP)
+    })
   })
 })

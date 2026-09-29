@@ -57,7 +57,13 @@ import { createFsSsivcSessionStore } from './clients/ssivc-session-store.js'
 import { createFsDownloadQuarantineStore } from './clients/ssivc-download-quarantine-store.js'
 import { requestAiBirthcertVerification, checkAiBirthcertVerification, clearStuckPaymentReceipt } from './orchestrator/verify-ai-birthcert.js'
 import type { ClearStuckPaymentReceiptInput } from './orchestrator/verify-ai-birthcert.js'
-import { needsNativeGasCheck, prepareBaseUrl } from './accept-selection.js'
+import { PolicyDecisionClient } from './clients/policy-decision-client.js'
+import { needsNativeGasCheck, orderAccepts, prepareBaseUrl } from './accept-selection.js'
+import { PolicyWriteClient } from './clients/policy-write-client.js'
+import { createFsPolicyWriteReceiptStore } from './clients/policy-write-receipt-store.js'
+import type { WritePolicyDeps } from './orchestrator/write-policy.js'
+import { policyPreflight, type DraftPolicy } from './orchestrator/policy-preflight.js'
+import { getTemplateById } from './clients/policy-read-client.js'
 
 // esbuild resolves this JSON import at build time and inlines it into the bundle, so the
 // reported version always matches whatever package.json said when this bundle was built.
@@ -171,6 +177,190 @@ export function buildToolList() {
       },
     },
     {
+      name: 'check_policy_decision',
+      description:
+        'Ask whether a specific spend would be PERMITTED RIGHT NOW — the one policy question no ' +
+        'chain read can answer, because a cap is measured against cumulative spend held off-chain. ' +
+        'Three outcomes: "permitted", "refused", and "undetermined". ' +
+        'UNDETERMINED IS NOT A REFUSAL AND NOT PERMISSION — it means nothing was evaluated (the ' +
+        'service was unreachable, the ledger was stale, or no decision service is configured), so ' +
+        'do not spend on the strength of it and do not tell the user their policy blocked them. ' +
+        'There is NO step-up or approval-required verdict: the decision service answers only allow ' +
+        'or deny, so this tool never reports that a human must approve something. ' +
+        'A PERMITTED ANSWER RESERVES THE OWNER\'S BUDGET FOR 15 MINUTES. This is free of charge ' +
+        'but NOT free of consequence: the reserved amount is unavailable to any other payment for ' +
+        'that owner until the matching transfer settles or the 15 minutes lapse, and there is no ' +
+        'way to release it early. ' +
+        'SO DO NOT EXPLORE WITH THIS TOOL. Do not probe amounts to find one that fits — asking ' +
+        '"can I send 5? no? can I send 3?" reserves the budget for EVERY allow along the way, so ' +
+        'an agent that probes three amounts and sends the smallest has locked several times what ' +
+        'it spent, and the owner\'s next real payment can be refused by their own agent. Nothing ' +
+        'errors and nothing warns when this happens. ' +
+        'To find an amount that fits, call ONCE and read "remaining" from that one answer, then ' +
+        'work it out locally — that is what the field is for. A refusal reserves nothing, so a ' +
+        'probe that succeeds is the expensive one. ' +
+        'Call this only when actually about to send, and call it BEFORE building the transaction ' +
+        'rather than before signing one — the verdict depends on the amount, recipient, asset and ' +
+        'method, and a reservation abandoned after signing is worse than one never taken. ' +
+        'NEVER retry automatically after a timeout or an error: a timeout may mean the decision ' +
+        'succeeded and already reserved the budget, and asking again reserves it a second time. ' +
+        'Always read "ignored" back to the user even on a permitted answer: it lists constraints ' +
+        'the policy carries that the service could not enforce, which makes a permitted answer ' +
+        'narrower evidence than it looks. Omit policyKey to have every policy governing the asset ' +
+        'resolved, all of which must then allow. ' +
+        'Note for testnet today: the spend ledger crawl is switched off, so EVERY ' +
+        'decision currently answers "undetermined" with reason EVALUATION_UNAVAILABLE. That is ' +
+        'the correct behaviour rather than an outage — there is no settled-spend history to ' +
+        'evaluate against yet — and it still means stop.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          ownerAddress: { type: 'string', description: 'Whose policy to consult.' },
+          asset: {
+            description: '"ZTX", a ZTP20 contract address, or { scope, tokenAddress }.',
+          },
+          amount: {
+            type: 'string',
+            description: "The amount to spend, as a whole number string in the chain's own unit.",
+          },
+          policyKey: {
+            type: 'string',
+            description:
+              'Optional. Omit it and EVERY policy governing this asset is resolved and all must ' +
+              'allow. An owner with no policy for the asset is a refusal, not a pass.',
+          },
+          recipientAddress: { type: 'string', description: 'Who receives the funds, when the policy restricts that.' },
+          method: { type: 'string', description: 'ZTP20 only. Defaults to "transfer" server-side.' },
+          payTo: { type: 'string', description: 'Required when the policy sets payToAllowlist.' },
+          paymentNonce: {
+            type: 'string',
+            description:
+              'The x402 payment nonce, for correlating this decision with a payment. The policy ' +
+              'attribute it relates to, settlementChannel, is recorded but never enforced, so ' +
+              'omitting this cannot cause a refusal.',
+          },
+          requestKey: {
+            type: 'string',
+            description:
+              'A correlation id for support to find this decision later. NOT an idempotency ' +
+              'key: repeating it does not deduplicate, every call gets a fresh verdict, and ' +
+              'every permitted answer reserves the budget again. Never reuse one to make a ' +
+              'retry "safe".',
+          },
+        },
+        required: ['ownerAddress', 'asset', 'amount'],
+      },
+    },
+    {
+      name: 'write_policy',
+      description:
+        'Deploy a spending policy on chain. THIS PAYS A REAL FEE. Run policy_preflight first and ' +
+        'show the user its `interpretation`, because a policy that is valid can still mean ' +
+        'something other than what they asked for, and this tool cannot take that back once it is ' +
+        'written. ' +
+        'The flow is three steps and the middle one is where care is needed: a free pre-check, a ' +
+        'payment that writes NOTHING, and a collect that finishes the write once the payment ' +
+        'settles. Between the payment and the settlement A PAYMENT HAS BEEN MADE and no policy ' +
+        'exists — that window is normal, not a failure. ' +
+        'If `state` is "settling" or "submitted", A PAYMENT HAS BEEN MADE: never call this tool ' +
+        'again for the same policy, never tell the user it failed, and pass `paymentReceipt` to ' +
+        'check_policy_write instead. "submitted" means the transaction is on chain but the block ' +
+        'has not confirmed it — do NOT report the policy as created, even though a txHash is ' +
+        'present. ' +
+        '"written" is the only state that means the policy exists. ' +
+        '"already_exists" and "refused" both come from the FREE pre-check, so nothing was paid. ' +
+        '"payment_refused" is different: a payment was presented and the service rejected it, and ' +
+        'that says nothing either way about whether the fee was taken — never tell the user they ' +
+        'were not charged, and never tell them they were. ' +
+        '"receipt_void" is the one state where paying again is correct — the settlement failed and ' +
+        'the receipt bought nothing; `payFresh` is set to say so. ' +
+        '"write_failed" and "unknown" both mean money moved and paying again would NOT help: quote ' +
+        '`paymentReceipt` to support rather than retrying. ' +
+        'Never ask the user for their HSM password — this tool does not take one.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          policyKey: {
+            type: 'string',
+            description:
+              'The key this policy is stored under. Free-form, and independent of the template — ' +
+              'use it to separate policies that govern different things for the same owner.',
+          },
+          attributes: {
+            type: 'array',
+            description:
+              'The rules, one { attributeName, attributeType, value } each. A cap expressed "per ' +
+              'month" needs BOTH the cap and its window attribute — a cap alone is a LIFETIME cap, ' +
+              'which is not what the user asked for. policy_preflight checks this.',
+            items: {
+              type: 'object',
+              properties: {
+                attributeName: { type: 'string' },
+                attributeType: { type: 'string' },
+                value: { type: 'string' },
+              },
+              required: ['attributeName', 'value'],
+            },
+          },
+          templateContractAddress: {
+            type: 'string',
+            description: 'The Template contract the template lives on. Required: it is what makes this an adopt.',
+          },
+          templateId: {
+            type: 'string',
+            description:
+              'The template to type these attributes against. The chain checks the attribute names ' +
+              'against it, so a typo is refused instead of deploying a policy that enforces nothing.',
+          },
+          validFromBlock: { type: 'string', description: 'Block this policy starts at, as a string. Omit for unbounded.' },
+          validToBlock: { type: 'string', description: 'Block it ends at, as a string. Omit for unbounded.' },
+          requestKey: {
+            type: 'string',
+            description:
+              'A correlation id for this write, generated automatically when omitted. Do NOT treat ' +
+              'it as an idempotency key: repeating one is not a safe way to retry. If a write may ' +
+              'already have been paid for, ask for the same policyKey again — the free pre-check ' +
+              'reports it before any payment.',
+          },
+          pollBudgetMs: {
+            type: 'number',
+            description:
+              'How long to wait for the settlement before handing back the receipt. The default is ' +
+              'about a minute; settlement usually takes around twenty seconds.',
+          },
+        },
+        required: ['policyKey', 'attributes', 'templateContractAddress', 'templateId'],
+      },
+    },
+    {
+      name: 'check_policy_write',
+      description:
+        'Finish a policy write that has already been PAID FOR. FREE — this tool never pays, on any ' +
+        'path, which is why it is the right answer to "did my policy get created?" and calling ' +
+        'write_policy again is not. ' +
+        'Call it with the `paymentReceipt` from a "settling" or "submitted" result, or with no ' +
+        'arguments to resume the most recent pending write. ' +
+        'The states mean the same as in write_policy: "written" is the only one where the policy ' +
+        'exists, "settling" and "submitted" mean keep waiting, and "unknown" means the outcome ' +
+        'could not be determined — none of which is a reason to pay again. ' +
+        'If this wallet holds no record of the receipt, that does NOT mean the write failed: the ' +
+        'service completes a paid write on its own, and asking to write the same policyKey again ' +
+        'will report the truth for free before any payment.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          paymentReceipt: {
+            type: 'string',
+            description: 'The receipt from a pending write. Omit to resume the most recent one.',
+          },
+          pollBudgetMs: {
+            type: 'number',
+            description: 'How long to wait for the settlement before reporting back. Defaults to about a minute.',
+          },
+        },
+      },
+    },
+    {
       name: 'policy_preflight',
       description:
         'Check a draft policy BEFORE it is deployed — FREE, no payment, no signing. It answers two ' +
@@ -255,7 +445,20 @@ export function buildToolList() {
       description:
         'Obtain a VC from MBI: build the signed payload, pay x402, and return the issued credential. If a ' +
         'still-valid credential for this templateId is already cached locally, it is returned directly with ' +
-        'no payment (fromCache: true) — pass forceReissue:true to pay and issue fresh regardless. Payment ' +
+        'no payment (fromCache: true). Setting forceReissue:true alone does NOT pay again — it only asks to ' +
+        'be shown that existing credential first: you get back { issued: false, vcId, vc, fromCache: true, ' +
+        'reason } instead, and nothing is paid. Show that existing credential to the user and ask whether ' +
+        'they actually want to replace it; only call this tool again, with BOTH forceReissue:true and ' +
+        'confirmReplaceExistingVc set to exactly the vcId you were shown, if they explicitly say yes. Never ' +
+        'pass confirmReplaceExistingVc on your own judgement. When nothing valid is cached, forceReissue has ' +
+        'no effect either way — that case has always paid and issued fresh. When a call DOES render a full ' +
+        'credential to the user (a fresh issuance, a plain cache hit, or a confirmed replace), show every ' +
+        'claim under vc.credentialSubject as a table — not a cherry-picked subset — labelling each key by ' +
+        'title-casing it (the exact claim set varies by template; use schema.required/optional to know what ' +
+        'to expect), plus vcId and validUntil if present. If vcPassImagePaths is also present, the ' +
+        "credential's own pass-design image(s) came back attached to this result — tell the user their " +
+        'credential\'s official pass design is shown below and display the image(s); do not silently drop ' +
+        'them from your summary just because they are not text. Payment ' +
         "is asset-agnostic — MBI's 402 challenge may quote the native ZETRIX token or a ZTP20 token (e.g. " +
         'JMYR); pass dryRun:true first to see the quoted asset/amount for free before committing to pay. ' +
         'What a call actually cost is reported precisely: paidAsset/amountPaid are set ONLY when this call ' +
@@ -269,9 +472,9 @@ export function buildToolList() {
         'REQUIRED/SETTLED (still unresolved) / UNKNOWN (recovery itself unreachable). NEVER retry a payment ' +
         'after either failure: the funds may already be gone, and a retry charges the full amount again — ' +
         'look the paymentId up instead. ' +
-        'Every response except a cache hit also includes { schema: { required, optional } } — the ' +
-        "template's full declared attribute schema read from chain — so you see the complete field list, " +
-        'not just what went wrong; a cache hit skips the chain lookup and omits it. ' +
+        'Every response also includes { schema: { required, optional } } whenever the template schema could ' +
+        "be read from chain — the template's full declared attribute list, so you see the complete field " +
+        'list, not just what went wrong. ' +
         'For the AI Birthcert specifically: this issues the BASIC one — self-declared by the agent, ' +
         'agent-paid via x402, owner identity NOT identity-verified. If the user asked for a "verified" AI ' +
         'birthcert (owner identity confirmed via MyDigital ID), use request_ai_birthcert_verification ' +
@@ -294,8 +497,12 @@ export function buildToolList() {
             type: 'object',
             description:
               'Claim values for the credential (schema varies by template — check what the issuer requires ' +
-              'before guessing). "agentDid" does not need to be supplied: it is auto-filled with this wallet\'s ' +
-              "own holder DID (the credential's self-referential subject) unless you explicitly override it.",
+              'before guessing). ALWAYS ask the human owner directly for any name/identifier-type value ' +
+              '(e.g. an agentUsername or similar field) — NEVER invent, guess, or silently reuse one of ' +
+              'your own choosing; if the template requires one, get it from the user first. "agentDid" is ' +
+              'the one exception: it does not need to be supplied, since it is auto-filled with this ' +
+              "wallet's own holder DID (the credential's self-referential subject) unless you explicitly " +
+              'override it.',
           },
           expirationDate: { type: 'string' },
           dryRun: {
@@ -313,7 +520,22 @@ export function buildToolList() {
           },
           forceReissue: {
             type: 'boolean',
-            description: 'Skip the local cache and pay + issue a fresh credential regardless of what is already cached.',
+            description:
+              'Alone, this does NOT pay again — if a valid credential is already cached it only returns that ' +
+              'credential (issued: false, fromCache: true, reason) so it can be shown to the user first. Pair ' +
+              'it with confirmReplaceExistingVc to actually pay and reissue over a still-valid one. Has no ' +
+              'effect when nothing valid is cached — that case always pays and issues fresh regardless.',
+          },
+          confirmReplaceExistingVc: {
+            type: 'string',
+            description:
+              'Only for replacing a cached credential that is STILL VALID (not expired). Pass the exact vcId ' +
+              'from a prior forceReissue response — never a guess, never made up. Only set this after the ' +
+              'user has SEEN that existing credential and explicitly asked to replace it; omit it otherwise, ' +
+              'and never set it without forceReissue also being true. A mismatched value is ignored: nothing ' +
+              'is paid and you get the same { issued: false, reason } response again, naming the id to ' +
+              'confirm. Setting it without forceReissue does nothing at all either way — that case is a ' +
+              'plain cache hit ({ issued: true }) regardless of what this field is set to.',
           },
         },
         required: ['templateId', 'attributes'],
@@ -326,14 +548,27 @@ export function buildToolList() {
         'ALWAYS run credential_preflight for "verified_ai_birthcert" immediately before calling this, ' +
         'even if you checked earlier in the conversation — preflight is free, this tool spends real ' +
         'funds, and a balance the user topped up a minute ago is not the balance you read before that. ' +
-        'Returns { sessionId, verificationUrl, expiresAt, expiresIn, expiresInSeconds } — show verificationUrl to the human owner ' +
+        'Returns { sessionId, verificationUrl, expiresAt, expiresIn, expiresInSeconds, message } — show verificationUrl to the human owner ' +
         'and ask them to open it and complete MyDigital ID verification (typically finishes in ' +
         'seconds). Tell them how long the link is good for by quoting `expiresIn` exactly as given: ' +
         'the wallet works it out from its own clock, so never calculate the time remaining yourself ' +
-        'from `expiresAt` — your clock and timezone may differ from the server\'s. ' +
+        'from `expiresAt` — your clock and timezone may differ from the server\'s. `message` here ' +
+        'contains a "Tell the user:" sentence about following up — relay it rather than composing ' +
+        'your own reassurance. ' +
         'Once they confirm they are done, call check_ai_birthcert_verification to see ' +
-        'whether the credential was issued. IMPORTANT: agentName must be unique — if this exact name ' +
-        'has already been used to request a Verified AI Birthcert, issuance will fail. Before calling, ' +
+        'whether the credential was issued. Nothing keeps running after this call returns — there is ' +
+        'no background polling, webhook, or timer, so you can only check status when the user sends ' +
+        'you a new message. NEVER tell the user you have "set up an automation" or that you will ' +
+        '"alert them" when it completes — you cannot act on your own between messages, and promising ' +
+        'that leaves them waiting for a notification that will never come. Instead, tell them how ' +
+        'long the link is good for and ask them to message you back once done (or after a few ' +
+        'minutes) so you can check_ai_birthcert_verification again. ALWAYS ask the human owner directly what agentName they ' +
+        'want to use for a NEW session — NEVER invent, guess, or silently choose one yourself. (Calling ' +
+        'again with the SAME name to resume an already-pending session, as described below, is not ' +
+        '"inventing" one — that is reusing the exact name the owner already gave.) IMPORTANT: agentName ' +
+        'must be unique — if this exact name has already been used to request a Verified AI Birthcert, ' +
+        'issuance will fail. ' +
+        'Before calling, ' +
         'ask the human owner whether they want to supply any of the optional fields — agentPurpose, ' +
         'evidenceAssuranceLevel, ownerType, ownerVerified — do not silently omit them; they only need ' +
         'to say no. Calling this ' +
@@ -403,7 +638,10 @@ export function buildToolList() {
         properties: {
           agentName: {
             type: 'string',
-            description: 'A unique, human-readable name for this agent. Must not already be in use for a Verified AI Birthcert, or issuance will fail.',
+            description:
+              'A unique, human-readable name for this agent. Must not already be in use for a Verified ' +
+              'AI Birthcert, or issuance will fail. ALWAYS ask the human owner directly which name to ' +
+              'use for a new session — NEVER invent, guess, or silently choose one yourself.',
           },
           agentPurpose: { type: 'string', description: 'Optional — what this agent does, e.g. "Negotiate and settle supplier invoices".' },
           evidenceAssuranceLevel: { type: 'string', description: 'Optional — assurance level of the identity evidence, e.g. "high".' },
@@ -513,7 +751,12 @@ export function buildToolList() {
         'Check the status of the most recently requested Verified AI Birthcert session (see ' +
         'request_ai_birthcert_verification). FREE — it never pays for anything. Use this, not ' +
         'request_ai_birthcert_verification, whenever the user asks where their verification link is, ' +
-        'what happened to their session, or whether their credential is ready. While the session is ' +
+        'what happened to their session, or whether their credential is ready. This tool has NO ' +
+        'background/automatic polling — calling it once checks the status once, right now, and ' +
+        'nothing more. If status is still pending, do not claim you will keep checking or alert the ' +
+        'user later: you cannot act again until they send you another message, so ask them to message ' +
+        'you back (now or in a few minutes) and you will check_ai_birthcert_verification again then. ' +
+        'While the session is ' +
         'still open the result carries `verificationUrl` (the same link issued at creation) and ' +
         '`expiresAt` and `expiresIn` — give the user the link and `expiresIn` exactly as given, so ' +
         'they know how long it is good for; never work out the time remaining yourself from ' +
@@ -553,9 +796,9 @@ export function buildToolList() {
         'and message quotes what it said — relay that reason to the user and tell them the ' +
         'verification service is not completing requests right now. Do NOT describe it as a ' +
         'settlement still processing: the settlement is not what failed. The receipt is kept and no ' +
-        'new payment was made, so it is worth checking again later — an outage on their side can ' +
-        'clear. This says NOTHING about whether the fee was taken, so never tell the user they were ' +
-        'not charged. ' +
+        'new payment was made, so it is worth asking the user to message you back so you can check ' +
+        'again later — an outage on their side can clear. This says NOTHING about whether the fee ' +
+        'was taken, so never tell the user they were not charged. ' +
         'With paymentInvalid: true (message leads "PAYMENT SENT, BUT THE CREDENTIAL SERVICE SAYS ' +
         'THIS PAYMENT DID NOT VALIDATE") the service has specifically ruled the payment or receipt ' +
         'invalid — different from issuerRejected: do NOT say "the settlement is not what failed" ' +
@@ -568,11 +811,13 @@ export function buildToolList() {
         'Otherwise, outcomeUnknown tells the remaining cases apart, and without it the message ' +
         'splits again. Without outcomeUnknown the message leads "PAYMENT SENT", and that shape is ' +
         'TWO different states you tell apart by the clause that follows. If it says "still being ' +
-        'processed" the settlement is confirmed queued and progressing — check again in a few ' +
-        'minutes. If it says "has not been confirmed yet" the outcome could not be determined at ' +
-        'all yet: do NOT describe that one as progressing and do NOT describe it as succeeded, ' +
-        'because it is indeterminate, not confirmed. Either way the receipt is saved, so do not ' +
-        'pay again, and check again later. When the message contains a "Tell the user:" sentence, ' +
+        'processed" the settlement is confirmed queued and progressing — ask the user to message ' +
+        'you back in a few minutes so you can check again. If it says "has not been confirmed yet" ' +
+        'the outcome could not be determined at all yet: do NOT describe that one as progressing ' +
+        'and do NOT describe it as succeeded, because it is indeterminate, not confirmed. Either ' +
+        'way the receipt is saved, so do not pay again, and ask the user to message you back so ' +
+        'you can check again later — you cannot act again on your own between messages. When the ' +
+        'message contains a "Tell the user:" sentence, ' +
         'relay it rather than composing your own reassurance. With outcomeUnknown: true (message leads "OUTCOME UNKNOWN") ' +
         'the settlement outcome could not be determined at all and has been unresolved long enough ' +
         'that it is not coming back (stuckFor says how long). The fee was most likely ALREADY TAKEN ' +
@@ -699,10 +944,127 @@ type Payer = (accept: PayRequirement) => Promise<string>
  * because every test supplied its own validator locally. That is the class the preceding commit
  * existed to close, so this extends the pattern rather than adding a seam beside it.
  */
+/**
+ * Everything the two policy-write tools need, or nothing.
+ *
+ * Returned as a spread, like buildAddressValidator. Be precise about what that buys, because the
+ * first version of this comment overclaimed it (APP-M03): the SPREAD ITSELF is still an expression
+ * in `main()`, and deleting it leaves both tools unwired. What the shape buys is that the BODY —
+ * which client, which store, which payer — is a function a test can call directly, and one now
+ * does. The remaining gap is `main()`'s dep object as a whole, which is untested here exactly as
+ * it is for buildAddressValidator and buildTransferSafetyWiring; recorded as tracked,
+ * not done, and that is still true.
+ *
+ * THE PAYER COMES FROM buildPayers. `pay` here is `payForPolicyWrite`, built from the same
+ * `makePay` every other paying tool uses, so `assertWithinPaymentCap` applies to a policy write
+ * exactly as it does to `pay_and_fetch` (per the ticket's AC #2). Which CAP it carries is decided inside
+ * buildPayers and deliberately not restated here — that restatement is the R2-M01 defect.
+ *
+ * The HSM password is bound HERE, in the wiring, so it never crosses into the tool layer: an
+ * agent cannot be asked for it, and no tool schema carries a field for it.
+ */
+export function buildPolicyWriteDeps(input: {
+  policyWriteUrl?: string
+  network: string
+  stateDir: string
+  ownerAddress: string
+  hsmPassword: string
+  /**
+   * TYPED AS `Payer`, not as the orchestrator's looser accept type. The call site used to hand
+   * this over through `as never`, which switched off the one check that the CAPPED payer is what
+   * gets wired — a cast is a silent yes to whatever is passed (APP-M03).
+   */
+  pay: Payer
+  gasPreference: AgenticWalletConfig['gasPreference']
+  sleep: (ms: number) => Promise<void>
+  /**
+   * The Template contract this wallet trusts. Both the preflight read and the equality check
+   * against the caller's `templateContractAddress` use it, so they cannot disagree.
+   */
+  policyTemplateAddress?: string
+  /** The chain reader preflight types a draft with — the same seam every other read uses. */
+  chainQuery: ContractQuery
+}): { policyWriteDeps?: WritePolicyDeps } {
+  // Both, not either. Without a template contract there is nothing to type a draft against, and
+  // a write that cannot be checked for free is one this wallet will not pay for.
+  if (!input.policyWriteUrl || !input.policyTemplateAddress) return {}
+  const templateContract = input.policyTemplateAddress
+  return {
+    policyWriteDeps: {
+      client: new PolicyWriteClient(input.policyWriteUrl, (url, init) => fetch(url, init)),
+      receipts: createFsPolicyWriteReceiptStore(join(input.stateDir, 'policy-write-receipts')),
+      // The one narrowing left, and it is here rather than at the call site so the call site
+      // cannot pass something else entirely. The orchestrator describes an accept as an opaque
+      // record because it never reads one; the payer wants the SDK's type.
+      pay: (accept) => input.pay(accept as PayRequirement),
+      // The same ordering every other x402 surface uses, so a policy write cannot end up
+      // preferring a different gas model than the rest of the wallet.
+      chooseAccept: (accepts) => orderAccepts(accepts as never, input.gasPreference)[0] as never,
+      hsmPassword: input.hsmPassword,
+      ownerAddress: input.ownerAddress,
+      network: input.network,
+      sleep: input.sleep,
+      templateContract,
+      // Built HERE rather than at the call site, because this function has tests and the call
+      // site does not. It reads the template through the configured contract — the same address
+      // the equality check above compares the caller's against — so the draft is typed against
+      // exactly the template it will be written against.
+      preflight: async (draft) =>
+        policyPreflight(
+          {
+            network: input.network,
+            isValidAddress: (address) => keypair.checkAddress(address),
+            readTemplate: async (d: DraftPolicy) =>
+              d.templateId
+                ? getTemplateById(d.templateId, templateContract, input.chainQuery)
+                : {
+                    error: 'query_failed' as const,
+                    detail: 'no templateId supplied, so the draft could not be typed against a template',
+                  },
+          },
+          { ...draft, attributes: draft.attributes.map((a) => ({ ...a, attributeType: a.attributeType ?? '' })) },
+        ),
+    },
+  }
+}
 export function buildAddressValidator(
   checkAddress: (address: string) => boolean = (address) => keypair.checkAddress(address),
 ): { isValidAddress: (address: string) => boolean } {
   return { isValidAddress: (address) => checkAddress(address) }
+}
+
+/**
+ * The Policy Decision Point client, or nothing.
+ *
+ * Returned as a spread, the same shape as buildAddressValidator. Be precise about what that
+ * buys: the BODY is a function a test can call, and one does. The spread in main() is still an
+ * expression, and deleting it leaves check_policy_decision answering "not configured" on a
+ * wallet that is — a gap shared with the two builders beside it, and still tracked rather than
+ * closed.
+ *
+ * Absent unless POLICY_DECISION_URL is set, and that absence is deliberate rather than a
+ * missing default. There is no URL this wallet could reach today: ms-zetrix mounts the
+ * decision endpoint under /policy/**, which carries no entry in its PUBLIC_PATHS and so
+ * inherits anyRequest().authenticated(), and this wallet holds no BaaS token. Guessing a host
+ * would turn "nobody has wired this up" into a connection error, which reads like a transient
+ * fault rather than a missing integration — the same honesty convention as
+ * derivePolicyRegistryAddress returning undefined on mainnet.
+ *
+ * With no client, check_policy_decision answers "undetermined" and says why. It never answers
+ * "permitted".
+ */
+export function buildPolicyDecisionClient(config: {
+  policyDecisionUrl?: string
+  policyDecisionAuth?: string
+}): { policyDecisionClient?: PolicyDecisionClient } {
+  if (!config.policyDecisionUrl) return {}
+  return {
+    policyDecisionClient: new PolicyDecisionClient(
+      config.policyDecisionUrl,
+      (url, init) => fetch(url, init),
+      config.policyDecisionAuth,
+    ),
+  }
 }
 
 /**
@@ -753,10 +1115,22 @@ export function buildTransferSafetyWiring(
 export function buildPayers(
   config: { maxPaymentAmount: Record<string, string>; credentialIssuanceCaps: Record<string, string> },
   makePay: (caps: Record<string, string>) => Payer,
-): { pay: Payer; payForCredential: Payer; preflightCaps: Record<string, string> } {
+): {
+  pay: Payer
+  payForCredential: Payer
+  payForPolicyWrite: Payer
+  preflightCaps: Record<string, string>
+} {
   return {
     pay: makePay(config.maxPaymentAmount),
     payForCredential: makePay(config.credentialIssuanceCaps),
+    // THE GENERAL CAP, not the credential one. A policy write is a known service fee, which makes
+    // it tempting to file beside credential issuance — but the credential allowance exists to let
+    // a wallet buy CREDENTIALS, and a policy write drawing on it would spend an allowance granted
+    // for something else. maxPaymentAmount is the map a user raises when they mean "this wallet
+    // may spend", and it is refuse-all by default on mainnet, which is the right default for a
+    // path that puts a spending policy on chain.
+    payForPolicyWrite: makePay(config.maxPaymentAmount),
     preflightCaps: config.credentialIssuanceCaps,
   }
 }
@@ -1038,7 +1412,7 @@ async function main(): Promise<void> {
   // (a known issuer — carries the credential-fee allowance on both networks) and `preflightCaps`
   // (the read-only map credential_preflight reports against) all come from one call so nothing
   // else in main() pairs a cap map with what consumes it.
-  const { pay, payForCredential, preflightCaps } = buildPayers(config, makePay)
+  const { pay, payForCredential, payForPolicyWrite, preflightCaps } = buildPayers(config, makePay)
 
   // MBI's pass-design PNG(s) for an issued VC (extraData.vcPassBase64 from /v1/vc/ext/download).
   // Shared across both the Verified AI Birthcert flow and basic subscribe_and_issue — the download
@@ -1214,6 +1588,24 @@ async function main(): Promise<void> {
     // policy_preflight's validator. transfer_token has its OWN, from buildTransferSafetyWiring
     // above — two identical-bodied defaults, not one shared instance.
     ...buildAddressValidator(),
+    // Absent unless POLICY_DECISION_URL is set — see buildPolicyDecisionClient for why there is
+    // no default host. Its absence makes check_policy_decision answer "undetermined", never
+    // "permitted".
+    ...buildPolicyDecisionClient(config),
+    // The policy write tools. Absent on a network with no write endpoint, which makes them
+    // answer "not available, nothing was paid" rather than fail against a guessed host.
+    ...buildPolicyWriteDeps({
+      policyWriteUrl: config.policyWriteUrl,
+      network: config.network,
+      stateDir: config.stateDir,
+      ownerAddress: zetrixAddress,
+      hsmPassword,
+      pay: payForPolicyWrite,
+      gasPreference: config.gasPreference,
+      sleep,
+      policyTemplateAddress: config.policyTemplateAddress,
+      chainQuery: contractQuery,
+    }),
     chainQuery: contractQuery,
     queryContract: (input: ContractQueryInput): Promise<ContractQueryResult> => runContractQuery(input, contractQuery),
     queryTokenBalance,

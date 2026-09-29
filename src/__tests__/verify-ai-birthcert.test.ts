@@ -7,6 +7,17 @@ import { PaymentReadinessError } from '../payment-readiness'
 import { PaymentCapError } from '../payment-guard'
 import { SsivcError } from '../clients/ssivc-client'
 
+// Mirrors the (unexported) noAutoRecheckMessage() in verify-ai-birthcert.ts, whose wording depends
+// on how much time is actually left on the link.
+const NO_AUTO_RECHECK_MESSAGE =
+  'Tell the user: "No automatic re-check happens on this end. Please message me again — once you ' +
+  'have completed MyDigital ID verification, or after a few minutes — and I will check the status ' +
+  'then."'
+const NO_AUTO_RECHECK_MESSAGE_EXPIRED =
+  'Tell the user: "This verification link has already expired, so completing MyDigital ID ' +
+  'verification on it will not work now. No automatic re-check happens on this end — please ' +
+  'message me back so a new verification link can be started."'
+
 let passImagesDir: string
 beforeEach(() => {
   passImagesDir = mkdtempSync(join(tmpdir(), 'verify-ai-birthcert-vc-pass-image-test-'))
@@ -74,7 +85,7 @@ describe('requestAiBirthcertVerification', () => {
     expect(pay).toHaveBeenCalledWith(SAMPLE_ACCEPT)
     expect(createSessionSettle).toHaveBeenCalledWith(createSessionChallenge.mock.calls[0][0], 'BASE64PAYMENT')
     expect(createSessionWithReceipt).not.toHaveBeenCalled()
-    expect(out).toEqual({ sessionId: 's-1', verificationUrl: 'https://zvg.test/verify/tok', expiresAt: '2026-08-17T09:30:00+00:00', expiresInSeconds: 1800, expiresIn: 'about 30 minutes' })
+    expect(out).toEqual({ sessionId: 's-1', verificationUrl: 'https://zvg.test/verify/tok', expiresAt: '2026-08-17T09:30:00+00:00', expiresInSeconds: 1800, expiresIn: 'about 30 minutes', message: NO_AUTO_RECHECK_MESSAGE })
   })
 
   it('builds the request body: id mirrors agentName, ownerReference is the holderDid, publicKey/address come from deps', async () => {
@@ -133,7 +144,7 @@ describe('requestAiBirthcertVerification', () => {
       sessionId: 's-1', agentName: 'Procurement Assistant', createdAt: '2026-08-17T09:00:00.000Z',
       verificationUrl: 'https://zvg.test/verify/tok', paymentReceipt: 'receipt-1', holderDid: 'did:zid:owner123',
     })
-    expect(out).toEqual({ sessionId: 's-1', verificationUrl: 'https://zvg.test/verify/tok', expiresAt: '2026-08-17T09:30:00+00:00', expiresInSeconds: 1800, expiresIn: 'about 30 minutes' })
+    expect(out).toEqual({ sessionId: 's-1', verificationUrl: 'https://zvg.test/verify/tok', expiresAt: '2026-08-17T09:30:00+00:00', expiresInSeconds: 1800, expiresIn: 'about 30 minutes', message: NO_AUTO_RECHECK_MESSAGE })
   })
 
   it('rejects a blank agentName before calling out', async () => {
@@ -158,7 +169,25 @@ describe('requestAiBirthcertVerification', () => {
     expect(createSessionChallenge).not.toHaveBeenCalled()
     expect(createSessionSettle).not.toHaveBeenCalled()
     expect(createSessionWithReceipt).not.toHaveBeenCalled()
-    expect(out).toEqual({ sessionId: 's-old', verificationUrl: 'https://zvg.test/verify/old-tok', expiresAt: '2026-08-17T08:30:00+00:00', expiresInSeconds: 0, expiresIn: 'already expired' })
+    expect(out).toEqual({ sessionId: 's-old', verificationUrl: 'https://zvg.test/verify/old-tok', expiresAt: '2026-08-17T08:30:00+00:00', expiresInSeconds: 0, expiresIn: 'already expired', message: NO_AUTO_RECHECK_MESSAGE_EXPIRED })
+  })
+
+  // R2-M01: the middle branch of noAutoRecheckMessage() — plenty of time left gets the "or after a
+  // few minutes" wording, already-expired gets the "start over" wording, but a link that is ABOUT TO
+  // expire must say "complete it now", not invite the exact wait that killed the QA incident.
+  it('when the stored session is pending and about to expire: message says complete it now, not "after a few minutes"', async () => {
+    const { deps, sessionStore, getSession } = makeDeps()
+    await sessionStore.set({
+      sessionId: 's-old', agentName: 'Procurement Assistant', createdAt: '2026-08-17T08:00:00.000Z',
+      verificationUrl: 'https://zvg.test/verify/old-tok', paymentReceipt: 'receipt-old',
+    })
+    // deps.now() is fixed at 2026-08-17T09:00:00.000Z — 2 minutes to expiry, under the 5-minute urgent threshold.
+    getSession.mockResolvedValue({ sessionId: 's-old', status: 'pending', expiresAt: '2026-08-17T09:02:00+00:00' })
+
+    const out = await requestAiBirthcertVerification(deps as never, { agentName: 'Procurement Assistant' })
+
+    expect(out.message).toMatch(/right now, not later/)
+    expect(out.message).not.toMatch(/or after a few minutes/)
   })
 
   // APP-M03 / SEC-13: only `issued` ever consumes the settlement receipt (SPEC.md §634) — every
@@ -1149,9 +1178,11 @@ describe('an existing Verified Birthcert VC is checked before paying for a new o
         },
       }
 
-      await checkAiBirthcertVerification(deps as never)
+      const out = await checkAiBirthcertVerification(deps as never)
 
       expect(sessionStore.set).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 's-resumed', holderDid: 'did:zid:new-holder' }))
+      // R2-L03: advanceQueuedSettlement's settled-to-pending result was not previously asserted here.
+      expect(out).toMatchObject({ sessionId: 's-resumed', status: 'pending', message: NO_AUTO_RECHECK_MESSAGE })
     })
 
     // R1-M01 (round-2 review): a deterministic (non-transient) resolution failure must not be a dead
@@ -1257,7 +1288,7 @@ describe('sponsored settlement retry', () => {
     it('gives the agent a sentence to relay that claims nothing beyond sent / still processing / saved / do not pay again', async () => {
       const out = await runRequestRaw({ ssivc: queuedSsivc(1), sleep: vi.fn().mockResolvedValue(undefined) })
       const sentence =
-        'Tell the user: "Your payment was sent and the settlement is still being processed. The receipt is saved — please do not pay again. I will check again shortly."'
+        'Tell the user: "Your payment was sent and the settlement is still being processed. The receipt is saved — please do not pay again. Please message me again in a few minutes and I will check."'
       expect(out.message).toContain(sentence)
       expect(sentence).not.toMatch(/succeed|fail|safe|normal|automatic|no funds|nothing is lost|stuck/i)
     })
@@ -2078,7 +2109,7 @@ describe('R10: the paid-this-call wording is pinned on every half of every branc
   // ("stuck after 12+ minutes", "normal on testnet") and offered to discard the receipt and pay again.
   // The answer is now in the message, and so is a sentence the agent can relay as-is.
   const TELL_USER =
-    'Tell the user: "Your payment was sent, but the credential service has not confirmed it yet, so I cannot say whether it went through. The receipt is saved — please do not pay again. I will check again shortly."'
+    'Tell the user: "Your payment was sent, but the credential service has not confirmed it yet, so I cannot say whether it went through. The receipt is saved — please do not pay again. Please message me again in a few minutes and I will check."'
   /** The relayable sentence itself must claim nothing beyond "sent", "not confirmed", "saved", "do not pay again". */
   const expectRelayableSentence = (out: Record<string, unknown>) => {
     const t = text(out)
@@ -4034,7 +4065,7 @@ describe('checkAiBirthcertVerification', () => {
     const out = await checkAiBirthcertVerification(deps as never)
 
     expect(getSession).toHaveBeenCalledWith('s-1')
-    expect(out).toEqual({ sessionId: 's-1', status: 'pending', expiresAt: '2026-08-13T09:30:00+00:00', expiresInSeconds: 0, expiresIn: 'already expired' })
+    expect(out).toEqual({ sessionId: 's-1', status: 'pending', expiresAt: '2026-08-13T09:30:00+00:00', expiresInSeconds: 0, expiresIn: 'already expired', message: NO_AUTO_RECHECK_MESSAGE_EXPIRED })
     expect(out.vcId).toBeUndefined()
   })
 
@@ -4060,6 +4091,9 @@ describe('checkAiBirthcertVerification', () => {
       // The expiry comes from SSIVC on every call, not from the store — the agent needs to say how
       // long the link is good for, and a locally cached value would go stale.
       expiresAt: '2026-08-13T09:30:00+00:00',
+      // R2-L03: this is the common production shape (the URL is always stored at creation), and it
+      // was not previously asserted on this branch — only the no-URL branch was.
+      message: NO_AUTO_RECHECK_MESSAGE_EXPIRED,
     })
   })
 
@@ -4078,6 +4112,25 @@ describe('checkAiBirthcertVerification', () => {
     const out = await checkAiBirthcertVerification(deps as never)
 
     expect(out).not.toHaveProperty('verificationUrl')
+  })
+
+  // R2-L03: the guard's FALSE branch — a confirmed terminal, non-pending, non-issued status (here
+  // 'expired') must carry no message at all. Telling the holder to "just wait and message back"
+  // would be actively wrong on a link that is already dead.
+  it('carries no message field for a confirmed-expired status', async () => {
+    const { deps, sessionStore, getSession } = makeDeps()
+    await sessionStore.set({
+      sessionId: 's-1',
+      agentName: 'Procurement Assistant',
+      createdAt: '2026-08-13T09:00:00.000Z',
+      verificationUrl: 'https://ssivc-api-uat.myegdev.com/verify/s-1',
+    })
+    getSession.mockResolvedValue({ sessionId: 's-1', status: 'expired', expiresAt: '2026-08-13T09:30:00+00:00' })
+
+    const out = await checkAiBirthcertVerification(deps as never)
+
+    expect(out.status).toBe('expired')
+    expect(out).not.toHaveProperty('message')
   })
 
   it('reports vcId when status is issued', async () => {

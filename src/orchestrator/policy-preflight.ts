@@ -350,7 +350,10 @@ export function baseNotChecked(network?: string): string[] {
     'Whether the policy will actually be ENFORCED. Nothing outside the policy registry currently ' +
       'consults the decision service, so a valid policy may gate nothing today.',
     'Whether the write will be accepted, and what it will cost — the deploy path is not built yet.',
-    'Whether a decision would currently be ALLOW, STEP_UP or DENY — that needs off-chain spend ' +
+    // NOT "STEP_UP": the decision service answers ALLOW or DENY and has no third verdict — its
+    // DecisionRespDto enforces that at both ends. This sentence shipped naming a state that does
+    // not exist, in text an LLM agent reads back to a user.
+    'Whether a decision would currently be ALLOW or DENY — that needs off-chain spend ' +
       'state this wallet cannot read. A clean preflight is not permission to spend.',
   ]
   if (network && !network.includes('testnet')) {

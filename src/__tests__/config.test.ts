@@ -30,6 +30,9 @@ describe('loadConfig', () => {
       zidResolverBaseUrl: 'https://zid-resolver-sandbox.zetrix.com',
       policyRegistryAddress: 'ZTX3Z2Fgsssx5fVq5v8EnhTBh6mqxJ8FQFqnk',
       policyTemplateAddress: 'ZTX3WfTbuZwsLQDWe4f7mzrfULiNdDU84BLJ5',
+      // Derived like every other service URL; undefined on mainnet, where the policy module
+      // is not enabled at all (see derivePolicyWriteUrl).
+      policyWriteUrl: 'https://public-api-sandbox.zetrix.com/api',
       // Testnet default: exactly the AI Birthcert fee, nothing else. See the network-scoped block below.
       maxPaymentAmount: { ZTX3WeinXtt28YMyr4vUZ14ddTgEMGeuc1e6b: '1000000', '*': '0' },
       credentialIssuanceCaps: { ZTX3WeinXtt28YMyr4vUZ14ddTgEMGeuc1e6b: '1000000', '*': '0' },

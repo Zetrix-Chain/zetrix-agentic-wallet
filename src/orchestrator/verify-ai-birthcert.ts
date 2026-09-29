@@ -12,7 +12,7 @@
 
 import { createHash } from 'node:crypto'
 import { canonicalizeJson } from '../canonical-json.js'
-import { withSessionExpiry, type SessionExpiryFields } from './session-expiry.js'
+import { withSessionExpiry, sessionExpiryFields, type SessionExpiryFields } from './session-expiry.js'
 import {
   SsivcError,
   type SsivcErrorKind,
@@ -258,9 +258,13 @@ export type RequestVerificationResult =
   /**
    * `discardedPaymentReceipt` is set only when this call discarded a stuck receipt to pay again.
    * `replacedExpiredVc` is set only when a cached Verified AI Birthcert VC existed but had already
-   * expired — this new session replaces it automatically, no confirmation needed.
+   * expired — this new session replaces it automatically, no confirmation needed. `message` is
+   * always present here: a live session now exists with MyDigital ID not yet confirmed, and the
+   * "no automatic re-check happens" rule needs to reach the model through this always-present
+   * field, not only through the tool description's prose — the same reasoning behind
+   * TELL_USER_UNCONFIRMED/TELL_USER_QUEUED below.
    */
-  | (SsivcSessionCreated & { discardedPaymentReceipt?: string; replacedExpiredVc?: ExistingVerifiedVcNote })
+  | (SsivcSessionCreated & { discardedPaymentReceipt?: string; replacedExpiredVc?: ExistingVerifiedVcNote; message: string })
   | RequestVerificationFailure
   | { quote: VerificationQuote }
   | RequestVerificationPending
@@ -318,7 +322,20 @@ export type CheckVerificationResult =
    */
   | { status: 'receipt_void'; message: string; paymentReceipt: string; discardedPaymentReceipt?: string }
   | (SsivcSessionStatus &
-      Partial<SessionExpiryFields> & { vc?: unknown; cacheError?: string; verificationUrl?: string; vcPassImagePaths?: string[] })
+      Partial<SessionExpiryFields> & {
+        vc?: unknown
+        cacheError?: string
+        verificationUrl?: string
+        vcPassImagePaths?: string[]
+        /**
+         * Set whenever `status: 'pending'` — MyDigital ID has not confirmed yet, and there is no
+         * automatic re-check: the model needs "ask the user to message back" through this
+         * always-present field, not only through the tool description's prose, matching the
+         * TELL_USER_UNCONFIRMED precedent elsewhere in this file. Not set on `issued` or other
+         * terminal statuses — there is nothing left to wait on there.
+         */
+        message?: string
+      })
 
 /** True iff `entry.vc.credentialSubject.id` equals `holderDid`. */
 function subjectMatches(vc: unknown, holderDid: string): boolean {
@@ -844,13 +861,53 @@ function ssivcAnswerNote(cause: unknown): string {
  * gloss ("this is normal", "picked up automatically"). Claims none of: success, failure, safety, or
  * that anything will recover by itself — and keeps "do not pay again" (SPEC REQ-19h).
  */
+// These used to end "I will check again shortly" — a first-person promise from the AGENT that it
+// will act again on its own. That is exactly the fabricated-polling claim QA caught live (an agent
+// that said it had "set up an automation" and then never checked again). This tool has no way to
+// act between messages at all, so the sentence a model is told to relay verbatim must ask the USER
+// to come back, not promise autonomous follow-through it cannot deliver.
 const TELL_USER_UNCONFIRMED =
   ` Tell the user: "Your payment was sent, but the credential service has not confirmed it yet, so I ` +
-  `cannot say whether it went through. The receipt is saved — please do not pay again. I will check ` +
-  `again shortly."`
+  `cannot say whether it went through. The receipt is saved — please do not pay again. Please message ` +
+  `me again in a few minutes and I will check."`
 const TELL_USER_QUEUED =
   ` Tell the user: "Your payment was sent and the settlement is still being processed. The receipt is ` +
-  `saved — please do not pay again. I will check again shortly."`
+  `saved — please do not pay again. Please message me again in a few minutes and I will check."`
+
+/** Below this remaining-time threshold, "message back in a few minutes" would send the user past the link's own expiry — the exact second half of the QA incident this rule exists to prevent. */
+const RECHECK_MESSAGE_URGENT_THRESHOLD_SECONDS = 300
+
+/**
+ * Attached to every result where a live SSIVC session now exists but MyDigital ID has not yet
+ * confirmed it. The "no automatic re-check" rule needs to reach the model through this
+ * always-present field, not only through the tool description's prose — the same reasoning behind
+ * TELL_USER_UNCONFIRMED/TELL_USER_QUEUED above — but the wording must also match the time actually
+ * left: telling someone to "message back in a few minutes" on a link that is already dead, or about
+ * to die, repeats the exact QA incident this rule exists to prevent, so the phrasing branches on
+ * `expiresAt` instead of asserting one sentence for every remaining-time case.
+ */
+function noAutoRecheckMessage(expiresAt: string, now: Date): string {
+  const expiry = sessionExpiryFields(expiresAt, now)
+  if (expiry && expiry.expiresInSeconds === 0) {
+    return (
+      `Tell the user: "This verification link has already expired, so completing MyDigital ID ` +
+      `verification on it will not work now. No automatic re-check happens on this end — please ` +
+      `message me back so a new verification link can be started."`
+    )
+  }
+  if (expiry && expiry.expiresInSeconds < RECHECK_MESSAGE_URGENT_THRESHOLD_SECONDS) {
+    return (
+      `Tell the user: "This verification link expires in ${expiry.expiresIn} — please complete ` +
+      `MyDigital ID verification right now, not later. No automatic re-check happens on this end, ` +
+      `so message me back once you have finished."`
+    )
+  }
+  return (
+    `Tell the user: "No automatic re-check happens on this end. Please message me again — once ` +
+    `you have completed MyDigital ID verification, or after a few minutes — and I will check the ` +
+    `status then."`
+  )
+}
 
 /**
  * What to tell the user when a receipt replay was rejected rather than left unresolved.
@@ -887,10 +944,11 @@ function issuerRejectionMessage(
       ? `, and THIS CALL ITSELF SENT A PAYMENT before the refusal — so a fee may have been spent on ` +
         `this attempt. It is still `
       : ` and no new payment was made, so this is still `) +
-    `recoverable and a refusal can clear once the service recovers — call ` +
-    `check_ai_birthcert_verification again later. It does NOT establish whether the fee was taken: ` +
-    `never tell the user they were not charged. Do NOT pay again. If it keeps repeating, quote the ` +
-    `receipt and this message to support.`
+    `recoverable and a refusal can clear once the service recovers — ask the user to message you ` +
+    `again in a few minutes, then call check_ai_birthcert_verification (you cannot act again on ` +
+    `your own between messages). It does NOT establish whether the fee was taken: never tell the ` +
+    `user they were not charged. Do NOT pay again. If it keeps repeating, quote the receipt and ` +
+    `this message to support.`
   )
 }
 
@@ -927,9 +985,10 @@ function paymentInvalidMessage(
       ? `, and THIS CALL ITSELF SENT A PAYMENT before that verdict — so a fee may have been spent ` +
         `on this attempt.`
       : ` and no new payment was made.`) +
-    ` Do NOT pay again and do NOT assume this is unrecoverable. Call ` +
-    `check_ai_birthcert_verification again later to see if it clears. If it keeps repeating, quote ` +
-    `the receipt and this message to support rather than guessing what it means.`
+    ` Do NOT pay again and do NOT assume this is unrecoverable. Ask the user to message you again ` +
+    `in a few minutes, then call check_ai_birthcert_verification to see if it clears (you cannot ` +
+    `act again on your own between messages). If it keeps repeating, quote the receipt and this ` +
+    `message to support rather than guessing what it means.`
   )
 }
 
@@ -1003,8 +1062,9 @@ async function resolveSettlement(
   if (outcome.kind === 'queued') {
     throw new SettlementStillQueuedError(
       'PAYMENT SENT — the sponsored settlement is still being processed. Nothing has gone wrong and ' +
-        'no funds are lost: the receipt has been saved. Call check_ai_birthcert_verification in a ' +
-        'few minutes to follow it through. Do not pay again.' +
+        'no funds are lost: the receipt has been saved. Ask the user to message you back in a few ' +
+        'minutes, then call check_ai_birthcert_verification to follow it through (you cannot act ' +
+        'again on your own between messages). Do not pay again.' +
         TELL_USER_QUEUED,
       outcome.paymentReceipt,
     )
@@ -1578,7 +1638,7 @@ async function checkExistingVerifiedVc(
  */
 function canCarryReplacedExpiredVc(
   result: RequestVerificationResult,
-): result is (SsivcSessionCreated & { discardedPaymentReceipt?: string }) | RequestVerificationPending {
+): result is (SsivcSessionCreated & { discardedPaymentReceipt?: string; message: string }) | RequestVerificationPending {
   return typeof result === 'object' && result !== null && !('error' in result)
 }
 
@@ -1655,7 +1715,8 @@ async function payOrReplayLocked(
   input: RequestAiBirthcertVerificationInput,
 ): Promise<RequestVerificationResult> {
   const decision = await decidePriorSession(deps, agentName)
-  if (decision.kind === 'still_pending') return decision.result
+  if (decision.kind === 'still_pending')
+    return { ...decision.result, message: noAutoRecheckMessage(decision.result.expiresAt, deps.now()) }
   if (decision.kind === 'blocked') return { error: decision.message }
 
   /**
@@ -1936,14 +1997,16 @@ async function payOrReplayLocked(
           message: paidThisCall
             ? `PAYMENT SENT — the settlement has not been confirmed yet, ${age.humanAge} in. This call ` +
               `itself sent the payment; whether it settled is not yet known. Receipt ` +
-              `${err.paymentReceipt} is saved. Do NOT pay again. Call ` +
-              `check_ai_birthcert_verification in a few minutes to follow it through.` +
+              `${err.paymentReceipt} is saved. Do NOT pay again. Ask the user to message you back in ` +
+              `a few minutes, then call check_ai_birthcert_verification to follow it through (you ` +
+              `cannot act again on your own between messages).` +
               ssivcAnswerNote(err.cause) +
               TELL_USER_UNCONFIRMED
             : `PAYMENT SENT — the settlement has not been confirmed yet, ${age.humanAge} in. The outcome is ` +
               `not known yet, so do not tell the user the payment succeeded or that it failed. Receipt ` +
-              `${err.paymentReceipt} is saved and no new payment was attempted. Do NOT pay again. Call ` +
-              `check_ai_birthcert_verification in a few minutes to follow it through.` +
+              `${err.paymentReceipt} is saved and no new payment was attempted. Do NOT pay again. Ask ` +
+              `the user to message you back in a few minutes, then call check_ai_birthcert_verification ` +
+              `to follow it through (you cannot act again on your own between messages).` +
               ssivcAnswerNote(err.cause) +
               TELL_USER_UNCONFIRMED,
         }
@@ -1984,7 +2047,7 @@ async function payOrReplayLocked(
     ...effectiveOptionalFields,
   })
 
-  return paid.session
+  return { ...paid.session, message: noAutoRecheckMessage(paid.session.expiresAt, deps.now()) }
 }
 
 /**
@@ -2084,6 +2147,7 @@ async function advanceQueuedSettlement(
     status: 'pending',
     expiresAt: settled.session.expiresAt,
     verificationUrl: settled.session.verificationUrl,
+    message: noAutoRecheckMessage(settled.session.expiresAt, deps.now()),
   }
 }
 
@@ -2197,8 +2261,9 @@ function unknownSettlementOutcome(
       message:
         `PAYMENT SENT — the settlement has not been confirmed yet, ${age.humanAge} in. The outcome is ` +
         `not known yet, so do not tell the user the payment succeeded or that it failed. Receipt ` +
-        `${paymentReceipt} is saved. Do NOT pay again. Call check_ai_birthcert_verification again in ` +
-        `a few minutes to follow it through.` +
+        `${paymentReceipt} is saved. Do NOT pay again. Ask the user to message you back in a few ` +
+        `minutes, then call check_ai_birthcert_verification to follow it through (you cannot act ` +
+        `again on your own between messages).` +
         ssivcAnswerNote(cause ?? err) +
         TELL_USER_UNCONFIRMED,
     }
@@ -2584,7 +2649,7 @@ async function fetchAndCacheIssuedVc(
 async function checkExistingSession(
   deps: Pick<
     VerifyAiBirthcertDeps,
-    'ssivc' | 'mbi' | 'messageSigner' | 'address' | 'holderDid' | 'verifiedTemplateId' | 'cache' | 'quarantine' | 'passImagesDir'
+    'ssivc' | 'mbi' | 'messageSigner' | 'address' | 'holderDid' | 'verifiedTemplateId' | 'cache' | 'quarantine' | 'passImagesDir' | 'now'
   >,
   stored: StoredSsivcSession,
 ): Promise<CheckVerificationResult> {
@@ -2597,10 +2662,14 @@ async function checkExistingSession(
   //
   // Only while the session can still be acted on. Once myid has issued, the link is spent, and
   // handing it back would send the owner into a MyDigital ID flow that is already finished.
+  // Only 'pending' invites "message me again" — an 'expired' (or any other confirmed non-issued,
+  // non-pending) status is dead, and telling the holder to just wait and message back would be
+  // actively wrong there.
+  const pendingMessage = status.status === 'pending' ? { message: noAutoRecheckMessage(status.expiresAt, deps.now()) } : {}
   if (status.status !== 'issued' && stored.verificationUrl) {
-    return { ...status, verificationUrl: stored.verificationUrl }
+    return { ...status, verificationUrl: stored.verificationUrl, ...pendingMessage }
   }
-  if (status.status !== 'issued' || !status.vcId) return status
+  if (status.status !== 'issued' || !status.vcId) return { ...status, ...pendingMessage }
   const vcId = status.vcId
 
   // Already fetched and cached by an earlier call — no need to hit MBI again, as long as that

@@ -136,8 +136,22 @@ export interface SubscribeOpts {
    * so it is not a safe way to ask a price.
    */
   dryRun?: boolean
-  /** Skip the cache and pay + issue fresh regardless of what's cached. */
+  /**
+   * Alone, this does NOT pay again — if a valid VC is already cached it is a request to be SHOWN
+   * that credential (not consent to replace it; see `confirmReplaceExistingVc`), so nothing is paid
+   * and no new credential is issued. Has no effect at all when nothing valid is cached: that case
+   * has always paid and issued fresh regardless of this flag.
+   */
   forceReissue?: boolean
+  /**
+   * Exact `vcId` of a currently-valid cached VC that the holder wants replaced anyway. Required,
+   * together with `forceReissue: true`, to actually pay and reissue over a still-valid cached VC —
+   * the same "must echo the id you were shown" pattern as
+   * `request_ai_birthcert_verification`'s field of the same name, so a caller cannot decide to
+   * replace a still-good credential without the holder having actually seen it first. Ignored (and
+   * unnecessary) when nothing valid is cached, or when `forceReissue` is not set.
+   */
+  confirmReplaceExistingVc?: string
 }
 
 export interface Quote {
@@ -362,10 +376,11 @@ export async function subscribeAndIssue(deps: SubscribeDeps, opts: SubscribeOpts
     ? { required: fields.required, optional: fields.allKeys.filter((k) => !fields.required.includes(k)) }
     : undefined
 
-  // Reuse a still-valid previously-issued VC instead of paying + issuing again. Skipped by
-  // forceReissue (fresh regardless of what's cached) and by dryRun (quoting a fresh price is
-  // independent of, and free relative to, whatever happens to be cached).
-  if (deps.cache && !opts.forceReissue && !opts.dryRun) {
+  // Reuse a still-valid previously-issued VC instead of paying + issuing again. Skipped only by
+  // dryRun (quoting a fresh price is independent of, and free relative to, whatever happens to be
+  // cached) — NOT by forceReissue, which now merely EXPRESSES intent to replace a valid VC rather
+  // than immediately acting on it (see below): a caller must still be shown what it would replace.
+  if (deps.cache && !opts.dryRun) {
     const cached = await deps.cache.get(opts.templateId)
     if (cached && isVcValid(cached)) {
       // Serving from cache costs nothing, so txHash/paidAsset/amountPaid stay unset — they
@@ -378,14 +393,67 @@ export async function subscribeAndIssue(deps: SubscribeDeps, opts: SubscribeOpts
       // one, means no charge to report.
       const paidOriginally = cached.amountPaid !== undefined && cached.amountPaid !== '0'
       const staleAttributes = fields ? diffAgainstTemplate(cached.vc, fields) : undefined
-      return {
-        issued: true,
+      // Shared by every cache-derived return below — built once so a field added to one shape
+      // (e.g. vcPassImagePaths) cannot be forgotten on the other.
+      const cacheHitFields = {
         vcId: cached.vcId,
         vc: cached.vc,
-        fromCache: true,
+        fromCache: true as const,
         ...(paidOriginally ? { originalPayment } : {}),
         ...(schema ? { schema } : {}),
         ...(staleAttributes ? { staleAttributes } : {}),
+        ...(cached.vcPassImagePaths ? { vcPassImagePaths: cached.vcPassImagePaths } : {}),
+      }
+
+      // forceReissue alone is not consent: a caller could set it on its own judgement without the
+      // holder ever having seen the credential it would replace.
+      if (opts.forceReissue) {
+        // A cache entry with no usable `vcId` (an older record, a writer that omitted it, or a
+        // non-string/empty value) must NOT fail open into paying without confirmation — fall back
+        // to the VC document's own `id` (the same fallback identifier every VC carries; mirrors
+        // resolveVcPassImagePaths's own use of `vcId` for quarantine lookups), and if even THAT is
+        // unavailable, refuse to replace it automatically at all rather than silently spend over an
+        // unconfirmable credential.
+        const cachedVcId = typeof cached.vcId === 'string' && cached.vcId ? cached.vcId : undefined
+        const rawBodyId = typeof cached.vc === 'object' && cached.vc !== null ? (cached.vc as { id?: unknown }).id : undefined
+        const confirmableVcId = cachedVcId ?? (typeof rawBodyId === 'string' && rawBodyId ? rawBodyId : undefined)
+
+        if (!confirmableVcId) {
+          return {
+            issued: false,
+            reason:
+              `A credential for this template already exists and is still valid` +
+              (cached.validUntil ? ` until ${cached.validUntil}` : '') +
+              `, but it has no confirmable credential id. Nothing was paid and no new credential was ` +
+              `issued — replacing it automatically is refused because there is nothing to safely ` +
+              `confirm against. Show the existing credential to the user; there is no supported way ` +
+              `to replace it until this is resolved, so quote this to support if a fresh credential ` +
+              `is genuinely needed.`,
+            ...cacheHitFields,
+          }
+        }
+
+        // Only proceed to pay a second time once confirmReplaceExistingVc echoes back this EXACT
+        // id — the same "must have been shown the id" pattern request_ai_birthcert_verification uses.
+        if (opts.confirmReplaceExistingVc !== confirmableVcId) {
+          return {
+            issued: false,
+            reason:
+              `A credential for this template already exists and is still valid` +
+              (cached.validUntil ? ` until ${cached.validUntil}` : '') +
+              ` (credential id ${confirmableVcId}). Nothing was paid and no new credential was issued. ` +
+              `Show this to the user before doing anything else. Call subscribe_and_issue again with ` +
+              `forceReissue set to true AND confirmReplaceExistingVc set to exactly "${confirmableVcId}" ` +
+              `only if the user explicitly wants to replace it.`,
+            ...cacheHitFields,
+            // Overrides cacheHitFields.vcId (which may be absent/non-string on the fallback path
+            // above) with the exact id the message just told the caller to echo back.
+            vcId: confirmableVcId,
+          }
+        }
+        // else: confirmed — fall through to pay + issue fresh.
+      } else {
+        return { issued: true, ...cacheHitFields }
       }
     }
   }

@@ -48,6 +48,9 @@ Your host may present them slightly differently — match on the part after the 
 | `get_policy_template_schema` | no | Which spending rules a policy template allows you to write |
 | `get_my_policy` | no | The spending policies this wallet owner has deployed on chain |
 | `policy_preflight` | no | Checking a draft spending policy — is it valid, and does it MEAN what the user thinks |
+| `check_policy_decision` | no | Asking whether a spend is permitted RIGHT NOW — but a permitted answer RESERVES capacity for ~15 min, so never poll it |
+| `write_policy` | **YES** | Deploying a spending policy on chain. Run `policy_preflight` first and show the user what it MEANS |
+| `check_policy_write` | no | Finishing a policy write already paid for — the right answer to "did it get created?" |
 | `transfer_token` | **yes** | Sending ZTX or a ZTP20 token to an address — **moves real funds, irreversible** |
 
 ## Safe first action
@@ -97,6 +100,23 @@ spend from the user's wallet. Every time:
    already-expired one is replaced automatically, no confirmation needed. It can also refuse with
    `{ error }` when an already-issued credential exists but could not be confirmed — relay that error
    as given rather than retrying blindly.
+7. `subscribe_and_issue` has the same check, its own way: a still-valid cached credential is always
+   returned for free with no confirmation needed (`fromCache: true`). `forceReissue: true` on its own
+   does **not** pay either — it only returns that same existing credential (`issued: false, reason`)
+   so it can be shown to the user first. Only call it again with `forceReissue: true` **and**
+   `confirmReplaceExistingVc` set to the exact `vcId` you were shown if the user explicitly asks to
+   replace it. It also has the same naming rule as `request_ai_birthcert_verification`: get any
+   name/identifier attribute (e.g. `agentUsername`) from the user directly — never invent one.
+8. **Nothing keeps running after a tool call returns.** `check_ai_birthcert_verification` checks the
+   live status once, at the moment you call it, and nothing more — there is no background polling,
+   webhook, or timer behind it. (A couple of OTHER tools do their own bounded, synchronous
+   in-call waiting — e.g. `subscribe_and_issue`'s brief settlement retry — but that waiting is
+   entirely inside that one call; it never continues after the call returns.) Never tell the user
+   you have "set up an automation" or that you will "alert them" when a pending verification
+   completes — you cannot act between messages, so that promise can never be kept and leaves them
+   waiting for a notification that will never come. Instead, tell them how long the link is good
+   for (`expiresIn`) and ask them to message you back once they are done, or after a few minutes, so
+   you can check again.
 
 **Treat the wallet's payment cap as the boundary, not your own judgement.** If a payment is refused
 for exceeding the cap, relay that and stop. Do not retry, do not try a smaller amount to discover the
@@ -161,7 +181,8 @@ Read `message`, not just the flags. These cases need different answers:
 - **No `outcomeUnknown`, message says *"has not been confirmed yet"*** — same flags, different
   state: the outcome could not be determined at all yet. Do **not** call this progressing and do
   **not** call it succeeded. Say the payment was sent, the outcome is not confirmed, the receipt is
-  saved, and you will check again later. Do not pay again.
+  saved, and ask them to message you again in a few minutes so you can check — you cannot check on
+  your own between messages. Do not pay again.
 - **`outcomeUnknown: true`** (the message starts `OUTCOME UNKNOWN`) — the wallet could not determine
   what happened. Do not simply tell them to wait. Give them the `paymentReceipt` and tell them to
   quote it to support; it is the only record of the payment.
@@ -215,7 +236,24 @@ on chain. Report the nonce and tell the user to check it before anything else is
 ## Spending policies
 
 A policy is the user's own spending rulebook for this wallet, stored on chain. Reading one is
-always free. This wallet can only READ policies today — it cannot write or deploy one.
+always free. Writing one costs a fee and goes through write_policy; reading and checking are free.
+
+**`check_policy_decision` has three outcomes, and `undetermined` is the one to get right.** It is
+NOT a refusal and NOT permission — it means nothing was evaluated, so never tell the user their
+policy blocked them on the strength of it, and never spend. There is no step-up verdict: the
+decision service answers only allow or deny. A permitted answer reserves capacity for about
+fifteen minutes, so do not call it in a loop — and do not probe amounts to find one that fits,
+because every permitted answer along the way reserves again and the owner's next real payment can
+be refused by their own agent. Read `remaining` from ONE answer and work it out locally. Never
+retry automatically after a timeout either: the call may have succeeded and reserved already.
+Read `ignored` back even on a permitted answer —
+it lists constraints the policy carries that the service could not enforce.
+**A policy write that is `settling` or `submitted` has ALREADY BEEN PAID FOR.** No policy exists
+yet, and that is the normal window rather than a failure. Never call `write_policy` again for it —
+pass its `paymentReceipt` to `check_policy_write`, which never pays. `submitted` carries a
+`txHash` and still is not a written policy: the block has not confirmed it, so do not tell the user
+their policy exists. Only `written` means that. The one state where paying again is right is
+"receipt_void", and it sets `payFresh` to say so.
 
 **Always run `policy_preflight` on a draft before anyone deploys it, and always show the user its
 `interpretation` — including when `ready` is true.** The chain validates nothing: a policy can be
