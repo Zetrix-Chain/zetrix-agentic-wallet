@@ -63,4 +63,30 @@ describe('buildToolContent', () => {
     const blocks = await buildToolContent(null, readFile)
     expect(blocks).toEqual([{ type: 'text', text: 'null' }])
   })
+
+  describe('a QR code in the result', () => {
+    it('is sent as a PNG image block and kept out of the JSON text', async () => {
+      const png = Buffer.from('png-bytes').toString('base64')
+      const result = { created: true, link: 'https://link.myid.test/x?referenceId=v2-1', qrCodePngBase64: png }
+
+      const blocks = await buildToolContent(result, vi.fn())
+
+      expect(blocks).toEqual([
+        { type: 'text', text: JSON.stringify({ created: true, link: 'https://link.myid.test/x?referenceId=v2-1' }) },
+        { type: 'image', data: png, mimeType: 'image/png' },
+      ])
+    })
+
+    it('leaves a result without a QR as a single text block', async () => {
+      const result = { created: true, link: 'https://link.myid.test/x?referenceId=v2-1', qrError: 'qr failed' }
+
+      expect(await buildToolContent(result, vi.fn())).toEqual([{ type: 'text', text: JSON.stringify(result) }])
+    })
+
+    it('ignores a qrCodePngBase64 that is not a non-empty string', async () => {
+      const result = { qrCodePngBase64: 42 }
+
+      expect(await buildToolContent(result, vi.fn())).toEqual([{ type: 'text', text: JSON.stringify(result) }])
+    })
+  })
 })

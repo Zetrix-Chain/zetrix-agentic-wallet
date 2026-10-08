@@ -16,7 +16,7 @@
  * duplicate charge into one the wallet had promised would not happen.
  */
 
-import { describePaymentCap, type PaymentCapDescription } from '../payment-guard.js'
+import { describePaymentCap, describePolicyGovernedCap, type PaymentCapDescription } from '../payment-guard.js'
 import type { TokenBalanceResult } from '../clients/token-balance-client.js'
 
 /** The Verified AI Birthcert (myid SSIVC), as opposed to a template-issued credential. */
@@ -48,8 +48,20 @@ export interface PreflightFee {
   paymentRequired?: boolean
 }
 
+/** A valid credential the wallet already holds, as preflight reports it. Names what it is; carries no personal data. */
+export interface HeldCredential {
+  label: string
+  vcId?: string
+  validUntil?: string
+}
+
 export interface PreflightResult {
   credential: string
+  /**
+   * Set when the wallet already holds a valid copy of this credential. Without `replacing` that stops preflight (nothing
+   * is priced and `ready` is false); with it, preflight carries on and this says what would be replaced.
+   */
+  alreadyHeld?: HeldCredential & { replacing?: true }
   /** True only when nothing in `blockers` stands in the way. */
   ready: boolean
   fee?: PreflightFee
@@ -73,15 +85,25 @@ export interface PreflightInput {
    * present the placeholder as the name that will be used.
    */
   agentName?: string
+  /**
+   * Set ONLY when the user has said they want a replacement for the credential they already hold. It is an instruction
+   * to the agent like `confirm`, never to be passed on its own judgement; without exactly `true`, a held credential
+   * stops preflight.
+   */
+  replacing?: boolean
 }
 
 export interface PreflightDeps {
+  /** Whether the wallet already holds a valid copy of the credential, answered locally. Optional: absent, nothing is checked. */
+  findHeld?: (credential: string) => Promise<HeldCredential | undefined>
   /** `requestAiBirthcertVerification` with `dryRun`, returning `{ quote }` or `{ error }`. */
   quoteVerified: (input: { agentName: string; dryRun: true }) => Promise<Record<string, unknown>>
   /** `subscribeAndIssue` with `dryRun`, returning `{ quote, schema? }` or `{ reason }`. */
   quoteTemplate: (templateId: string) => Promise<Record<string, unknown>>
   queryTokenBalance: (token: string) => Promise<TokenBalanceResult>
   caps: Record<string, string> | undefined
+  /** True when the owner's spending policy governs the asset, so the default cap is not applied. */
+  policyGoverns?: (asset: string) => Promise<boolean>
 }
 
 /**
@@ -97,6 +119,44 @@ export async function credentialPreflight(deps: PreflightDeps, input: PreflightI
   const blockers: string[] = []
   const notChecked: string[] = []
   const isVerified = input.credential === VERIFIED_AI_BIRTHCERT
+
+  // FIRST, and free: if the wallet already holds this credential, nothing below matters. The paid call has its own guard
+  // against replacing a valid credential, but by then the agent has already walked the user through choosing a name.
+  let alreadyHeld: PreflightResult['alreadyHeld']
+  if (deps.findHeld) {
+    try {
+      const found = await deps.findHeld(input.credential)
+      if (found) {
+        const replacing = input.replacing === true
+        alreadyHeld = { ...found, ...(replacing ? { replacing: true as const } : {}) }
+        if (!replacing) {
+          const until = found.validUntil ? ` (valid until ${found.validUntil.slice(0, 10)})` : ''
+          return {
+            credential: input.credential,
+            ready: false,
+            alreadyHeld,
+            balances: [],
+            blockers: [
+              `This wallet already holds a valid ${found.label}${until}${found.vcId ? `, ${found.vcId}` : ''}. Tell the user, and do not start another: ` +
+                `a new one would REPLACE it (the wallet keeps one per template) and costs the fee. Only if the user explicitly says they want a ` +
+                `replacement, run this check again with replacing: true.`,
+            ],
+            notChecked: [],
+          }
+        }
+      } else {
+        notChecked.push(
+          'Preflight only looks at credentials this wallet has already saved. A credential that was paid for and issued but not yet collected with ' +
+            'check_ai_birthcert_verification would not show here.',
+        )
+      }
+    } catch (e) {
+      // Never "nothing is held": the lookup failing says nothing about what the wallet holds.
+      notChecked.push(
+        `Whether this wallet already holds one could not be checked (${e instanceof Error ? e.message : String(e)}), so do not assume it does not.`,
+      )
+    }
+  }
 
   const quoted = isVerified
     ? await deps.quoteVerified({ agentName: input.agentName?.trim() || placeholderAgentName(), dryRun: true })
@@ -114,9 +174,10 @@ export async function credentialPreflight(deps: PreflightDeps, input: PreflightI
       credential: input.credential,
       ready: false,
       balances: [],
+      ...(alreadyHeld ? { alreadyHeld } : {}),
       ...(schema ? { schema } : {}),
       blockers: [`Could not price this credential: ${why}`],
-      notChecked: uncheckable(isVerified),
+      notChecked: [...notChecked, ...uncheckable(isVerified)],
     }
   }
 
@@ -166,7 +227,10 @@ export async function credentialPreflight(deps: PreflightDeps, input: PreflightI
 
   // The cap limits what may be SPENT, so it cannot stand in the way of spending nothing. Still
   // described in the result (headroom is worth seeing) — it just raises no blocker when free.
-  const cap = describePaymentCap(asset, requiredRaw, deps.caps)
+  const cap =
+    deps.policyGoverns && (await deps.policyGoverns(asset))
+      ? describePolicyGovernedCap(asset)
+      : describePaymentCap(asset, requiredRaw, deps.caps)
   if (!cap.wouldPass && !isFree) blockers.push(renderCapBlocker(cap, requiredRaw, feeBalance))
 
   return {
@@ -182,14 +246,15 @@ export async function credentialPreflight(deps: PreflightDeps, input: PreflightI
     },
     balances,
     cap,
+    ...(alreadyHeld ? { alreadyHeld } : {}),
     ...(schema ? { schema } : {}),
     blockers,
-    notChecked: uncheckable(isVerified, isFree),
+    notChecked: [...notChecked, ...uncheckable(isVerified, isFree)],
   }
 }
 
 /** Render a raw amount using the decimals the balance read already resolved. */
-function renderAmount(raw: string, balance: TokenBalanceResult): string {
+export function renderAmount(raw: string, balance: TokenBalanceResult): string {
   if ('error' in balance || balance.decimals === null) return raw
   const d = BigInt(10) ** BigInt(balance.decimals)
   const whole = BigInt(raw) / d
@@ -205,7 +270,7 @@ function renderAmount(raw: string, balance: TokenBalanceResult): string {
  * alongside "issuance requires 1,000,000" (this function, unrendered) had no way to tell that
  * second number was already the same unit, not a distinct raw count needing its own conversion.
  */
-function renderCapBlocker(cap: PaymentCapDescription, requiredRaw: string, feeBalance: TokenBalanceResult): string {
+export function renderCapBlocker(cap: PaymentCapDescription, requiredRaw: string, feeBalance: TokenBalanceResult): string {
   const requiredHuman = renderAmount(requiredRaw, feeBalance)
   if (cap.capRaw === null) {
     return `No spending limit applies to ${cap.asset}, and limits are configured — so this payment would be refused. Set a limit keyed by "${cap.asset}".`

@@ -1,5 +1,5 @@
 /**
- * The checks that would have caught BT-3000, run against the REAL templates.
+ * The checks that would have caught that, run against the REAL templates.
  *
  * Everything here uses `fixtures/real-policy-templates.ts`, copied from chain. The five defects this
  * pins all shipped through a thorough, self-consistent suite that validated against an invented
@@ -31,6 +31,13 @@ const deps = (template: unknown) => ({
   network: 'zetrix:testnet',
   isValidAddress: (a: string) => keypair.checkAddress(a),
 })
+
+/**
+ * A cap is denominated in an asset, and the write service refuses one that does not say which. The
+ * tests below that assert a cap is READY used to omit this — encoding the false assurance that a
+ * real transcript exposed — so they now name a scope explicitly.
+ */
+const SCOPE = { attributeName: 'assetScope', attributeType: 'STRING', value: 'native' }
 
 const draft = (attributes: Array<{ attributeName: string; attributeType: string; value: string }>) => ({
   policyKey: 'ztp20-v1',
@@ -72,8 +79,9 @@ describe('type validation actually fires on a real template', () => {
 
   it('accepts a well-formed NUMBER', async () => {
     const r = await policyPreflight(deps(ZTP20_V1), draft([
+      SCOPE,
       { attributeName: 'cumulativeMax', attributeType: 'NUMBER', value: '500000000' },
-      { attributeName: 'cumulativeWindow', attributeType: 'STRING', value: '43200' },
+      { attributeName: 'cumulativeWindow', attributeType: 'STRING', value: '12h' },
     ]))
     expect(r.ready).toBe(true)
   })
@@ -85,8 +93,12 @@ describe('type validation actually fires on a real template', () => {
     expect(bad.ready).toBe(false)
     expect(bad.blockers.join(' ')).toMatch(/checksum/i)
 
+    // A token address only says WHICH token; with nothing else the policy answers NO_ENFORCEABLE_CONSTRAINTS
+    // (a DENY), so the good draft carries a cap as well — the service's vocabulary calls tokenAddress a QUALIFIER.
     const good = await policyPreflight(deps(ZTP20_V1), draft([
+      { attributeName: 'assetScope', attributeType: 'STRING', value: 'ztp20' },
       { attributeName: 'tokenAddress', attributeType: 'ADDRESS', value: VALID_ADDRESS },
+      { attributeName: 'perTransactionMax', attributeType: 'NUMBER', value: '1000000' },
     ]))
     expect(good.ready).toBe(true)
   })
@@ -125,7 +137,7 @@ describe('type validation actually fires on a real template', () => {
 })
 
 describe('list attributes are read with the RIGHT POLARITY, or not interpreted at all', () => {
-  // BT-3000 APP-C01: the first cut keyed on the TYPE alone, so a denylist got allowlist prose —
+  // APP-C01: the first cut keyed on the TYPE alone, so a denylist got allowlist prose —
   // a user told that listing an address permits it would list the addresses they wanted to allow,
   // thereby blocking exactly those and permitting everyone else. The type says a value is a list;
   // it says nothing about which way the list points.
@@ -416,11 +428,13 @@ describe('list attributes are read with the RIGHT POLARITY, or not interpreted a
     allLines(r).filter((line) => line.endsWith('…'))
 
   it('caps every echo on a result that has NO blockers at all', async () => {
-    // APP-M01 round 5, and the case that proves this is not an error-path concern. A 50,000-digit
-    // perTransactionMax against the real ztp20-v1 is well-formed: ready:true, zero blockers, and an
-    // interpretation of 50,035 characters, which round 5's test never looked at.
+    // APP-M01 round 5, and the case that proves this is not an error-path concern. The largest amount the wallet
+    // accepts (77 digits — a 256-bit number is never longer) against the real ztp20-v1 is well-formed: ready:true,
+    // zero blockers, and an interpretation line that must still be capped. (A 50,000-digit amount is now refused
+    // outright — see policy-amount-unit.test.ts — so it can no longer be the input here.)
     const r = await policyPreflight(deps(ZTP20_V1), draft([
-      { attributeName: 'perTransactionMax', attributeType: 'NUMBER', value: '9'.repeat(50_000) },
+      SCOPE,
+      { attributeName: 'perTransactionMax', attributeType: 'NUMBER', value: '9'.repeat(77) },
     ]))
     expect(r.ready).toBe(true)
     expect(r.blockers).toEqual([])
@@ -808,11 +822,14 @@ describe('list attributes are read with the RIGHT POLARITY, or not interpreted a
     // the assertion said nothing about the input it was named for. The size claim is the real one.
     const huge = 'x'.repeat(50_000)
     const r = await policyPreflight(deps(ZTP20_V1), draft([
+      SCOPE,
       { attributeName: 'cumulativeMax', attributeType: 'NUMBER', value: '1000' },
       { attributeName: 'cumulativeWindow', attributeType: 'STRING', value: huge },
     ]))
-    // Enforceable now, so the verdict turns on the value rather than on the shape of the draft.
-    expect(r.ready).toBe(true)
+    // A 50,000-character window is not a duration, so the service refuses it and preflight now says so.
+    // The point of this test is unchanged: however large the value, what is echoed back is bounded.
+    expect(r.ready).toBe(false)
+    expect(r.blockers.join(' ')).toMatch(/cumulativeWindow.*refuses/)
     expect(longestString(r)).toBeLessThanOrEqual(MAX_MESSAGE)
     expect(truncated(r)).toEqual([])
   })
@@ -891,6 +908,7 @@ describe('the window rules hold against the real templates', () => {
 
   it('still calls a windowless cumulativeMax a lifetime cap, on a real template', async () => {
     const r = await policyPreflight(deps(ZTP20_V1), draft([
+      SCOPE,
       { attributeName: 'cumulativeMax', attributeType: 'NUMBER', value: '500000000' },
     ]))
     expect(r.ready).toBe(true)

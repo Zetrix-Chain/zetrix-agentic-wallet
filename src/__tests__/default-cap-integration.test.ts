@@ -27,13 +27,15 @@ describe('the out-of-the-box spending cap, end to end', () => {
     expect(() => assertWithinPaymentCap(mainnetFee, cfg.credentialIssuanceCaps)).not.toThrow()
   })
 
-  // The allowance is scoped to issuance on purpose. pay_and_fetch auto-pays arbitrary URLs, so the
-  // same default there would let a misled agent be drained of real value on a wallet nobody
-  // configured — the confused-deputy case the payment guard exists to prevent.
-  it('but that mainnet allowance does NOT extend to pay_and_fetch — the general cap still refuses it', () => {
+  // Note: the allowance WAS scoped to issuance on purpose, because pay_and_fetch auto-pays arbitrary URLs and a
+  // misled agent could drain a wallet nobody configured. The reviewer agreed to give the general cap the same default; the
+  // exposure is now up to 1 JMYR per call, with no running total, until the user sets MAX_PAYMENT_AMOUNT.
+  it('and now the same 1 JMYR is allowed by the GENERAL cap too, and nothing above it or in any other asset', () => {
     const cfg = loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet' } as never)
     const mainnetFee = { asset: JMYR_MAINNET, maxAmountRequired: '1000000' }
-    expect(() => assertWithinPaymentCap(mainnetFee, cfg.maxPaymentAmount)).toThrow()
+    expect(() => assertWithinPaymentCap(mainnetFee, cfg.maxPaymentAmount)).not.toThrow()
+    expect(() => assertWithinPaymentCap({ asset: JMYR_MAINNET, maxAmountRequired: '1000001' }, cfg.maxPaymentAmount)).toThrow()
+    expect(() => assertWithinPaymentCap({ asset: 'ZTX', maxAmountRequired: '1' }, cfg.maxPaymentAmount)).toThrow()
   })
 
   it('...and an unconfigured MAINNET wallet still refuses anything above the fee, and every other asset', () => {

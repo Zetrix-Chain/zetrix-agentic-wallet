@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { MbiVpAdapter, dcqlToRevealAttributes } from '../clients/mbi-vp-adapter'
+import { MbiVpAdapter, dcqlToRevealAttributes, orderRevealPaths, unresolvedRevealPaths } from '../clients/mbi-vp-adapter'
 
 /** The DCQL query as it arrives at createVp — the sandbox `requirements`/`credential_query` shape. */
 const AGENT_DCQL = {
@@ -43,23 +43,24 @@ describe('MbiVpAdapter (x401 VcProofProvider over MBI /vp/ext/*)', () => {
     const signMessage = vi.fn().mockResolvedValue({ signBlob: 'addr-sig', publicKey: 'authpk' })
     const resolveIssuerKeys = vi.fn().mockResolvedValue({ bbsPublicKey: 'issuer-bbs-pk', ed25519PublicKey: 'issuer-ed-hex' })
 
-    const adapter = new MbiVpAdapter(mbi as never, signHexBlob, signMessage, 'ZTX3Holder', resolveIssuerKeys, {
+    const adapter = new MbiVpAdapter(mbi as never, signHexBlob, signMessage, resolveIssuerKeys, {
       vc: { id: 'vc-1' },
       revealAttribute: ['mykad.name'],
     })
 
     const out = await adapter.createVp({ credentialQuery: { q: 1 }, nonce: 'n1', holderDid: 'did:zid:h' })
 
-    // Auth: sign the holder's own address once, reuse for both calls.
-    expect(signMessage).toHaveBeenCalledWith('ZTX3Holder')
+    // Auth: the adapter no longer signs anything for MBI itself. MbiClient signs each /ext request
+    // (request-bound), so the adapter hands it the message signer for both calls.
+    expect(signMessage).not.toHaveBeenCalled()
     expect(mbi.createVp).toHaveBeenCalledWith(
       { vc: { id: 'vc-1' }, revealAttributes: ['mykad.name'] },
-      { signedData: 'addr-sig', publicKey: 'authpk' },
+      signMessage,
     )
     expect(signHexBlob).toHaveBeenCalledWith('deadbeef')
     expect(mbi.submitVp).toHaveBeenCalledWith(
       { blobId: 'b1', signedBlob: 'sig', publicKey: 'edpk', includeVp: true },
-      { signedData: 'addr-sig', publicKey: 'authpk' },
+      signMessage,
     )
     // The issuer's resolved keys go to the OID4VP verifier — NOT the holder's signing key above.
     expect(resolveIssuerKeys).toHaveBeenCalledWith({ id: 'vc-1' })
@@ -76,7 +77,7 @@ describe('MbiVpAdapter (x401 VcProofProvider over MBI /vp/ext/*)', () => {
     const signHexBlob = vi.fn().mockResolvedValue({ signBlob: 's', publicKey: 'pk' })
     const signMessage = vi.fn().mockResolvedValue({ signBlob: 'as', publicKey: 'apk' })
     const resolveIssuerKeys = vi.fn().mockResolvedValue({ bbsPublicKey: '', ed25519PublicKey: '' })
-    const adapter = new MbiVpAdapter(mbi as never, signHexBlob, signMessage, 'ZTX3H', resolveIssuerKeys, { vc: { id: 'v' } })
+    const adapter = new MbiVpAdapter(mbi as never, signHexBlob, signMessage, resolveIssuerKeys, { vc: { id: 'v' } })
 
     const out = await adapter.createVp({ credentialQuery: {}, nonce: 'n', holderDid: 'd' })
 
@@ -90,7 +91,7 @@ describe('MbiVpAdapter (x401 VcProofProvider over MBI /vp/ext/*)', () => {
     const signHexBlob = vi.fn().mockResolvedValue({ signBlob: 's', publicKey: 'pk' })
     const signMessage = vi.fn().mockResolvedValue({ signBlob: 'as', publicKey: 'apk' })
     const resolveIssuerKeys = vi.fn().mockResolvedValue({ bbsPublicKey: '', ed25519PublicKey: '' })
-    const adapter = new MbiVpAdapter(mbi as never, signHexBlob, signMessage, 'ZTX3H', resolveIssuerKeys, {
+    const adapter = new MbiVpAdapter(mbi as never, signHexBlob, signMessage, resolveIssuerKeys, {
       vc: { id: 'v' },
       rangeProof: { ageOver: 18 },
     })
@@ -99,7 +100,7 @@ describe('MbiVpAdapter (x401 VcProofProvider over MBI /vp/ext/*)', () => {
 
     expect(mbi.createVp).toHaveBeenCalledWith(
       { vc: { id: 'v' }, revealAttributes: [], rangeProof: { ageOver: 18 } },
-      { signedData: 'as', publicKey: 'apk' },
+      signMessage,
     )
   })
 
@@ -109,7 +110,7 @@ describe('MbiVpAdapter (x401 VcProofProvider over MBI /vp/ext/*)', () => {
     const signMessage = vi.fn().mockResolvedValue({ signBlob: 'as', publicKey: 'apk' })
     const resolveIssuerKeys = vi.fn().mockResolvedValue({ bbsPublicKey: '', ed25519PublicKey: '' })
     // No revealAttribute supplied -> derive from the challenge's DCQL, resolved against AGENT_VC.
-    const adapter = new MbiVpAdapter(mbi as never, signHexBlob, signMessage, 'ZTX3H', resolveIssuerKeys, { vc: AGENT_VC })
+    const adapter = new MbiVpAdapter(mbi as never, signHexBlob, signMessage, resolveIssuerKeys, { vc: AGENT_VC })
 
     await adapter.createVp({ credentialQuery: AGENT_DCQL, nonce: 'n', holderDid: 'd' })
 
@@ -123,7 +124,7 @@ describe('MbiVpAdapter (x401 VcProofProvider over MBI /vp/ext/*)', () => {
           'agentIdentityCredential.purpose',
         ],
       },
-      { signedData: 'as', publicKey: 'apk' },
+      signMessage,
     )
   })
 
@@ -132,7 +133,7 @@ describe('MbiVpAdapter (x401 VcProofProvider over MBI /vp/ext/*)', () => {
     const signHexBlob = vi.fn().mockResolvedValue({ signBlob: 's', publicKey: 'pk' })
     const signMessage = vi.fn().mockResolvedValue({ signBlob: 'as', publicKey: 'apk' })
     const resolveIssuerKeys = vi.fn().mockResolvedValue({ bbsPublicKey: '', ed25519PublicKey: '' })
-    const adapter = new MbiVpAdapter(mbi as never, signHexBlob, signMessage, 'ZTX3H', resolveIssuerKeys, {
+    const adapter = new MbiVpAdapter(mbi as never, signHexBlob, signMessage, resolveIssuerKeys, {
       vc: { id: 'v' },
       revealAttribute: ['agentName'], // caller narrows further than the query
     })
@@ -141,7 +142,7 @@ describe('MbiVpAdapter (x401 VcProofProvider over MBI /vp/ext/*)', () => {
 
     expect(mbi.createVp).toHaveBeenCalledWith(
       { vc: { id: 'v' }, revealAttributes: ['agentName'] },
-      { signedData: 'as', publicKey: 'apk' },
+      signMessage,
     )
   })
 
@@ -243,7 +244,7 @@ describe('MbiVpAdapter (x401 VcProofProvider over MBI /vp/ext/*)', () => {
     const signHexBlob = vi.fn().mockResolvedValue({ signBlob: 's', publicKey: 'pk' })
     const signMessage = vi.fn().mockResolvedValue({ signBlob: 'as', publicKey: 'apk' })
     const resolveIssuerKeys = vi.fn().mockResolvedValue({ bbsPublicKey: 'RESOLVER', ed25519PublicKey: 'RESOLVER' })
-    const adapter = new MbiVpAdapter(mbi as never, signHexBlob, signMessage, 'ZTX3H', resolveIssuerKeys, {
+    const adapter = new MbiVpAdapter(mbi as never, signHexBlob, signMessage, resolveIssuerKeys, {
       vc: AGENT_VC,
       issuerKeys: { bbsPublicKey: 'zBBS-OOB', ed25519PublicKey: 'edhex-OOB' },
     })
@@ -263,7 +264,7 @@ describe('MbiVpAdapter (x401 VcProofProvider over MBI /vp/ext/*)', () => {
     const mbi = { createVp: vi.fn().mockResolvedValue({ blob: 'aa' }), submitVp: vi.fn() } // missing blobId
     const signMessage = vi.fn().mockResolvedValue({ signBlob: 'as', publicKey: 'apk' })
     const resolveIssuerKeys = vi.fn().mockResolvedValue({ bbsPublicKey: '', ed25519PublicKey: '' })
-    const adapter = new MbiVpAdapter(mbi as never, vi.fn(), signMessage, 'ZTX3H', resolveIssuerKeys, { vc: {} })
+    const adapter = new MbiVpAdapter(mbi as never, vi.fn(), signMessage, resolveIssuerKeys, { vc: {} })
     await expect(adapter.createVp({ credentialQuery: {}, nonce: 'n', holderDid: 'd' })).rejects.toThrow(/vp\/ext\/create/)
   })
 
@@ -272,7 +273,76 @@ describe('MbiVpAdapter (x401 VcProofProvider over MBI /vp/ext/*)', () => {
     const signHexBlob = vi.fn().mockResolvedValue({ signBlob: 's', publicKey: 'pk' })
     const signMessage = vi.fn().mockResolvedValue({ signBlob: 'as', publicKey: 'apk' })
     const resolveIssuerKeys = vi.fn().mockResolvedValue({ bbsPublicKey: '', ed25519PublicKey: '' })
-    const adapter = new MbiVpAdapter(mbi as never, signHexBlob, signMessage, 'ZTX3H', resolveIssuerKeys, { vc: {} })
+    const adapter = new MbiVpAdapter(mbi as never, signHexBlob, signMessage, resolveIssuerKeys, { vc: {} })
     await expect(adapter.createVp({ credentialQuery: {}, nonce: 'n', holderDid: 'd' })).rejects.toThrow(/vp\/ext\/submit/)
+  })
+})
+
+describe('orderRevealPaths', () => {
+  const vc = { credentialSubject: { id: 'did:zid:h', agentIdentityCredential: { purpose: 'p', controllerName: 'c', agentName: 'a' } } }
+
+  it('puts the paths in the order the VC signed its fields, whatever order they were given in', () => {
+    expect(orderRevealPaths(['agentIdentityCredential.agentName', 'agentIdentityCredential.purpose'], vc)).toEqual([
+      'agentIdentityCredential.purpose',
+      'agentIdentityCredential.agentName',
+    ])
+  })
+
+  it('drops repeats, keeping the first', () => {
+    expect(orderRevealPaths(['agentIdentityCredential.agentName', 'agentIdentityCredential.agentName'], vc)).toEqual([
+      'agentIdentityCredential.agentName',
+    ])
+  })
+
+  it('keeps a path the VC does not contain after the ones it does, in the order given', () => {
+    expect(orderRevealPaths(['zzz', 'agentIdentityCredential.agentName', 'aaa'], vc)).toEqual(['agentIdentityCredential.agentName', 'zzz', 'aaa'])
+  })
+
+  it('only drops repeats when there is no credentialSubject to order by', () => {
+    expect(orderRevealPaths(['b', 'a', 'b'], { id: 'no-subject' })).toEqual(['b', 'a'])
+  })
+})
+
+describe('unresolvedRevealPaths', () => {
+  const vc = { credentialSubject: { id: 'did:zid:h', agentIdentityCredential: { purpose: 'p', agentName: 'a' } } }
+
+  it('is empty when every path is a leaf of the credential', () => {
+    expect(unresolvedRevealPaths(['id', 'agentIdentityCredential.agentName'], vc)).toEqual([])
+  })
+
+  it('names a path the credential does not have', () => {
+    expect(unresolvedRevealPaths(['agentIdentityCredential.agentNmae'], vc)).toEqual(['agentIdentityCredential.agentNmae'])
+  })
+
+  it('names a parent path, which would disclose a whole subtree rather than one attribute', () => {
+    expect(unresolvedRevealPaths(['agentIdentityCredential'], vc)).toEqual(['agentIdentityCredential'])
+  })
+
+  // null is "cannot tell", which is not the same answer as "all fine" ([]): a caller that treats it as fine would let
+  // a parent path through, and a parent path discloses everything under it.
+  it.each([
+    ['a credential with no credentialSubject', { id: 'no-subject' }],
+    ['a credentialSubject that is an array', { credentialSubject: [{ id: 'did:zid:h', agentName: 'a' }] }],
+    ['a credential passed as a JSON string', '{"credentialSubject":{"agentName":"a"}}'],
+    ['a null credential', null],
+    ['no credential at all', undefined],
+  ])('cannot judge %s, and says so with null rather than "all fine"', (_label, vc) => {
+    expect(unresolvedRevealPaths(['anything'], vc)).toBeNull()
+  })
+
+  it('cannot judge a credentialSubject with a dotted key, where a path could mean two things', () => {
+    // {"a.b": 1, a: {b: {c: 1}}}: the path "a.b" is the literal key and also the parent of a.b.c
+    expect(unresolvedRevealPaths(['a.b'], { credentialSubject: { 'a.b': 1, a: { b: { c: 1 } } } })).toBeNull()
+    expect(unresolvedRevealPaths(['x'], { credentialSubject: { x: 1, nested: { 'y.z': 2 } } })).toBeNull()
+  })
+
+  it('counts an array as one attribute, so it can be named whole but not by index', () => {
+    const arrayVc = { credentialSubject: { tags: ['a', 'b'] } }
+    expect(unresolvedRevealPaths(['tags'], arrayVc)).toEqual([])
+    expect(unresolvedRevealPaths(['tags.0'], arrayVc)).toEqual(['tags.0'])
+  })
+
+  it('cannot name an attribute whose value is an empty object, since it has no leaf under it', () => {
+    expect(unresolvedRevealPaths(['empty'], { credentialSubject: { id: 'did:zid:h', empty: {} } })).toEqual(['empty'])
   })
 })

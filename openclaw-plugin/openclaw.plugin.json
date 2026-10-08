@@ -2,7 +2,7 @@
   "id": "zetrix-agentic-wallet",
   "name": "Zetrix Agentic Wallet",
   "description": "Zetrix identity, verifiable-credential and pay-per-use wallet tools for agents.",
-  "version": "0.3.9",
+  "version": "0.4.0",
   "activation": {
     "onStartup": true
   },
@@ -29,6 +29,10 @@
       },
       "zetrixAddress": {
         "type": "string"
+      },
+      "myidVerifyLinkTemplate": {
+        "type": "string",
+        "pattern": "^https://[^/?#{}@\\s\\\\]+[/?][^#\\s\\\\]*\\{referenceId\\}"
       }
     }
   },
@@ -44,6 +48,10 @@
     "zetrixAddress": {
       "label": "Existing holder address (optional)",
       "help": "Leave empty and the wallet creates its own account on first run."
+    },
+    "myidVerifyLinkTemplate": {
+      "label": "MyID verification link (optional)",
+      "help": "The link create_verification_qr gives the user, with {referenceId} where the reference id goes, for example https://<MyID link domain>/<path>?referenceId={referenceId}. Must be https, printable ASCII only, with the placeholder in the path or query. The wallet checks it again when it starts and has the final say. Leave it empty on testnet: it defaults to MyID's UAT link. On mainnet there is no default until MyID's production side is verified, and until it is set the tool refuses rather than invent a link."
     }
   }
 }

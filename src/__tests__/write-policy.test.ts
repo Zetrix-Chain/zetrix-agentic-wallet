@@ -15,7 +15,8 @@ import { describe, it, expect, vi } from 'vitest'
 import { PolicyWriteClient, type HttpSend } from '../clients/policy-write-client'
 import { createFsPolicyWriteReceiptStore, type PolicyWriteReceiptStore } from '../clients/policy-write-receipt-store'
 import { writePolicy, checkPolicyWrite, type WritePolicyDeps } from '../orchestrator/write-policy'
-import { buildPolicyWriteDeps, buildToolList } from '../index'
+import type { Affordability } from '../orchestrator/policy-affordability'
+import { buildPolicyWriteDeps, buildToolList, describeAssetAmount } from '../index'
 import { ZTP20_V1 } from './fixtures/real-policy-templates'
 import { mkdtemp, readFile, readdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -35,6 +36,7 @@ const INPUT = {
   templateId: 'a'.repeat(64),
   requestKey: 'req-1',
   pollBudgetMs: 10_000,
+  confirm: true,
 }
 
 const CHALLENGE = {
@@ -225,6 +227,414 @@ describe('the five terminal-ish collect states are told apart', () => {
   })
 })
 
+describe('real preflight drives the real paid request, end to end', () => {
+  // The tests above mock preflight. These wire the REAL one through buildPolicyWriteDeps, so a change anywhere between
+  // the draft and the request body is caught: this is what the service actually receives.
+  const TOKEN = 'ZTX3WeinXtt28YMyr4vUZ14ddTgEMGeuc1e6b'
+  const chainFor = (decimals: unknown) => async ({ input }: { input: string }) => {
+    const { method } = JSON.parse(input)
+    const body =
+      method === 'getTemplateById' ? ZTP20_V1 : method === 'contractInfo' ? { contractInfo: { symbol: 'JMYR', decimals } } : { found: false }
+    return { errorCode: 0, result: { query_rets: [{ result: { value: JSON.stringify(body) } }] } }
+  }
+  const attrs = (cap: string) => [
+    { attributeName: 'assetScope', attributeType: 'STRING', value: 'ztp20' },
+    { attributeName: 'tokenAddress', attributeType: 'ADDRESS', value: TOKEN },
+    { attributeName: 'perTransactionMax', attributeType: 'NUMBER', value: cap },
+  ]
+  const run = async (decimals: unknown, attributes: ReturnType<typeof attrs>, amountUnit?: unknown) => {
+    const built = buildPolicyWriteDeps({
+      policyWriteUrl: 'https://ms.test/api',
+      network: 'zetrix:testnet',
+      stateDir: '/tmp/x',
+      ownerAddress: OWNER,
+      hsmPassword: 'p',
+      pay: async () => 'header',
+      gasPreference: 'sponsored',
+      sleep: async () => undefined,
+      policyTemplateAddress: TEMPLATE,
+      chainQuery: chainFor(decimals),
+      queryBalance: async (token: string) => ({ token, error: 'query_failed' }),
+      caps: undefined,
+    } as never).policyWriteDeps!
+    const { d, http, pay } = deps([{ status: 402, body: CHALLENGE }], { preflight: built.preflight })
+    const r = await writePolicy(d, {
+      ...INPUT,
+      policyKey: 'ztp20-v1',
+      attributes,
+      ...(amountUnit === undefined ? {} : { amountUnit: amountUnit as string }),
+      dryRun: true,
+    })
+    const calls = (http as unknown as { calls: Array<{ url: string; body: string }> }).calls
+    return { r, calls, pay }
+  }
+  const sent = (calls: Array<{ body: string }>) => JSON.parse(calls[0].body) as { attributes: Array<{ attributeName: string; value: string }> } & Record<string, unknown>
+
+  it('writes 1 JMYR as 1000000 when the user said "1" with amountUnit "whole"', async () => {
+    const { r, calls } = await run('6', attrs('1'), 'whole')
+    expect(r.state).toBe('quoted')
+    expect(sent(calls).attributes.find((a) => a.attributeName === 'perTransactionMax')!.value).toBe('1000000')
+  })
+
+  it('scales by the token\'s own decimals: 1 whole token of an 18-decimal token is 10^18', async () => {
+    const { r, calls } = await run('18', attrs('1'), 'whole')
+    expect(r.state).toBe('quoted')
+    expect(sent(calls).attributes.find((a) => a.attributeName === 'perTransactionMax')!.value).toBe('1' + '0'.repeat(18))
+  })
+
+  it('sends no request at all when the unit guard refuses', async () => {
+    const { r, calls, pay } = await run('6', attrs('1'))
+    expect(r.state).toBe('refused')
+    expect(r.message).toMatch(/NOTHING WAS PAID/)
+    expect(calls).toHaveLength(0)
+    expect(pay).not.toHaveBeenCalled()
+  })
+
+  it('sends no request when the draft looks already converted — the double conversion the reviewer traced', async () => {
+    const { r, calls } = await run('6', attrs('1000000'), 'whole')
+    expect(r.state).toBe('refused')
+    expect(r.message).toMatch(/times looser or tighter/)
+    expect(r.message).toMatch(/resend them UNCHANGED with amountUnit "base"/)
+    expect(calls).toHaveLength(0)
+  })
+
+  it('a genuine million-token cap: refused as whole, then sent exactly as the refusal says (value x 10^decimals, base)', async () => {
+    // The reviewer's APP-M03. "1000000" with whole is ambiguous (copied raw, or a real million-token cap), so it is refused —
+    // and the refusal names the route that is RIGHT for the large reading, which must actually work end to end.
+    const refused = await run('6', attrs('1000000'), 'whole')
+    expect(refused.r.state).toBe('refused')
+    expect(refused.r.message).toMatch(/"perTransactionMax" 1000000 becomes 1000000000000/)
+    expect(refused.calls).toHaveLength(0)
+
+    const routed = await run('6', attrs('1000000000000'), 'base')
+    expect(routed.r.state).toBe('quoted')
+    expect(sent(routed.calls).attributes.find((a) => a.attributeName === 'perTransactionMax')!.value).toBe('1000000000000')
+  })
+
+  it('the copied-raw reading: the value resent unchanged with base is written as 1 token, not a million', async () => {
+    const routed = await run('6', attrs('1000000'), 'base')
+    expect(routed.r.state).toBe('quoted')
+    expect(sent(routed.calls).attributes.find((a) => a.attributeName === 'perTransactionMax')!.value).toBe('1000000')
+  })
+
+  it('refuses decimals that are not a number, instead of writing the value unscaled', async () => {
+    // The incident: a contract answering null/empty used to read as 0 decimals, so "1" went out as 1.
+    for (const bad of [null, '', false, [], 77]) {
+      const { r, calls } = await run(bad, attrs('1'), 'whole')
+      expect(r.state, JSON.stringify(bad)).toBe('refused')
+      expect(calls, JSON.stringify(bad)).toHaveLength(0)
+    }
+  })
+
+  it('refuses an empty amountUnit, treating it as neither mode', async () => {
+    const { r, calls } = await run('6', attrs('1000000'), '')
+    expect(r.state).toBe('refused')
+    expect(r.message).toMatch(/is not one of "whole" or "base"/)
+    expect(calls).toHaveLength(0)
+  })
+
+  it('never puts amountUnit into the request body', async () => {
+    for (const unit of ['whole', 'base'] as const) {
+      const { calls } = await run('6', attrs(unit === 'whole' ? '1' : '1000000'), unit)
+      expect(sent(calls)).not.toHaveProperty('amountUnit')
+      expect(JSON.stringify(sent(calls))).not.toContain('amountUnit')
+    }
+  })
+
+  it('passes a raw value through untouched with amountUnit "base"', async () => {
+    const { r, calls } = await run('6', attrs('1'), 'base')
+    expect(r.state).toBe('quoted')
+    expect(sent(calls).attributes.find((a) => a.attributeName === 'perTransactionMax')!.value).toBe('1')
+  })
+})
+
+describe('amountUnit reaches the write, so what is paid for is what the user saw', () => {
+  const cleanPreflight = (extra: Record<string, unknown> = {}) =>
+    vi.fn(async (_draft: unknown) => ({ ready: true, policyKey: 'k', blockers: [], interpretation: [], notChecked: [], ...extra }) as never)
+
+  const ATTRS = [
+    { attributeName: 'assetScope', attributeType: 'STRING', value: 'ztp20' },
+    { attributeName: 'perTransactionMax', attributeType: 'NUMBER', value: '1' },
+    { attributeName: 'cumulativeMax', attributeType: 'NUMBER', value: '100' },
+    { attributeName: 'maxTransactionCount', attributeType: 'NUMBER', value: '5' },
+  ]
+  const sentAttributes = (http: unknown) => {
+    const calls = (http as { calls: Array<{ url: string; body: string }> }).calls
+    return JSON.parse(calls[0].body).attributes as Array<{ attributeName: string; value: string }>
+  }
+  const valuesOf = (attrs: Array<{ attributeName: string; value: string }>) => Object.fromEntries(attrs.map((x) => [x.attributeName, x.value]))
+
+  it('forwards amountUnit to preflight', async () => {
+    const preflight = cleanPreflight()
+    const { d } = deps([{ status: 402, body: CHALLENGE }], { preflight })
+    await writePolicy(d, { ...INPUT, attributes: ATTRS, amountUnit: 'whole', dryRun: true })
+    expect(preflight).toHaveBeenCalledWith(expect.objectContaining({ amountUnit: 'whole' }))
+  })
+
+  it('does not invent an amountUnit when none was given', async () => {
+    const preflight = cleanPreflight()
+    const { d } = deps([{ status: 402, body: CHALLENGE }], { preflight })
+    await writePolicy(d, { ...INPUT, attributes: ATTRS, dryRun: true })
+    expect((preflight.mock.calls[0][0] as Record<string, unknown>)).not.toHaveProperty('amountUnit')
+  })
+
+  it('sends the RAW values preflight converted to, not the whole-token ones the caller typed', async () => {
+    const preflight = cleanPreflight({ convertedAmounts: { perTransactionMax: '1000000', cumulativeMax: '100000000' } })
+    const { d, http } = deps([{ status: 402, body: CHALLENGE }], { preflight })
+    await writePolicy(d, { ...INPUT, attributes: ATTRS, amountUnit: 'whole', dryRun: true })
+    expect(valuesOf(sentAttributes(http))).toEqual({
+      assetScope: 'ztp20',
+      perTransactionMax: '1000000',
+      cumulativeMax: '100000000',
+      // Not an amount, so never touched.
+      maxTransactionCount: '5',
+    })
+  })
+
+  it('keeps every attribute, in order, changing only the converted values', async () => {
+    const preflight = cleanPreflight({ convertedAmounts: { cumulativeMax: '100000000' } })
+    const { d, http } = deps([{ status: 402, body: CHALLENGE }], { preflight })
+    await writePolicy(d, { ...INPUT, attributes: ATTRS, amountUnit: 'whole', dryRun: true })
+    const sent = sentAttributes(http)
+    expect(sent.map((x) => x.attributeName)).toEqual(ATTRS.map((x) => x.attributeName))
+    expect(valuesOf(sent).perTransactionMax).toBe('1')
+    expect(valuesOf(sent).cumulativeMax).toBe('100000000')
+  })
+
+  it('sends the caller\'s attributes untouched when nothing was converted', async () => {
+    const { d, http } = deps([{ status: 402, body: CHALLENGE }], { preflight: cleanPreflight() })
+    await writePolicy(d, { ...INPUT, attributes: ATTRS, amountUnit: 'base', dryRun: true })
+    expect(sentAttributes(http)).toEqual(ATTRS.map(({ attributeName, value }) => expect.objectContaining({ attributeName, value })))
+  })
+
+  it('does not let a converted-values map act on an inherited property name', async () => {
+    // convertedAmounts is a plain object; an attribute called "toString" or "constructor" must not
+    // read as converted just because the object inherits one.
+    const preflight = cleanPreflight({ convertedAmounts: {} })
+    const attrs = [...ATTRS, { attributeName: 'toString', attributeType: 'STRING', value: 'x' }, { attributeName: 'constructor', attributeType: 'STRING', value: 'y' }]
+    const { d, http } = deps([{ status: 402, body: CHALLENGE }], { preflight })
+    await writePolicy(d, { ...INPUT, attributes: attrs, amountUnit: 'whole', dryRun: true })
+    const sent = valuesOf(sentAttributes(http))
+    expect(sent.toString).toBe('x')
+    expect(sent.constructor).toBe('y')
+  })
+
+  it('pays for the converted values on a real deploy, not the typed ones', async () => {
+    const preflight = cleanPreflight({ convertedAmounts: { perTransactionMax: '1000000' } })
+    const { d, http, pay } = deps(
+      [
+        { status: 402, body: CHALLENGE },
+        { status: 202, body: { receipt: 'blob-1' }, headers: { 'X-PAYMENT-RECEIPT': 'blob-1' } },
+        { status: 200, body: { state: 'WRITTEN', policyKey: 'native-v1', txHash: '0xabc' } },
+      ],
+      { preflight },
+    )
+    const r = await writePolicy(d, { ...INPUT, attributes: ATTRS, amountUnit: 'whole' })
+    expect(r.state).toBe('written')
+    expect(pay).toHaveBeenCalledTimes(1)
+    const calls = (http as unknown as { calls: Array<{ url: string; body: string }> }).calls
+    const withAttributes = calls.filter((c) => c.body.includes('perTransactionMax'))
+    expect(withAttributes.length).toBeGreaterThan(0)
+    for (const c of withAttributes) expect(valuesOf(JSON.parse(c.body).attributes).perTransactionMax).toBe('1000000')
+  })
+
+  it('refuses before anything is quoted or paid when preflight refuses — the unit guard costs nothing', async () => {
+    const preflight = cleanPreflight({ ready: false, blockers: ['"perTransactionMax" is 1, which is only 0.000001 JMYR'] })
+    const { d, http, pay } = deps([{ status: 402, body: CHALLENGE }], { preflight })
+    const r = await writePolicy(d, { ...INPUT, attributes: ATTRS })
+    expect(r.state).toBe('refused')
+    expect(r.message).toMatch(/NOTHING WAS PAID/)
+    expect(r.message).toContain('only 0.000001 JMYR')
+    expect(pay).not.toHaveBeenCalled()
+    expect((http as unknown as { calls: unknown[] }).calls).toHaveLength(0)
+  })
+})
+
+describe('a 5xx from collect that is not the service reporting a money state', () => {
+  // Real, from a transcript on 2026-10-01: the collect call answered with a Spring default error body,
+  // and the status check that followed got Cloudflare's own page. The second was read as the SERVICE's
+  // 502 — "paid, submitted, and rejected by the block" — which nobody knew to be true.
+  const SPRING_500 = {
+    timestamp: '2026-10-01T02:01:43.291+00:00',
+    status: 500,
+    error: 'Internal Server Error',
+    path: '/api/pay/policy/adopt-template/collect',
+  }
+  const CLOUDFLARE_502 =
+    '<!DOCTYPE html><html><head><title>502 Bad Gateway</title><style>body{color:red}</style></head>' +
+    '<body><h1>Bad gateway</h1><p>The origin web server returned an invalid or incomplete response to ' +
+    'Cloudflare. This typically indicates the origin is overloaded or misconfigured.</p>' +
+    '<script>var x = "secret"</script></body></html>'
+
+  const collect = async (step: Step) => {
+    const { d, http } = deps([
+      { status: 402, body: CHALLENGE },
+      { status: 202, body: { receipt: 'blob-1' }, headers: { 'X-PAYMENT-RECEIPT': 'blob-1' } },
+      step,
+    ])
+    const r = await writePolicy(d, INPUT)
+    const collects = (http as unknown as { calls: Array<{ url: string }> }).calls.filter((c) => c.url.endsWith('/collect'))
+    return { r, d, collects }
+  }
+
+  describe("the service's own unhandled exception (HTTP 500)", () => {
+    it('is unknown, not failed — and says the write may or may not have happened', async () => {
+      const { r } = await collect({ status: 500, body: SPRING_500 })
+      expect(r.state).toBe('unknown')
+      expect(r.paid).toBe(true)
+      expect(r.payFresh).toBeUndefined()
+      expect(r.message).toMatch(/PAYMENT MADE/)
+      expect(r.message).toMatch(/internal error \(HTTP 500\)/)
+      expect(r.message).toMatch(/may or may not have been written/)
+    })
+
+    it('tells the agent what NOT to say or do, and what to do instead', async () => {
+      const { r } = await collect({ status: 500, body: SPRING_500 })
+      expect(r.message).toMatch(/Do NOT tell the user it failed/)
+      expect(r.message).toMatch(/do NOT pay again/)
+      expect(r.message).toMatch(/check once with check_policy_write/)
+      expect(r.message).toMatch(/do not loop/i)
+      expect(r.message).toMatch(/quote the receipt/i)
+    })
+
+    it('does not blame the chain or a gateway — it knows neither', async () => {
+      const { r } = await collect({ status: 500, body: SPRING_500 })
+      expect(r.message).not.toMatch(/gateway|proxy|REJECTED|rejecting/i)
+    })
+
+    it('keeps the receipt, because it is the only handle on money that moved', async () => {
+      const { d } = await collect({ status: 500, body: SPRING_500 })
+      expect((await d.receipts.list()).map((x) => x.blobId)).toEqual(['blob-1'])
+    })
+
+    it('is NOT retried: a failed collect uses one of a small number of retries for this write', async () => {
+      const { collects } = await collect({ status: 500, body: SPRING_500 })
+      expect(collects).toHaveLength(1)
+    })
+
+    it('quotes what the service said, so support has something to search by', async () => {
+      const { r } = await collect({ status: 500, body: SPRING_500 })
+      expect(r.message).toContain('Internal Server Error')
+      expect(r.message).toContain('/api/pay/policy/adopt-template/collect')
+    })
+  })
+
+  describe('a gateway answering instead of the service', () => {
+    it("does NOT read Cloudflare's 502 page as 'the chain rejected the write'", async () => {
+      const { r } = await collect({ status: 502, body: CLOUDFLARE_502 })
+      expect(r.state).toBe('unknown')
+      expect(r.state).not.toBe('write_failed')
+      expect(r.payFresh).toBeUndefined()
+      expect(r.message).not.toMatch(/chain then REJECTED|Paying again would not help/i)
+    })
+
+    it('says plainly that the write result was never seen, and that it is not a chain rejection', async () => {
+      const { r } = await collect({ status: 502, body: CLOUDFLARE_502 })
+      expect(r.message).toMatch(/gateway or proxy in front of the policy service answered \(HTTP 502\)/)
+      expect(r.message).toMatch(/NOT the chain rejecting anything/)
+      expect(r.message).toMatch(/may be written, still in progress, or failed — it is not known/)
+      expect(r.message).toMatch(/Do NOT tell the user it failed/)
+      expect(r.message).toMatch(/do NOT pay again/)
+      expect(r.message).toMatch(/check once with check_policy_write/)
+    })
+
+    it('quotes the page as TEXT, not markup, with scripts and styles dropped', async () => {
+      const { r } = await collect({ status: 502, body: CLOUDFLARE_502 })
+      expect(r.message).toContain('origin web server returned an invalid or incomplete response')
+      expect(r.message).not.toMatch(/<\/?(html|body|h1|p|script|style)/i)
+      expect(r.message).not.toContain('secret')
+      expect(r.message).not.toContain('color:red')
+    })
+
+    it('keeps the receipt and does not retry', async () => {
+      const { d, collects } = await collect({ status: 502, body: CLOUDFLARE_502 })
+      expect((await d.receipts.list()).map((x) => x.blobId)).toEqual(['blob-1'])
+      expect(collects).toHaveLength(1)
+    })
+
+    it('treats a 502 with JSON but NO service state as a gateway, not as WRITE_FAILED', async () => {
+      // Only the service's own body — {state: WRITE_FAILED} — is the service reporting a rejection.
+      const { r } = await collect({ status: 502, body: { message: 'upstream connect error' } })
+      expect(r.state).toBe('unknown')
+      expect(r.message).toMatch(/gateway or proxy/)
+    })
+
+    it('treats a 502 whose state is one it does not know as UNRECOGNISED — the service spoke, so it is not a gateway', async () => {
+      const { r } = await collect({ status: 502, body: { state: 'SOMETHING_NEW' } })
+      expect(r.state).toBe('unknown')
+      expect(r.message).toMatch(/does not recognise/)
+      expect(r.message).not.toMatch(/gateway or proxy|REJECTED/)
+    })
+
+    it('still honours the service\'s own 502 — WRITE_FAILED is the one that means rejected', async () => {
+      const { r } = await collect({ status: 502, body: { state: 'WRITE_FAILED', txHash: '0xbad' } })
+      expect(r.state).toBe('write_failed')
+      expect(r.txHash).toBe('0xbad')
+    })
+
+    it('treats a bare 504 as a gateway, and still honours the service\'s own UNKNOWN', async () => {
+      const bare = await collect({ status: 504, body: '<html><body>Gateway Timeout</body></html>' })
+      expect(bare.r.state).toBe('unknown')
+      expect(bare.r.message).toMatch(/gateway or proxy/)
+      const own = await collect({ status: 504, body: { state: 'UNKNOWN' } })
+      expect(own.r.state).toBe('unknown')
+      expect(own.r.message).toMatch(/could not be determined/i)
+      expect(own.r.message).not.toMatch(/gateway or proxy/)
+    })
+
+    for (const status of [503, 520, 521, 522, 523, 524, 525, 526, 530]) {
+      it('treats a bare ' + status + ' as a gateway fault', async () => {
+        const { r } = await collect({ status, body: '' })
+        expect(r.state, String(status)).toBe('unknown')
+        expect(r.message, String(status)).toMatch(new RegExp('gateway or proxy in front of the policy service answered \\(HTTP ' + status + '\\)'))
+      })
+    }
+
+    it('treats a 500 that is an HTML page as a gateway, and a 500 that is JSON as the service', async () => {
+      const html = await collect({ status: 500, body: '  <html><body>nginx error</body></html>' })
+      expect(html.r.message).toMatch(/gateway or proxy/)
+      const json = await collect({ status: 500, body: SPRING_500 })
+      expect(json.r.message).not.toMatch(/gateway or proxy/)
+    })
+
+    it('recognises an HTML page however it opens', async () => {
+      for (const body of ['<!DOCTYPE html><html></html>', '<!doctype HTML><body></body>', '\n\t <HTML><BODY>x</BODY></HTML>', '<head></head>']) {
+        const { r } = await collect({ status: 500, body })
+        expect(r.message, body).toMatch(/gateway or proxy/)
+      }
+    })
+
+    it('bounds what it echoes of a hostile page', async () => {
+      const hostile = '<html><body>' + 'A'.repeat(50_000) + '<script>' + 'B'.repeat(50_000) + '</script></body></html>'
+      const { r } = await collect({ status: 502, body: hostile })
+      expect(r.message.length).toBeLessThan(1500)
+      expect(r.message).not.toContain('BBBB')
+    })
+
+    it('bounds what it echoes of a hostile JSON body from the service', async () => {
+      const { r } = await collect({ status: 500, body: { error: 'E'.repeat(50_000) } })
+      expect(r.message.length).toBeLessThan(1500)
+    })
+  })
+
+  it('leaves non-5xx statuses on the unrecognised path, which is not a server fault', async () => {
+    const { r } = await collect({ status: 404, body: { detail: 'no such receipt' } })
+    expect(r.state).toBe('unknown')
+    expect(r.message).toMatch(/does not recognise/)
+    expect(r.message).not.toMatch(/gateway or proxy|internal error/)
+  })
+
+  it('check_policy_write reads the same 5xx the same way, rather than reporting the chain rejected it', async () => {
+    const { d } = deps([{ status: 502, body: CLOUDFLARE_502 }])
+    await d.receipts.set({ blobId: 'blob-1', policyKey: 'native-v1', ownerAddress: OWNER, paidAt: '2026-10-01T02:00:00Z' })
+    const r = await checkPolicyWrite(d, { pollBudgetMs: 1 })
+    expect(r.state).toBe('unknown')
+    expect(r.message).toMatch(/gateway or proxy/)
+    expect(r.message).not.toMatch(/REJECTED/)
+    expect((await d.receipts.list()).map((x) => x.blobId)).toEqual(['blob-1'])
+  })
+})
+
 describe('AC #3 — a 409 in phase 1 costs nothing, and one kind of 409 is a recovery', () => {
   it('ALREADY_EXISTS is reported without any payment being attempted', async () => {
     const { d, pay } = deps([{ status: 409, body: { state: 'ALREADY_EXISTS', detail: 'that key is taken' } }])
@@ -384,6 +794,9 @@ describe('AC #6 — the receipt store holds no secret material', () => {
       policyKey: 'native-v1',
       ownerAddress: OWNER,
       paidAt: expect.any(String),
+      // What the chain should show once the write lands (names and values the user already submitted, public on chain once
+      // written), so a collect that answers with an error can be checked against the chain. No credential, no signature.
+      verify: { attributes: INPUT.attributes.map((x) => ({ attributeName: x.attributeName, value: x.value })), templateId: INPUT.templateId },
     })
     // Stated as a property too, so a field added later cannot smuggle one in.
     expect(raw).not.toMatch(/hunter2|password|signature|publicKey|blob"\s*:\s*"0x/i)
@@ -446,7 +859,7 @@ describe('nothing is attempted when the flow cannot be run at all', () => {
     ['no attributes', { attributes: [] }],
     ['attributes not an array', { attributes: 'cumulativeMax' }],
     ['no templateId', { templateId: undefined }],
-    ['no templateContractAddress', { templateContractAddress: undefined }],
+    ['a blank templateId', { templateId: '   ' }],
   ]
   for (const [label, over] of cases) {
     it(`refuses before paying: ${label}`, async () => {
@@ -677,7 +1090,7 @@ describe('round 1 — the remaining findings', () => {
 
   it('stops on a status this flow does not define, instead of retrying into the key limit', async () => {
     // APP-L01. A 404/410 for a swept receipt read as "unreachable", which kept the loop going and
-    // re-presented the HSM password each time — against a six-key retry series (BT-2958).
+    // re-presented the HSM password each time — against a six-key retry series.
     const { d, http } = deps([
       { status: 402, body: CHALLENGE },
       { status: 202, body: { receipt: 'blob-1' }, headers: { 'X-PAYMENT-RECEIPT': 'blob-1' } },
@@ -759,7 +1172,7 @@ describe('round 1 — the remaining findings', () => {
   })
 
   it('does not advertise requestKey as an idempotency key', () => {
-    // APP-L04, and the same wrong fact BT-2867 carried: repeating one is not a safe retry.
+    // APP-L04, and the same wrong fact an earlier version carried: repeating one is not a safe retry.
     const tool = buildToolList().find((t) => t.name === 'write_policy')!
     const text = tool.inputSchema.properties!.requestKey!.description
     expect(text).toMatch(/Do NOT treat it as an idempotency key/i)
@@ -817,8 +1230,35 @@ describe('round 2 — the preflight wiring is built where it is tested', () => {
       sleep: async () => undefined,
       policyTemplateAddress: TEMPLATE,
       chainQuery: async () => ({ errorCode: 0, result: { query_rets: [{ result: { value: '{}' } }] } }),
+      queryBalance: async (token: string) => ({ token, balance: '0', decimals: 6, display: `0 ${token}` }),
+      caps: undefined,
       ...over,
     } as never)
+
+  describe('wires the affordability check to the cap and reader the payer uses', () => {
+    const accept = { asset: 'ZTX3JMYR', maxAmountRequired: '1000', extra: { gasModel: 'facilitator', prepareEndpoint: 'https://f.test/prepare' } }
+    const funded = async (token: string) => ({ token: 'JMYR', balance: '5000', decimals: 3, display: '5 JMYR' }) as never
+
+    it('wires a check at all', () => {
+      expect(buildWith().policyWriteDeps!.checkAffordability).toBeDefined()
+    })
+
+    it('evaluates the cap it was given — and refuses a quote over it', async () => {
+      const over = await buildWith({ queryBalance: funded, caps: { '*': '500' } }).policyWriteDeps!.checkAffordability!(accept)
+      expect(over.verdict).toBe('not_affordable')
+      expect(over.cap?.wouldPass).toBe(false)
+      const within = await buildWith({ queryBalance: funded, caps: { '*': '5000' } }).policyWriteDeps!.checkAffordability!(accept)
+      expect(within.verdict).toBe('affordable')
+    })
+
+    it('reads balances through the reader it was given', async () => {
+      const seen: string[] = []
+      const reader = async (token: string) => { seen.push(token); return { token: 'JMYR', balance: '0', decimals: 3, display: '0 JMYR' } as never }
+      const r = await buildWith({ queryBalance: reader, caps: undefined }).policyWriteDeps!.checkAffordability!(accept)
+      expect(seen).toEqual(['ZTX3JMYR'])
+      expect(r.verdict).toBe('not_affordable')
+    })
+  })
 
   it('builds nothing without a Template contract, because an unpriceable draft is not paid for', () => {
     // Both, not either: with no template there is nothing to type a draft against, and a write
@@ -884,6 +1324,14 @@ describe('round 2 — the preflight wiring is built where it is tested', () => {
     expect(read[0].contractAddress).toBe(TEMPLATE)
   })
 
+  it('wires a quote formatter that resolves through the chain reader', async () => {
+    // The orchestrator treats describeAmount as optional, so a builder that simply forgot it
+    // would still type-check and still quote — with the raw figure only, in silence.
+    const built = buildWith().policyWriteDeps!
+    expect(built.describeAmount).toBeDefined()
+    expect(await built.describeAmount!('ZTX', '1500000')).toBe('1500000 (1.5 ZTX)')
+  })
+
   it('refuses a draft with no templateId rather than typing it against nothing', async () => {
     const built = buildWith().policyWriteDeps!
     const result = await built.preflight({
@@ -894,6 +1342,8 @@ describe('round 2 — the preflight wiring is built where it is tested', () => {
     })
     expect(result.ready).toBe(false)
     expect(result.blockers.join(' ')).toMatch(/could not read the template/i)
+    // And it says where a templateId comes from, instead of leaving the agent stuck.
+    expect(result.blockers.join(' ')).toMatch(/get_policy_template_schema with no arguments/i)
   })
 
   it('the real preflight refuses the empty-allow-list draft, end to end through the builder', async () => {
@@ -914,5 +1364,405 @@ describe('round 2 — the preflight wiring is built where it is tested', () => {
     })
     expect(result.ready).toBe(false)
     expect(result.blockers.join(' ')).toMatch(/denies EVERYTHING/i)
+  })
+})
+
+describe('templateContractAddress is optional, and the configured one is what is written against', () => {
+  const happy = () => [
+    { status: 402, body: CHALLENGE },
+    { status: 202, body: { receipt: 'blob-1' }, headers: { 'X-PAYMENT-RECEIPT': 'blob-1' } },
+    { status: 200, body: { state: 'WRITTEN', policyKey: 'native-v1', txHash: '0xabc' } },
+  ]
+  const bodiesOf = (http: unknown) =>
+    (http as { calls: Array<{ body: string }> }).calls.map((c) => JSON.parse(c.body) as Record<string, unknown>)
+
+  it('writes when the address is omitted — the agent is not asked for what only the wallet knows', async () => {
+    // The transcript that prompted this: the agent asked the user for a template contract address.
+    // The wallet refuses every address but one, so requiring the caller to supply it was friction
+    // that could only ever produce a wrong value.
+    const { d } = deps(happy())
+    const r = await writePolicy(d, { ...INPUT, templateContractAddress: undefined })
+    expect(r.state).toBe('written')
+  })
+
+  it('sends the CONFIGURED contract on the wire when the caller omitted it', async () => {
+    // The part that would fail silently: omitted in, undefined out. The server needs the address
+    // to record which template typed the policy.
+    const { d, http } = deps(happy())
+    await writePolicy(d, { ...INPUT, templateContractAddress: undefined })
+    for (const body of bodiesOf(http).filter((b) => 'policyKey' in b)) {
+      expect(body.templateContractAddress).toBe(TEMPLATE)
+    }
+    expect(bodiesOf(http).some((b) => b.templateContractAddress === TEMPLATE)).toBe(true)
+  })
+
+  it('sends the configured contract when the caller supplied the matching one', async () => {
+    const { d, http } = deps(happy())
+    await writePolicy(d, INPUT)
+    expect(bodiesOf(http)[0].templateContractAddress).toBe(TEMPLATE)
+  })
+
+  for (const blank of ['', '   ', null]) {
+    it(`treats ${JSON.stringify(blank)} as not supplied`, async () => {
+      const { d } = deps(happy())
+      const r = await writePolicy(d, { ...INPUT, templateContractAddress: blank as never })
+      expect(r.state).toBe('written')
+    })
+  }
+
+  const wrong: Array<[string, unknown]> = [
+    ['a different address', 'ZTX3SomeOtherTemplateContract00001'],
+    ['the address with a trailing space', `${TEMPLATE} `],
+    ['a number', 5],
+    ['an object', { address: TEMPLATE }],
+    ['an array', [TEMPLATE]],
+  ]
+  for (const [label, value] of wrong) {
+    it(`still refuses ${label}, before anything is sent or paid`, async () => {
+      // The safety check survives: only ABSENCE became valid. A supplied value must match exactly.
+      const { d, pay, http } = deps(happy())
+      const r = await writePolicy(d, { ...INPUT, templateContractAddress: value as never })
+      expect(r.state, label).toBe('refused')
+      expect(r.message, label).toMatch(/BEFORE any payment/i)
+      expect(pay, label).not.toHaveBeenCalled()
+      expect((http as unknown as { calls: unknown[] }).calls, label).toHaveLength(0)
+    })
+  }
+
+  it('points a missing templateId at the listing instead of leaving the agent stuck', async () => {
+    const { d, pay } = deps(happy())
+    const r = await writePolicy(d, { ...INPUT, templateId: undefined as never })
+    expect(r.state).toBe('unavailable')
+    expect(r.message).toMatch(/get_policy_template_schema with no arguments/i)
+    expect(pay).not.toHaveBeenCalled()
+  })
+})
+
+describe('dryRun asks for the price and does nothing else', () => {
+  const quoteSteps = () => [{ status: 402, body: CHALLENGE }]
+  const happy = () => [
+    { status: 402, body: CHALLENGE },
+    { status: 202, body: { receipt: 'blob-1' }, headers: { 'X-PAYMENT-RECEIPT': 'blob-1' } },
+    { status: 200, body: { state: 'WRITTEN', policyKey: 'native-v1', txHash: '0xabc' } },
+  ]
+  const callsOf = (http: unknown) =>
+    (http as { calls: Array<{ url: string; headers: Record<string, string>; body: string }> }).calls
+
+  it('returns the quote from the 402, paying nothing and stopping after the free pre-check', async () => {
+    // The agent in the transcript said it could not learn the price without calling write_policy,
+    // and "I can't stop it after the pre-check, so I'd rather not call it just to learn the price".
+    const { d, pay, http } = deps(quoteSteps())
+    const r = await writePolicy(d, { ...INPUT, dryRun: true })
+    expect(r.state).toBe('quoted')
+    expect(r.paid).toBe(false)
+    expect(r.quote).toMatchObject({ asset: 'ZTX3JMYR', amount: '1000', gasModel: 'facilitator' })
+    expect(pay).not.toHaveBeenCalled()
+    // ONE call — the free pre-check — and it carried no payment header.
+    expect(callsOf(http)).toHaveLength(1)
+    expect(callsOf(http)[0].headers['X-PAYMENT']).toBeUndefined()
+  })
+
+  it('says plainly that nothing was paid and that a quote is not a promise', async () => {
+    const { d } = deps(quoteSteps())
+    const r = await writePolicy(d, { ...INPUT, dryRun: true })
+    expect(r.message).toMatch(/QUOTE ONLY — nothing was paid and nothing was written/)
+    expect(r.message).toMatch(/can change/i)
+    expect(r.message).toMatch(/not a promise the payment will be allowed/i)
+    // The cap is applied inside the payer, which a quote never reaches — so the claim must not be
+    // that it was checked.
+    expect(r.message).toMatch(/payment cap is applied only when paying/i)
+    expect(r.message).not.toMatch(/within the cap|cap allows|is allowed by/i)
+  })
+
+  it('does not depend on the wallet being able to pay at all', async () => {
+    // The quote must work for a user who has no funds and whose cap would refuse — that is exactly
+    // who needs to know the price first.
+    const { d } = deps(quoteSteps(), {
+      pay: (async () => { throw new Error('payer must not be reached') }) as never,
+    })
+    const r = await writePolicy(d, { ...INPUT, dryRun: true })
+    expect(r.state).toBe('quoted')
+  })
+
+  it('adds the human-readable amount when it can', async () => {
+    const { d } = deps(quoteSteps(), { describeAmount: async (asset, raw) => `${raw} (0.001 JMYR)` })
+    const r = await writePolicy(d, { ...INPUT, dryRun: true })
+    expect(r.quote?.amountHuman).toBe('1000 (0.001 JMYR)')
+    expect(r.message).toContain('1000 (0.001 JMYR)')
+  })
+
+  it('bounds the friendly form too — it comes from a token lookup, not from this wallet', async () => {
+    // The raw figure is clipped, but the decorated form is produced by a separate read whose
+    // result is just as untrusted. Without its own cap it floods the quote and the message.
+    const { d } = deps(quoteSteps(), { describeAmount: async () => 'X'.repeat(50_000) })
+    const r = await writePolicy(d, { ...INPUT, dryRun: true })
+    expect(r.quote!.amountHuman!.length).toBeLessThanOrEqual(120)
+    expect(r.message.length).toBeLessThan(1000)
+  })
+
+  it('still quotes when the friendly form cannot be produced', async () => {
+    // A failed lookup costs the decoration and nothing else.
+    const { d } = deps(quoteSteps(), { describeAmount: async () => { throw new Error('token lookup failed') } })
+    const r = await writePolicy(d, { ...INPUT, dryRun: true })
+    expect(r.state).toBe('quoted')
+    expect(r.quote?.amountHuman).toBeUndefined()
+    expect(r.message).toContain('1000 of ZTX3JMYR')
+  })
+
+  it('carries payTo when the service names one, and omits it when it does not', async () => {
+    const withPayTo = { ...CHALLENGE, accepts: [{ ...CHALLENGE.accepts[0], payTo: 'ZTX3PayeeAddress' }] }
+    const { d } = deps([{ status: 402, body: withPayTo }])
+    expect((await writePolicy(d, { ...INPUT, dryRun: true })).quote?.payTo).toBe('ZTX3PayeeAddress')
+    const { d: d2 } = deps(quoteSteps())
+    expect('payTo' in ((await writePolicy(d2, { ...INPUT, dryRun: true })).quote ?? {})).toBe(false)
+  })
+
+  it('bounds what it echoes of the service’s quote', async () => {
+    const hostile = { ...CHALLENGE, accepts: [{ ...CHALLENGE.accepts[0], asset: 'A'.repeat(50_000), maxAmountRequired: '9'.repeat(50_000), payTo: 'P'.repeat(50_000) }] }
+    const { d } = deps([{ status: 402, body: hostile }])
+    const r = await writePolicy(d, { ...INPUT, dryRun: true })
+    expect(r.quote!.asset.length).toBeLessThanOrEqual(100)
+    expect(r.quote!.amount.length).toBeLessThanOrEqual(40)
+    expect(r.quote!.payTo!.length).toBeLessThanOrEqual(100)
+    expect(r.message.length).toBeLessThan(1000)
+  })
+
+  it('keeps no receipt for a quote, because nothing was paid', async () => {
+    const { d } = deps(quoteSteps())
+    await writePolicy(d, { ...INPUT, dryRun: true })
+    expect(await d.receipts.list()).toEqual([])
+  })
+
+  it('refuses a quote with nothing to quote, rather than inventing a price', async () => {
+    const { d } = deps(quoteSteps(), { chooseAccept: () => undefined })
+    const r = await writePolicy(d, { ...INPUT, dryRun: true })
+    expect(r.state).toBe('unavailable')
+    expect(r.quote).toBeUndefined()
+  })
+
+  describe('it says whether the wallet could pay the quote', () => {
+    const verdict = (v: Affordability["verdict"], problems: string[] = [], feeNotEstimated = false): Affordability => ({
+      verdict: v,
+      fee: { status: v === 'affordable' ? 'enough' : v === 'unknown' ? 'unknown' : 'short', required: '1000' },
+      gas: { status: 'not_needed' },
+      cap: { asset: 'ZTX3JMYR', capRaw: null, matchedKey: null, wouldPass: v === 'affordable' },
+      feeNotEstimated,
+      problems,
+      notChecked: [],
+    })
+
+    it('carries the verdict and says the wallet holds the quoted amount when it does', async () => {
+      const { d, pay } = deps(quoteSteps(), { checkAffordability: async () => verdict('affordable') })
+      const r = await writePolicy(d, { ...INPUT, dryRun: true })
+      expect(r.state).toBe('quoted')
+      expect(r.affordability?.verdict).toBe('affordable')
+      expect(r.message).toMatch(/holds the quoted amount and its payment cap would not refuse it/i)
+      // No fee caveat when the check says the wallet pays no fee it could not see.
+      expect(r.message).not.toMatch(/network fee is not estimated/i)
+      expect(pay).not.toHaveBeenCalled()
+    })
+
+    it('hands the chosen 402 option to the check, so it prices what will actually be paid', async () => {
+      const seen: unknown[] = []
+      const { d } = deps(quoteSteps(), { checkAffordability: async (accept) => { seen.push(accept); return verdict('affordable') } })
+      await writePolicy(d, { ...INPUT, dryRun: true })
+      expect(seen).toEqual([expect.objectContaining({ asset: 'ZTX3JMYR', maxAmountRequired: '1000' })])
+    })
+
+    it('says NOT when it could not pay, names every cause, and does not invite a deploy', async () => {
+      const { d } = deps(quoteSteps(), { checkAffordability: async () => verdict('not_affordable', ['Not enough JMYR: the quote is 1, the balance is 0.', 'The payment cap for X is 0.5, and this needs 1.']) })
+      const r = await writePolicy(d, { ...INPUT, dryRun: true })
+      expect(r.affordability?.verdict).toBe('not_affordable')
+      expect(r.message).toMatch(/could NOT pay it right now/)
+      expect(r.message).toContain("Not enough JMYR")
+      expect(r.message).toContain("The payment cap for X")
+      expect(r.message).toMatch(/Fix that, then ask again without dryRun/)
+      expect(r.message).not.toMatch(/would not refuse it/)
+    })
+
+    it('says it could not confirm when a read failed — never that it can pay', async () => {
+      const { d } = deps(quoteSteps(), { checkAffordability: async () => verdict('unknown', ['Could not read the JMYR balance (query_failed).']) })
+      const r = await writePolicy(d, { ...INPUT, dryRun: true })
+      expect(r.affordability?.verdict).toBe('unknown')
+      expect(r.message).toMatch(/could not be confirmed/i)
+      expect(r.message).not.toMatch(/holds the quoted amount|would not refuse it|could NOT pay/)
+    })
+
+    it('turns a THROWING check into unknown rather than losing the quote or implying it passed', async () => {
+      const { d } = deps(quoteSteps(), { checkAffordability: async () => { throw new Error('balance service down') } })
+      const r = await writePolicy(d, { ...INPUT, dryRun: true })
+      expect(r.state).toBe('quoted')
+      expect(r.affordability?.verdict).toBe('unknown')
+      expect(r.message).toMatch(/could not be confirmed/i)
+      expect(r.message).toContain("1000")
+    })
+
+    it('keeps the old wording, and no affordability, when no check is wired', async () => {
+      const { d } = deps(quoteSteps())
+      const r = await writePolicy(d, { ...INPUT, dryRun: true })
+      expect(r.affordability).toBeUndefined()
+      expect(r.message).toMatch(/payment cap is applied only when paying/i)
+    })
+
+    it('always says balances can change and the cap is enforced again when paying', async () => {
+      const { d } = deps(quoteSteps(), { checkAffordability: async () => verdict('affordable') })
+      const r = await writePolicy(d, { ...INPUT, dryRun: true })
+      expect(r.message).toMatch(/balances can change and the payment cap is enforced again when paying/i)
+      expect(r.message).toMatch(/not a promise the payment will be allowed/i)
+    })
+
+    it('adds the fee caveat when the wallet will pay a fee the check did not estimate', async () => {
+      const { d } = deps(quoteSteps(), { checkAffordability: async () => verdict('affordable', [], true) })
+      const r = await writePolicy(d, { ...INPUT, dryRun: true })
+      expect(r.message).toMatch(/holds the quoted amount and its payment cap would not refuse it\. The network fee is not estimated here, so this is not a guarantee/i)
+    })
+
+    it('does not invent a cap when the check itself failed', async () => {
+      const { d } = deps(quoteSteps(), { checkAffordability: async () => { throw new Error('balance service down') } })
+      const r = await writePolicy(d, { ...INPUT, dryRun: true })
+      // A made-up { capRaw: null, wouldPass: false } reads, to a structured consumer, as "caps are
+      // configured but none matches this asset" — and an agent may tell the user to add a cap key.
+      expect(r.affordability).toBeDefined()
+      expect(r.affordability).not.toHaveProperty('cap')
+      expect(r.affordability!.notChecked.join(' ')).toMatch(/check itself failed/)
+    })
+
+    it('bounds what a hostile check can put in the message', async () => {
+      const { d } = deps(quoteSteps(), { checkAffordability: async () => verdict('not_affordable', ['P'.repeat(50_000)]) })
+      const r = await writePolicy(d, { ...INPUT, dryRun: true })
+      expect(r.message.length).toBeLessThan(1500)
+    })
+
+    it('is not consulted on a real deploy — the payer does its own checks', async () => {
+      const check = vi.fn(async () => verdict('affordable'))
+      const { d } = deps(happy(), { checkAffordability: check })
+      await writePolicy(d, INPUT)
+      expect(check).not.toHaveBeenCalled()
+    })
+
+    it('is not consulted when the free checks refuse, so a refusal costs no reads', async () => {
+      const check = vi.fn(async () => verdict('affordable'))
+      const { d } = deps([{ status: 409, body: { state: 'ALREADY_EXISTS', detail: 'taken' } }], { checkAffordability: check })
+      await writePolicy(d, { ...INPUT, dryRun: true })
+      expect(check).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('it must never collect', () => {
+    it('does not collect an already-paid write — collecting signs and WRITES the policy', async () => {
+      // The one path where a "dry" run could do real damage. ALREADY_IN_FLIGHT normally goes
+      // straight to phase 3, which signs the permit with the owner's key and writes. A dry run
+      // that did that would be a deploy with a misleading name.
+      const { d, pay, http } = deps([
+        { status: 409, body: { state: 'ALREADY_IN_FLIGHT', receipt: 'blob-old', detail: 'already paid' } },
+        { status: 200, body: { state: 'WRITTEN', policyKey: 'native-v1', txHash: '0xaaa' } },
+      ])
+      // The wallet's OWN confirmed payment saved this receipt (one it does not hold is not collected at all).
+      await d.receipts.set({ blobId: 'blob-old', policyKey: 'native-v1', ownerAddress: OWNER, paidAt: '2026-10-07T00:00:00.000Z' })
+      const r = await writePolicy(d, { ...INPUT, dryRun: true })
+      expect(callsOf(http)).toHaveLength(1)
+      expect(callsOf(http).some((c) => c.url.endsWith('/collect'))).toBe(false)
+      expect(pay).not.toHaveBeenCalled()
+      expect(r.state).toBe('settling')
+      expect(r.paid).toBe(true)
+      expect(r.paymentReceipt).toBe('blob-old')
+      expect(r.recoveredEarlierWrite).toBe(true)
+      expect(r.message).toMatch(/DRY RUN — nothing was collected/)
+      expect(r.message).toMatch(/check_policy_write/)
+      expect(r.message).toMatch(/Do not pay again/i)
+    })
+
+    it('keeps the receipt the wallet already holds, so check_policy_write can finish it later', async () => {
+      const { d } = deps([{ status: 409, body: { state: 'ALREADY_IN_FLIGHT', receipt: 'blob-old', detail: 'already paid' } }])
+      await d.receipts.set({ blobId: 'blob-old', policyKey: 'native-v1', ownerAddress: OWNER, paidAt: '2026-10-07T00:00:00.000Z' })
+      await writePolicy(d, { ...INPUT, dryRun: true })
+      expect((await d.receipts.list()).map((x) => x.blobId)).toEqual(['blob-old'])
+    })
+
+    it('does NOT save a bookmark for a receipt it does not hold: a dry run must not hand check_policy_write something to collect', async () => {
+      const { d } = deps([{ status: 409, body: { state: 'ALREADY_IN_FLIGHT', receipt: 'blob-old', detail: 'already paid' } }])
+      const r = await writePolicy(d, { ...INPUT, dryRun: true })
+      expect(r.state).toBe('refused')
+      expect(await d.receipts.list()).toEqual([])
+    })
+
+    it('the same request WITHOUT dryRun does collect — so the guard is what stopped it', async () => {
+      const { d, http } = deps([
+        { status: 409, body: { state: 'ALREADY_IN_FLIGHT', receipt: 'blob-old', detail: 'already paid' } },
+        { status: 200, body: { state: 'WRITTEN', policyKey: 'native-v1', txHash: '0xaaa' } },
+      ])
+      await writePolicy(d, INPUT)
+      expect(callsOf(http).some((c) => c.url.endsWith('/collect'))).toBe(true)
+    })
+  })
+
+  describe('the free refusals are identical to a real call', () => {
+    it('already_exists', async () => {
+      const { d, pay } = deps([{ status: 409, body: { state: 'ALREADY_EXISTS', detail: 'that key is taken' } }])
+      const r = await writePolicy(d, { ...INPUT, dryRun: true })
+      expect(r.state).toBe('already_exists')
+      expect(pay).not.toHaveBeenCalled()
+    })
+
+    it('a pre-check refusal', async () => {
+      const { d } = deps([{ status: 400, body: { detail: 'assetScope is required' } }])
+      const r = await writePolicy(d, { ...INPUT, dryRun: true })
+      expect(r.state).toBe('refused')
+    })
+
+    it('a preflight refusal', async () => {
+      const { d, http } = deps(quoteSteps(), {
+        preflight: async () => ({ ready: false, policyKey: 'k', blockers: ['nope'], interpretation: [], notChecked: [] }) as never,
+      })
+      const r = await writePolicy(d, { ...INPUT, dryRun: true })
+      expect(r.state).toBe('refused')
+      expect(callsOf(http)).toHaveLength(0)
+    })
+
+    it('a wrong template contract', async () => {
+      const { d, http } = deps(quoteSteps())
+      const r = await writePolicy(d, { ...INPUT, dryRun: true, templateContractAddress: 'ZTX3SomeOtherTemplateContract00001' })
+      expect(r.state).toBe('refused')
+      expect(callsOf(http)).toHaveLength(0)
+    })
+  })
+
+  describe('an unexpected value fails toward the quote, because the mistakes are not the same size', () => {
+    // Reading a real deploy as a dry run costs one extra call. Reading a real dry run as a deploy
+    // spends money the user explicitly did not want spent.
+    for (const flag of [true, 'true', 'false', 'yes', 1, {}, []]) {
+      it(`treats ${JSON.stringify(flag)} as a request for a quote`, async () => {
+        const { d, pay } = deps(happy())
+        const r = await writePolicy(d, { ...INPUT, dryRun: flag as never })
+        expect(r.state, JSON.stringify(flag)).toBe('quoted')
+        expect(pay, JSON.stringify(flag)).not.toHaveBeenCalled()
+      })
+    }
+
+    for (const flag of [undefined, null, false, 0, '']) {
+      it(`deploys for ${JSON.stringify(flag)}`, async () => {
+        const { d, pay } = deps(happy())
+        const r = await writePolicy(d, { ...INPUT, dryRun: flag as never })
+        expect(r.state, JSON.stringify(flag)).toBe('written')
+        expect(pay, JSON.stringify(flag)).toHaveBeenCalledTimes(1)
+      })
+    }
+  })
+})
+
+describe('describeAssetAmount is the one amount formatter', () => {
+  it('scales a known asset and keeps the raw figure beside it', async () => {
+    const never = (async () => { throw new Error('native needs no lookup') }) as never
+    // ZTX is 6-decimal in this wallet (ZTX_DECIMALS), so 1500000 raw is 1.5. A first draft of this
+    // assertion assumed 8 decimals and the code rightly disagreed with it.
+    const out = await describeAssetAmount('ZTX', '1500000', never)
+    expect(out).toBe('1500000 (1.5 ZTX)')
+  })
+
+  it('falls back to the raw figure and a label when it cannot scale', async () => {
+    const failing = (async () => { throw new Error('down') }) as never
+    const out = await describeAssetAmount('ZTX3SomeTokenThatCannotBeRead000000', '50000', failing)
+    expect(out).toContain('50000')
+    expect(out).not.toMatch(/\(\d/)
   })
 })

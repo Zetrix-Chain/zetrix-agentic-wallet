@@ -66,7 +66,7 @@ describe('fetchZTP20BalanceStrict', () => {
 describe('queryTokenBalance', () => {
   it('reports a ZTP20 balance with the decimals read from contractInfo', async () => {
     const out = await queryTokenBalance(deps(), 'JMYR')
-    expect(out).toEqual({ token: 'JMYR', balance: '473999900', decimals: 6, display: '473.9999 JMYR' })
+    expect(out).toEqual({ token: 'JMYR', balance: '473999900', decimals: 6, display: '473.9999 JMYR', tokenAddress: jmyr })
   })
 
   it('reports the native ZTX balance with ZETA decimals', async () => {
@@ -95,7 +95,7 @@ describe('queryTokenBalance', () => {
   it('still reports the balance with decimals:null when contractInfo is unavailable', async () => {
     const query = queryReturning({ balanceOf: balanceOk })
     const out = await queryTokenBalance(deps({ query }), 'JMYR')
-    expect(out).toEqual({ token: 'JMYR', balance: '473999900', decimals: null, display: '473999900 JMYR' })
+    expect(out).toEqual({ token: 'JMYR', balance: '473999900', decimals: null, display: '473999900 JMYR', tokenAddress: jmyr })
   })
 
   it('reports unknown_token for a symbol with no registered contract on this network', async () => {
@@ -109,7 +109,7 @@ describe('queryTokenBalance', () => {
   describe('accepts a contract address as well as a symbol', () => {
     it('resolves a balance when given a ZTP20 contract address directly', async () => {
       const out = await queryTokenBalance(deps(), jmyr)
-      expect(out).toEqual({ token: 'JMYR', balance: '473999900', decimals: 6, display: '473.9999 JMYR' })
+      expect(out).toEqual({ token: 'JMYR', balance: '473999900', decimals: 6, display: '473.9999 JMYR', tokenAddress: jmyr })
     })
 
     it('queries the address that was passed, not a registry lookup of it', async () => {
@@ -156,7 +156,7 @@ describe('queryTokenBalance', () => {
 
   it('upper-cases the requested symbol before resolving it', async () => {
     const out = await queryTokenBalance(deps(), 'jmyr')
-    expect(out).toEqual({ token: 'JMYR', balance: '473999900', decimals: 6, display: '473.9999 JMYR' })
+    expect(out).toEqual({ token: 'JMYR', balance: '473999900', decimals: 6, display: '473.9999 JMYR', tokenAddress: jmyr })
   })
 })
 

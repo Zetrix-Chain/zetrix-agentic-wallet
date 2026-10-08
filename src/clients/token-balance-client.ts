@@ -25,6 +25,13 @@ export type TokenBalanceResult =
       balance: string
       decimals: number | null
       /**
+       * The token's contract address — what a policy's `tokenAddress` must carry. Present for every
+       * ZTP20 result and absent for native ZTX, which has no contract. Without it an agent had the
+       * balance and no way to name the token on chain, and asked the user to paste an address this
+       * wallet already held.
+       */
+      tokenAddress?: string
+      /**
        * The balance in whole tokens with its symbol, e.g. `473.9999 JMYR`. `balance` stays raw so
        * cap checks and quote comparisons remain integer-only; this exists so neither the agent nor
        * the user has to divide by 10^decimals before deciding whether they can afford something —
@@ -173,7 +180,7 @@ export async function queryTokenBalance(deps: TokenBalanceDeps, token: string): 
   // Asked by address, answer by name — the caller learns which token that contract actually is.
   const label = byAddress ? info?.symbol ?? asked : symbol
   const decimals = info?.decimals ?? null
-  return { token: label, balance, decimals, display: renderDisplay(balance, decimals, label) }
+  return { token: label, balance, decimals, display: renderDisplay(balance, decimals, label), tokenAddress: contractAddress }
 }
 
 /** `473999900` + 6 decimals -> `473.9999 JMYR`. Unreadable decimals keep the raw count, still labelled. */

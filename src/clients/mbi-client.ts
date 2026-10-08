@@ -11,6 +11,8 @@
  * so generic x402 clients can consume `accepts[]` directly; success/errors ARE wrapped.
  */
 
+import { createHash } from 'node:crypto'
+
 export class MbiError extends Error {
   httpStatus?: number
   /**
@@ -78,11 +80,11 @@ export interface MbiStatus {
   vcId?: string
 }
 
-/** `/v1/vp/ext/*` message-signing auth — Ed25519 signature over the holder's own address (UTF-8), not a hex blob. */
-export interface MbiVpAuth {
-  signedData: string
-  publicKey: string
-}
+/**
+ * Signs a UTF-8 message with the holder's key (Wallet BE `sign-message`) and returns the hex signature
+ * plus the public key. MbiClient uses it to log in each `/ext` request (see {@link MbiClient}).
+ */
+export type MbiRequestSigner = (message: string) => Promise<{ signBlob: string; publicKey: string }>
 
 export interface MbiVpCreateBody {
   vc: unknown
@@ -205,22 +207,22 @@ export class MbiClient {
   }
 
   /** POST /v1/vp/ext/create — derive the unsigned VP blob for external signing. */
-  async createVp(body: MbiVpCreateBody, auth: MbiVpAuth): Promise<MbiVpCreateResult> {
-    const res = await this.fetch('POST', '/v1/vp/ext/create', body, { signedData: auth.signedData, publicKey: auth.publicKey })
+  async createVp(body: MbiVpCreateBody, sign: MbiRequestSigner): Promise<MbiVpCreateResult> {
+    const res = await this.signedFetch('POST', '/v1/vp/ext/create', body, sign)
     if (!res.ok) throw await this.error(res, 'vp/ext/create failed')
     return this.unwrap<MbiVpCreateResult>(res)
   }
 
   /** POST /v1/vp/ext/submit — submit the signed VP blob; `includeVp: true` returns the finished VP too. */
-  async submitVp(body: MbiVpSubmitBody, auth: MbiVpAuth): Promise<MbiVpSubmitResult> {
-    const res = await this.fetch('POST', '/v1/vp/ext/submit', body, { signedData: auth.signedData, publicKey: auth.publicKey })
+  async submitVp(body: MbiVpSubmitBody, sign: MbiRequestSigner): Promise<MbiVpSubmitResult> {
+    const res = await this.signedFetch('POST', '/v1/vp/ext/submit', body, sign)
     if (!res.ok) throw await this.error(res, 'vp/ext/submit failed')
     return this.unwrap<MbiVpSubmitResult>(res)
   }
 
   /** POST /v1/vc/ext/download — holder-authenticated; returns EVERY VC for the address, not one. */
-  async downloadVcs(body: { address: string }, auth: MbiVpAuth): Promise<MbiVcEntry[]> {
-    const res = await this.fetch('POST', '/v1/vc/ext/download', body, { signedData: auth.signedData, publicKey: auth.publicKey })
+  async downloadVcs(body: { address: string }, sign: MbiRequestSigner): Promise<MbiVcEntry[]> {
+    const res = await this.signedFetch('POST', '/v1/vc/ext/download', body, sign)
     if (!res.ok) throw await this.error(res, 'vc/ext/download failed')
     const raw = await this.unwrap<unknown>(res)
     // Confirmed live (2026-08-17): MBI's real response double-wraps the list —
@@ -238,15 +240,71 @@ export class MbiClient {
     return data as MbiVcEntry[]
   }
 
+  /**
+   * An `/ext` request logged in with MBI's request-bound signing: the holder signs
+   * `METHOD|PATH|sha256hex(body)|timestamp` and MBI re-derives the same string from what it receives.
+   *
+   * The signature covers the body bytes that are actually sent, so the body is serialised once and
+   * that exact text is both hashed and sent. A fresh timestamp and signature are produced on every call:
+   * MBI treats each signed request as single-use, so one signature cannot be reused for a second call
+   * (and the legacy scheme, which signed the caller's own address, was replayable indefinitely).
+   * `path` is the API path (`/v1/...`) exactly as MBI sees it. The default base URLs have no path prefix;
+   * a base URL that does carry one is sent as given and the prefix is NOT part of the signature, which only
+   * works where a gateway in front of MBI strips it before MBI verifies the request.
+   *
+   * Redirects are not followed: a redirected POST would be replayed with the same signature and timestamp,
+   * which MBI refuses as already used, so a redirect is surfaced as an error instead.
+   */
+  private async signedFetch(method: string, path: string, body: unknown, sign: MbiRequestSigner): Promise<Response> {
+    const bodyText = JSON.stringify(body)
+    const timestamp = this.nextTimestamp()
+    const canonical = `${method}|${path}|${createHash('sha256').update(bodyText, 'utf8').digest('hex')}|${timestamp}`
+    const signed = await sign(canonical)
+    if (!signed?.signBlob || !signed?.publicKey) {
+      // Empty headers would reach MBI as an opaque 401/403, and for the one-shot VC download that burns the call.
+      throw new MbiError(`MBI ${path} request was not sent: the signer returned no signature or public key`)
+    }
+    return this.send(method, path, bodyText, { signedData: signed.signBlob, publicKey: signed.publicKey, timestamp }, 'error')
+  }
+
+  private lastSignedAtMs = 0
+
+  /**
+   * An ISO-8601 instant that is strictly later than the one before it from this client. MBI treats a signed
+   * request as single-use, keyed on the signed string, so two identical requests in the same millisecond
+   * would otherwise sign the same string and the second would be refused as already used.
+   */
+  private nextTimestamp(): string {
+    const ms = Math.max(Date.now(), this.lastSignedAtMs + 1)
+    this.lastSignedAtMs = ms
+    return new Date(ms).toISOString()
+  }
+
   private fetch(method: string, path: string, body?: unknown, extraHeaders?: Record<string, string>): Promise<Response> {
+    return this.send(method, path, body !== undefined ? JSON.stringify(body) : undefined, extraHeaders)
+  }
+
+  private send(
+    method: string,
+    path: string,
+    bodyText?: string,
+    extraHeaders?: Record<string, string>,
+    redirect?: RequestRedirect,
+  ): Promise<Response> {
     const headers: Record<string, string> = { Accept: 'application/json', ...(extraHeaders ?? {}) }
-    if (body !== undefined) headers['Content-Type'] = 'application/json'
+    if (bodyText !== undefined) headers['Content-Type'] = 'application/json'
     return fetch(`${this.baseUrl}${path}`, {
       method,
       headers,
       signal: AbortSignal.timeout(this.timeoutMs),
-      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      ...(bodyText !== undefined ? { body: bodyText } : {}),
+      ...(redirect !== undefined ? { redirect } : {}),
     }).catch((e) => {
+      // With redirect:'error' undici reports a redirect as a bare "fetch failed" whose cause names it.
+      const cause = (e as { cause?: { message?: string } }).cause?.message ?? ''
+      if (redirect === 'error' && /redirect/i.test(cause)) {
+        throw new MbiError(`MBI ${path} answered with a redirect, which is not followed for signed requests; check MBI_BASE_URL`)
+      }
       throw new MbiError(`MBI ${path} request failed: ${(e as Error).message}`)
     })
   }

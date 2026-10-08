@@ -200,7 +200,7 @@ describe('template reads', () => {
 
 describe('readOwnerPolicies', () => {
   // The REAL getPolicy envelope: the policy is NESTED, with a policyAttributeIds sibling.
-  // Modelled flat until BT-3000 read the deployed contract, which is why every field a caller
+  // Modelled flat until the deployed contract was read, which is why every field a caller
   // asked for came back undefined.
   const policyBody = (key: string) =>
     JSON.stringify({

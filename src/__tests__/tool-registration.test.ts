@@ -40,14 +40,14 @@ function moneySentences(): { tool: string; path: string; sentence: string }[] {
 }
 
 describe('buildToolList', () => {
-  it('exposes exactly the 18 agent tools with the correct required inputs', () => {
+  it('exposes exactly the 21 agent tools with the correct required inputs', () => {
     const tools = buildToolList()
     expect(tools.map((t) => t.name).sort()).toEqual([
       'check_ai_birthcert_verification', 'check_policy_decision', 'check_policy_write', 'clear_stuck_payment_receipt',
-      'create_holder_account', 'credential_preflight', 'get_my_policy', 'get_policy_template_schema',
+      'create_holder_account', 'create_verification_qr', 'credential_preflight', 'get_my_policy', 'get_policy_template_schema',
       'get_template_schema', 'pay_and_fetch', 'policy_preflight', 'prove_identity',
-      'query_contract', 'request_ai_birthcert_verification', 'subscribe_and_issue', 'transfer_token',
-      'wallet_status', 'write_policy',
+      'query_contract', 'remove_policy', 'request_ai_birthcert_verification', 'subscribe_and_issue', 'transfer_token',
+      'update_policy', 'wallet_status', 'write_policy',
     ])
 
     const byName = Object.fromEntries(tools.map((t) => [t.name, t]))
@@ -62,6 +62,88 @@ describe('buildToolList', () => {
     expect(byName.transfer_token.inputSchema.required).toEqual(['token', 'to'])
     expect(byName.request_ai_birthcert_verification.inputSchema.required).toEqual(['agentName'])
     expect(byName.check_ai_birthcert_verification.inputSchema.type).toBe('object')
+    expect(byName.create_verification_qr.inputSchema.required).toBeUndefined()
+    expect(byName.update_policy.inputSchema.required).toEqual(['policyKey', 'attributes', 'expectedUpdatedAtBlock'])
+    expect(byName.remove_policy.inputSchema.required).toEqual(['policyKey'])
+  })
+
+  // update_policy pays and remove_policy lifts every limit: what the agent is told about each has to say so, and the
+  // wording that stops it paying twice or calling a submitted removal done has to survive any later edit.
+  it('update_policy tells the agent it pays, needs confirm, never to pay again on settling/submitted, and what write_failed means', () => {
+    const d = buildToolList().find((t) => t.name === 'update_policy')!.description
+    expect(d).toMatch(/THIS PAYS A REAL FEE/)
+    expect(d).toMatch(/only pays and writes with confirm: true/)
+    expect(d).toMatch(/Never pass confirm on your own judgement/)
+    expect(d).toMatch(/never call this tool again for the same policy, never tell the user it failed, and pass `paymentReceipt` to check_policy_write/)
+    expect(d).toMatch(/do NOT report the policy as updated/)
+    expect(d).toMatch(/"written" is the only state that means the policy was updated/)
+    expect(d).toMatch(/the update was NOT applied and the policy is unchanged, but a payment may have been taken/)
+    expect(d).toMatch(/never retry with the old expectedUpdatedAtBlock/)
+    expect(d).toMatch(/Never ask the user for their HSM password/)
+  })
+
+  it('remove_policy tells the agent what removing means, that it needs a yes, and that submitted is not removed', () => {
+    const d = buildToolList().find((t) => t.name === 'remove_policy')!.description
+    expect(d).toMatch(/REMOVES EVERY LIMIT IT SET/)
+    expect(d).toMatch(/Wallet BE signs spends of that asset without any limit/)
+    expect(d).toMatch(/Never pass confirm on your own judgement/)
+    expect(d).toMatch(/"removed" is the only state that means the policy is gone/)
+    expect(d).toMatch(/"submitted" means the removal is on its way but not confirmed — do NOT tell the user it is removed/)
+    expect(d).toMatch(/expected not to submit a second removal/)
+    expect(d).toMatch(/Never ask the user for their HSM password/)
+  })
+
+  // an amount may be given in whole tokens per attribute, and the agent is told a count is never an amount.
+  it.each(['write_policy', 'update_policy', 'policy_preflight'])('%s offers valueHuman for an amount and says maxTransactionCount is a count, never scaled', (name) => {
+    const tool = buildToolList().find((t) => t.name === name)!
+    expect(tool.description).toMatch(/valueHuman/)
+    expect(tool.description).toMatch(/maxTransactionCount is a count/)
+    const items = (tool.inputSchema.properties.attributes as { items: { properties: Record<string, { description?: string }>; required: string[] } }).items
+    expect(items.properties.valueHuman.description).toMatch(/whole tokens/)
+    expect(items.properties.valueHuman.description).toMatch(/Never for a count/)
+    // a value OR a valueHuman: neither is required on its own
+    expect(items.required).not.toContain('value')
+  })
+
+  it('the schemas for the two new tools carry no password field', () => {
+    for (const name of ['update_policy', 'remove_policy']) {
+      const props = JSON.stringify(buildToolList().find((t) => t.name === name)!.inputSchema.properties)
+      expect(props).not.toMatch(/password/i)
+    }
+  })
+
+  it('create_verification_qr tells the agent to relay a failure, show the link only to the user, and that the reference id grants access to what is revealed', () => {
+    const tool = buildToolList().find((t) => t.name === 'create_verification_qr')!
+    expect(tool.description).toMatch(/do not invent a link/)
+    // the two credentials it is for, in the order it prefers them, and none that is no longer supported
+    expect(tool.description).toMatch(/Verified AI Birthcert if it holds one, otherwise the Basic AI Birthcert/)
+    expect(tool.description).toMatch(/neither it returns created: false and says to create one first/)
+    expect(JSON.stringify(tool)).not.toMatch(/agentIdentity|Agent Identity/i)
+    expect(tool.description).not.toMatch(/service asks/)
+    expect(tool.description).toMatch(/only to the human user/)
+    expect(tool.description).toMatch(/reference id grants access to the revealed attributes until it expires/)
+    expect(tool.description).not.toMatch(/never credential data/)
+    const properties = tool.inputSchema.properties as Record<string, { description?: string; type?: string }>
+    expect(properties.revealAll.type).toBe('boolean')
+    // what it reveals when nothing is said, and when to go beyond that
+    expect(tool.description).toMatch(/standard minimal set/)
+    expect(tool.description).toMatch(/agentName, evidenceProvider and ownerVerified/)
+    expect(tool.description).toMatch(/revealAll: true only when the user explicitly asks to reveal everything/)
+    expect(tool.description).toMatch(/Basic AI Birthcert does not mean the owner was verified/)
+    expect(properties.revealAttribute.description).toMatch(/Omit to reveal the standard set/)
+    expect(properties.revealAll.description).toMatch(/only when the user explicitly asks/)
+    expect(properties.expiryMinutes.description).toMatch(/1 to 60/)
+  })
+
+  // A credential the wallet already holds must stop the agent before it asks the user for a name.
+  it("credential_preflight tells the agent to stop on alreadyHeld, and to pass replacing only on the user's explicit word", () => {
+    const tool = buildToolList().find((t) => t.name === 'credential_preflight')!
+    expect(tool.description).toMatch(/If the result has `alreadyHeld`/)
+    expect(tool.description).toMatch(/do not ask for an agent name or any other detail, and do not begin an issuance/)
+    expect(tool.description).toMatch(/Only when the user has explicitly said they want a replacement/)
+    const properties = tool.inputSchema.properties as Record<string, { type?: string; description?: string }>
+    expect(properties.replacing.type).toBe('boolean')
+    expect(properties.replacing.description).toMatch(/Never infer it/)
   })
 
   it('does not expose a password parameter on create_holder_account', () => {
@@ -387,12 +469,17 @@ describe('buildToolList', () => {
   })
 
   // The other direction, and the one R9-M01's mutant used: asserting the money did NOT move. That is
-  // true for exactly two branches (insufficient funds / payment cap) and unknowable for every other,
+  // true for exactly three branches (insufficient funds / payment cap / a spending-policy refusal at signing) and
+  // unknowable for every other,
   // so such a sentence must either name that safe scope or be a prohibition on saying it. Applied to
   // both tools: check_ makes the same no-charge disclaimers, and both are non-vacuous here.
   const NO_CHARGE_CLAIM =
     /\b(fee|charge|charged|payment|money|funds)\b[^.]{0,80}\b(never left|did not leave|was not taken|were not taken|has not been taken|was not charged|were not charged|not charged|no charge|refunded|still in the account|untouched|intact)\b|\bnothing was (paid|charged|taken|spent|debited)\b|\bno (fee|money|charge) (was|has been) (taken|charged|spent|sent|paid)\b/i
-  const SAFE_SCOPE = /insufficient funds|payment-cap|payment cap/i
+  // A third branch is provably pre-money for the same reason the first two are: a Wallet BE policy refusal
+  // arrives as the failure of the SIGNATURE, which every paying path calls before the X-PAYMENT header exists, so
+  // nothing was presented for payment. It must still name the branch ("spending policy"); a bare "nothing was paid" is
+  // exactly the unscoped claim this guard exists to refuse.
+  const SAFE_SCOPE = /insufficient funds|payment-cap|payment cap|spending policy/i
   it.each(['request_ai_birthcert_verification', 'check_ai_birthcert_verification'])(
     '%s: no sentence says the money did not move unless it is scoped to the safe branches or forbids saying it',
     (name) => {
@@ -820,7 +907,7 @@ describe('the docs agree with the tool descriptions about money', () => {
     }
   })
 
-  // BT-3029 round-1 review, LOW finding 5: the exact-snapshot test above pins wording, but a future
+  // Round-1 review, LOW finding 5: the exact-snapshot test above pins wording, but a future
   // fixture edit that dropped a rule's WORDS while keeping the fixture in sync with the code would
   // sail through it silently. These are semantic (regex) guards on the underlying rule, independent
   // of exact phrasing, so either rule going missing from any of these surfaces fails on its own merit.

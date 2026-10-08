@@ -107,7 +107,7 @@ describe('"we could not tell" is never reported as a refusal', () => {
 
   it('reports an unrecognised reason code verbatim instead of describing it', async () => {
     // A code this wallet has never seen gets no invented meaning — the same discipline as
-    // declining to interpret a list whose polarity is unknown (BT-3000 APP-C01).
+    // declining to interpret a list whose polarity is unknown (APP-C01).
     const r = await ask(client(envelope({ decision: 'DENY', reasonCode: 'SOME_NEW_CODE' })))
     expect(r.outcome).toBe('refused')
     expect(r.reasonCode).toBe('SOME_NEW_CODE')
@@ -257,7 +257,7 @@ describe('the request this tool will and will not send', () => {
   })
 
   it('caps untrusted upstream text before it reaches the agent', async () => {
-    // Upstream error bodies land in agent-facing output, and BT-3000 spent several rounds on
+    // Upstream error bodies land in agent-facing output, and many review rounds went on
     // exactly this: an unbounded echo of someone else's text is a context-flood vector.
     const r = await ask(client('x'.repeat(50_000), 502))
     expect(r.outcome).toBe('undetermined')
@@ -418,7 +418,7 @@ describe('round 1 — what the ms-zetrix integration guide says, which this wall
 
   it('pins the default timeout absolutely, not against itself', () => {
     // The hung-service test below passes its own 10ms, so it never exercises the DEFAULT — and
-    // raising the constant to a day survived the whole suite. Same class as BT-3000 APP-M03: a
+    // raising the constant to a day survived the whole suite. Same class as APP-M03: a
     // bound compared only against itself cannot fail at any value.
     expect(REQUEST_TIMEOUT_MS).toBeLessThanOrEqual(60_000)
     expect(REQUEST_TIMEOUT_MS).toBeGreaterThan(1_000)
@@ -446,7 +446,7 @@ describe('round 1 — what the ms-zetrix integration guide says, which this wall
   })
 
   it('tells the agent that every decision is EVALUATION_UNAVAILABLE while the crawl is off', () => {
-    // APP-L03, guide §10: the crawl is off in every environment pending BT-2574, so there is no
+    // APP-L03, guide §10: the crawl is off in every environment pending a later change, so there is no
     // spend ledger to evaluate against and every decision answers EVALUATION_UNAVAILABLE. Worth
     // saying, because an agent otherwise reports a working system as broken.
     const description = buildToolList().find((t) => t.name === 'check_policy_decision')!.description

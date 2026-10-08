@@ -38,6 +38,22 @@ export type ContractQuery = (args: {
 }>
 
 /**
+ * The most decimals this wallet will believe. Real tokens use 0-18; 36 leaves headroom and still keeps
+ * `10n ** BigInt(decimals)` and the padded strings built from it trivially small.
+ */
+export const MAX_TOKEN_DECIMALS = 36
+
+/** A token's `decimals` field as a number in [0, MAX_TOKEN_DECIMALS], or undefined when it is anything else. */
+export function parseDecimals(raw: unknown): number | undefined {
+  if (typeof raw === 'number') return Number.isInteger(raw) && raw >= 0 && raw <= MAX_TOKEN_DECIMALS ? raw : undefined
+  if (typeof raw === 'string' && /^\d{1,2}$/.test(raw)) {
+    const n = Number(raw)
+    return n <= MAX_TOKEN_DECIMALS ? n : undefined
+  }
+  return undefined
+}
+
+/**
  * Read a ZTP20 contract's `contractInfo`. Returns `null` (never throws) on any RPC
  * error, missing field, malformed JSON, or a response without a `symbol`.
  */
@@ -60,11 +76,13 @@ export async function fetchTokenInfo(contractAddress: string, query: ContractQue
     // The query dispatcher wraps the handler's return under its key: {"contractInfo": {...}}.
     const info = (parsed.contractInfo ?? parsed) as Record<string, unknown>
     if (typeof info.symbol !== 'string' || info.symbol === '') return null
-    const decimals = Number(info.decimals)
-    // A non-integer or negative decimals is as unusable as a missing one — `toHumanAmount` with
-    // -1 happily returns a wrong answer rather than failing, so it is rejected here, at the read.
-    const readable = Number.isInteger(decimals) && decimals >= 0
-    return { symbol: info.symbol, decimals: readable ? decimals : 0, decimalsReadable: readable }
+    // Strictly typed. `Number(null)`, `Number("")`, `Number(false)` and `Number([])` are all 0, so a contract
+    // answering any of them used to read as a genuine 0-decimal token — and `amountUnit: "whole"` would then
+    // write 1 token as `1`, a million times too small for a 6-decimal one. A decimals value is a number or a
+    // short digit string and nothing else, and it is bounded: past MAX_TOKEN_DECIMALS no real token exists,
+    // and a hostile one would make `10n ** BigInt(decimals)` throw or stall the process.
+    const decimals = parseDecimals(info.decimals)
+    return { symbol: info.symbol, decimals: decimals ?? 0, decimalsReadable: decimals !== undefined }
   } catch {
     return null
   }

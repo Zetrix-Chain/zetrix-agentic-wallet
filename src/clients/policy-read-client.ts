@@ -242,7 +242,12 @@ export async function getPolicyByKey(
   const raw = await queryPolicy(policyAddress, 'getPolicy', { policyKey }, query)
   if (!raw.ok) return { error: 'query_failed', detail: raw.detail }
   const value = raw.value as { found?: unknown; policy?: unknown; policyAttributeIds?: unknown } | null
-  if (!value || value.found !== true) return { found: false }
+  // `found` is a boolean in the real contract. A reply that parses but has no boolean there (null, {}, an array, a string) is a
+  // failed read, NOT "no such policy": remove_policy reports `removed` on found:false, so a malformed reply must not reach it.
+  if (!value || typeof value !== 'object' || (value.found !== true && value.found !== false)) {
+    return { error: 'query_failed', detail: 'getPolicy: the reply carried no boolean found' }
+  }
+  if (value.found === false) return { found: false }
   if (!value.policy || typeof value.policy !== 'object') {
     // found:true with no policy body is a malformed reply, not a hit. Returning the envelope as
     // the record means every field a caller reads comes back undefined.
@@ -255,6 +260,26 @@ export async function getPolicyByKey(
       ...(value.policyAttributeIds ? { policyAttributeIds: value.policyAttributeIds as Record<string, string> } : {}),
     },
   }
+}
+
+/**
+ * Read ONE of the owner's policies: resolve the owner's Policy Contract through the Registry, then `getPolicy` by key.
+ * That is 2 chain calls rather than the 2 + N of {@link readOwnerPolicies}, which is what an update or a removal needs.
+ *
+ * `{found:false}` is an owner with no policy contract, or no policy under that key — both mean "there is none". A failed
+ * read is an error and is never reported as `found:false`: "we could not look" must not read as "it is not there".
+ */
+export async function readOwnerPolicy(
+  owner: string,
+  registryAddress: string,
+  policyKey: string,
+  query: ContractQuery,
+): Promise<PolicyRead<PolicyReadResult>> {
+  const contract = await getPolicyContract(owner, registryAddress, query)
+  if (!('found' in contract) || contract.found !== true) {
+    return 'error' in contract ? contract : { found: false }
+  }
+  return getPolicyByKey(contract.value, policyKey, query)
 }
 
 export interface OwnerPolicies {

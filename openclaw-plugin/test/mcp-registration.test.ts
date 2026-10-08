@@ -74,6 +74,12 @@ describe('buildServerEntry', () => {
   it('includes ZETRIX_ADDRESS only when the subscriber pinned one', () => {
     expect(entry.env.ZETRIX_ADDRESS).toBeUndefined()
     expect(buildServerEntry(BUNDLE, { zetrixAddress: 'ZTX3Pinned' }, STATE).env.ZETRIX_ADDRESS).toBe('ZTX3Pinned')
+    expect(
+      buildServerEntry(BUNDLE, { myidVerifyLinkTemplate: ' https://link.myid.test/v?referenceId={referenceId} ' }, STATE).env.MYID_VERIFY_LINK_TEMPLATE,
+    ).toBe('https://link.myid.test/v?referenceId={referenceId}')
+    // absent, not empty, when unconfigured: the wallet treats "not set" as "refuse", and a blank would only hide that
+    expect('MYID_VERIFY_LINK_TEMPLATE' in buildServerEntry(BUNDLE, {}, STATE).env).toBe(false)
+    expect('MYID_VERIFY_LINK_TEMPLATE' in buildServerEntry(BUNDLE, { myidVerifyLinkTemplate: '   ' }, STATE).env).toBe(false)
   })
 })
 

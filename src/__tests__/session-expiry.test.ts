@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest'
 import { humanRemaining, sessionExpiryFields, withSessionExpiry } from '../orchestrator/session-expiry'
 
 /**
- * BT-2993. In a live run the wallet returned SSIVC's expiresAt untouched, the host agent converted it
+ * In a live run the wallet returned SSIVC's expiresAt untouched, the host agent converted it
  * to +08:00 but took its own "now" to be UTC, and told the user the link was good for about 8 hours.
  * The real window was about 15 minutes. The wallet now works the remaining time out itself.
  */

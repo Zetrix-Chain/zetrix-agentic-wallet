@@ -2,7 +2,7 @@ import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest'
 import { SsivcClient } from '../clients/ssivc-client'
 
 /**
- * BT-2993: opt-in wire tracing (`SSIVC_TRACE=1`). It exists because a stalled settlement could not
+ * opt-in wire tracing (`SSIVC_TRACE=1`). It exists because a stalled settlement could not
  * be diagnosed from either side — SSIVC keeps no full response bodies and the wallet sits behind the
  * plugin host — so the wallet itself must be able to print the exact request and response. It is
  * OFF by default because the trace contains the payment receipt, a bearer handle on a real payment.

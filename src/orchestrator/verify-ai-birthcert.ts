@@ -26,11 +26,12 @@ import { orderAccepts, isSponsored, type GasPreference } from '../accept-selecti
 import type { PayRequirement } from '../clients/mbi-client.js'
 import type { SsivcSessionStore, StoredSsivcSession } from '../clients/ssivc-session-store.js'
 import type { DownloadQuarantineStore } from '../clients/ssivc-download-quarantine-store.js'
-import type { MbiClient, MbiVcEntry, MbiVpAuth } from '../clients/mbi-client.js'
+import type { MbiClient, MbiVcEntry } from '../clients/mbi-client.js'
 import { type VcCacheStore, extractValidUntil, isVcValid } from '../clients/vc-cache.js'
 import { extractVcPassBase64, writeVcPassImages } from '../clients/vc-pass-image.js'
 import { PaymentReadinessError, type PaymentShortfall } from '../payment-readiness.js'
 import { PaymentCapError, type PaymentCapDetail } from '../payment-guard.js'
+import { describePolicyRefusal, policyRefusalFlags, toPaymentPolicyError } from '../policy-refusal.js'
 
 export interface VerifyAiBirthcertDeps {
   ssivc: Pick<SsivcClient, 'createSessionChallenge' | 'createSessionSettle' | 'createSessionWithReceipt' | 'getSession'>
@@ -200,6 +201,16 @@ export interface RequestVerificationFailure {
   insufficientFunds?: PaymentShortfall
   /** Set when the spending cap refused the payment — includes which cap key was applied. */
   paymentCap?: PaymentCapDetail
+  /**
+   * Wallet BE refused to sign the session fee because the owner's spending policy DENIED it. A decision, not a
+   * failure: retrying will not help. Nothing was signed or paid and no session was created. See policy-refusal.ts.
+   */
+  policyDenied?: true
+  /**
+   * Wallet BE could not complete the policy check, so it refused to sign; nothing was paid and no session was
+   * created. Transient: trying again shortly is right.
+   */
+  policyCheckUnavailable?: true
   /**
    * The settlement receipt at stake, when one exists. Its own field because it is the
    * first thing support asks for, and digging it out of a long sentence invites transcription errors
@@ -1823,6 +1834,16 @@ async function payOrReplayLocked(
     const err = rawErr instanceof PrepareStageError ? rawErr.cause : rawErr
     if (err instanceof PaymentReadinessError) return { error: `insufficient funds: ${err.message}`, insufficientFunds: err.shortfall }
     if (err instanceof PaymentCapError) return { error: err.message, ...(err.detail ? { paymentCap: err.detail } : {}) }
+    // The refusal arrives at the signature, before the X-PAYMENT header exists, so no payment was presented to SSIVC
+    // and no session was created — only the free session challenge had been asked for. Never retried on the other gas
+    // option: that fallback is for the facilitator's own definitive refusals, and this is neither.
+    const policyRefusal = toPaymentPolicyError(err)
+    if (policyRefusal) {
+      return {
+        error: describePolicyRefusal(policyRefusal, 'Nothing was paid and no verification session was created.'),
+        ...policyRefusalFlags(policyRefusal),
+      }
+    }
     if (err instanceof NoPaymentOptionsError) return { error: err.message }
     if (err instanceof FacilitatorInsufficientFundsError) return { error: err.message }
     if (err instanceof SettlementStillQueuedError) {
@@ -2557,10 +2578,9 @@ async function fetchAndCacheIssuedVc(
     const quarantined = await deps.quarantine.get(vcId)
     if (quarantined) return { entries: quarantined.entries as MbiVcEntry[] }
 
-    const auth: MbiVpAuth = await deps.messageSigner(deps.address).then((r) => ({ signedData: r.signBlob, publicKey: r.publicKey }))
     let downloaded: MbiVcEntry[]
     try {
-      downloaded = await deps.mbi.downloadVcs({ address: deps.address }, auth)
+      downloaded = await deps.mbi.downloadVcs({ address: deps.address }, deps.messageSigner)
     } catch (err) {
       // This is exactly the "transient MBI error" the tool description already
       // promises becomes a cacheError, not a throw — so a caller can safely retry check_ai_birthcert_verification.

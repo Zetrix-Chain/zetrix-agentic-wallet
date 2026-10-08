@@ -3,17 +3,16 @@
  * `/v1/vp/ext/submit` (with `includeVp: true`), keeping the Ed25519 signature in
  * Wallet BE:
  *
- *   1. sign the holder's own address (UTF-8) via Wallet BE               → { signBlob, publicKey } (auth)
- *   2. POST /v1/vp/ext/create { vc, revealAttributes, rangeProof? }      → { blobId, blob(hex) }
- *   3. Ed25519-sign the hex `blob` via Wallet BE (injected `signHexBlob`) → { signBlob, publicKey }
- *   4. POST /v1/vp/ext/submit { blobId, signedBlob, publicKey, includeVp: true } → { id, vp }
- *   5. resolve the VC's *issuer* BBS+/Ed25519 keys (injected `resolveIssuerKeys`) for the
+ *   1. POST /v1/vp/ext/create { vc, revealAttributes, rangeProof? }      → { blobId, blob(hex) }
+ *   2. Ed25519-sign the hex `blob` via Wallet BE (injected `signHexBlob`) → { signBlob, publicKey }
+ *   3. POST /v1/vp/ext/submit { blobId, signedBlob, publicKey, includeVp: true } → { id, vp }
+ *   4. resolve the VC's *issuer* BBS+/Ed25519 keys (injected `resolveIssuerKeys`) for the
  *      OID4VP submit body — see `resolve-issuer-proof-keys.ts` for why.
  *
  * `/v1/vp/ext/*` accepts lightweight message-signing auth (no login/registration/subscription,
- * unlike the Zetrix BaaS the earlier VC-MCP-based adapter needed) — a self-signed Ed25519
- * signature over the holder's own address, sent as the `signedData`/`publicKey` headers. The
- * same signature (deterministic, not nonce-based) is reused for both HTTP calls in one `createVp`.
+ * unlike the Zetrix BaaS the earlier VC-MCP-based adapter needed). The adapter passes its
+ * `signMessage` to MbiClient, which signs each request with MBI's request-bound scheme
+ * (`METHOD|PATH|sha256(body)|timestamp`) — one signature per call, never reused.
  *
  * The `ed25519PublicKey`/`bbsPublicKey` this returns are the VC's *issuer's* keys (resolved via
  * `resolveIssuerKeys`), not the holder's — confirmed against `openid4vp-verifier-be`'s
@@ -34,7 +33,7 @@ export type MbiVpCaller = Pick<MbiClient, 'createVp' | 'submitVp'>
 /** Ed25519-signs a hex blob (→ Wallet BE `/sign-blob`). */
 export type HexBlobSigner = (blobHex: string) => Promise<{ signBlob: string; publicKey: string }>
 
-/** Ed25519-signs a UTF-8 message (→ Wallet BE `/sign-message`) — used for MBI's `/ext/` auth headers. */
+/** Ed25519-signs a UTF-8 message (→ Wallet BE `/sign-message`) — MBI's request-bound `/ext/` login. */
 export type MessageSigner = (message: string) => Promise<{ signBlob: string; publicKey: string }>
 
 /** Resolves the VC's issuer's BBS+/Ed25519 verification keys (via the ZID resolver). */
@@ -146,12 +145,59 @@ export function dcqlToRevealAttributes(credentialQuery: unknown, vc?: unknown): 
       }
     }
   }
-  if (!subject) return out
+  return orderRevealPaths(out, vc)
+}
+
+/**
+ * Reveal paths de-duplicated (first seen kept) and, when the VC carries a `credentialSubject`, ordered as the
+ * VC signed its fields — the order MBI needs them in (see dcqlToRevealAttributes). A path the VC does not
+ * contain sorts after every one it does, keeping its original relative order.
+ */
+export function orderRevealPaths(paths: string[], vc?: unknown): string[] {
+  const unique = [...new Set(paths)]
+  const subject = isRecord(vc) && isRecord(vc.credentialSubject) ? vc.credentialSubject : undefined
+  if (!subject) return unique
   const canonicalIndex = new Map(flattenLeafPaths(subject).map((path, i) => [path, i]))
-  return out
+  return unique
     .map((path, i) => ({ path, key: canonicalIndex.get(path) ?? Number.MAX_SAFE_INTEGER, i }))
     .sort((a, b) => a.key - b.key || a.i - b.i)
     .map((entry) => entry.path)
+}
+
+/**
+ * The attribute paths of the VC's `credentialSubject` that can be named for disclosure — names only, never values,
+ * and without the subject's own `id`. Empty when there is no plain-object `credentialSubject`.
+ */
+export function revealablePaths(vc?: unknown): string[] {
+  const subject = isRecord(vc) && isRecord(vc.credentialSubject) ? vc.credentialSubject : undefined
+  if (!subject) return []
+  return flattenLeafPaths(subject).filter((path) => path !== 'id')
+}
+
+/** True when any key, at any depth, contains a dot — so a dotted path could name either a literal key or a nesting. */
+function hasDottedKey(obj: unknown): boolean {
+  if (!isRecord(obj)) return false
+  return Object.entries(obj).some(([k, v]) => k.includes('.') || hasDottedKey(v))
+}
+
+/**
+ * The paths that are not a single attribute (a leaf) of the VC's `credentialSubject`: a typo, or a parent
+ * such as `agentIdentityCredential` that would disclose a whole subtree.
+ *
+ * Returns `null` — "cannot tell", which is a different answer from `[]` ("all fine") — when the credential
+ * cannot be judged: no plain-object `credentialSubject` (absent, an array, or the credential passed as a string
+ * or null), or an attribute name containing a dot, where a path could mean two things. A caller that read
+ * `null` as fine would let a parent path through.
+ *
+ * What counts as one attribute: a leaf of the plain-object tree. An array is one attribute, named whole (there
+ * is no path by index), and an attribute whose value is an empty object has no leaf under it, so it cannot be
+ * named.
+ */
+export function unresolvedRevealPaths(paths: string[], vc?: unknown): string[] | null {
+  const subject = isRecord(vc) && isRecord(vc.credentialSubject) ? vc.credentialSubject : undefined
+  if (!subject || hasDottedKey(subject)) return null
+  const leaves = new Set(flattenLeafPaths(subject))
+  return paths.filter((path) => !leaves.has(path))
 }
 
 export class MbiVpAdapter implements VcProofProvider {
@@ -159,7 +205,6 @@ export class MbiVpAdapter implements VcProofProvider {
     private readonly mbi: MbiVpCaller,
     private readonly signHexBlob: HexBlobSigner,
     private readonly signMessage: MessageSigner,
-    private readonly holderAddress: string,
     private readonly resolveIssuerKeys: IssuerKeyResolver,
     private readonly present: VcPresentInput,
   ) {}
@@ -176,17 +221,13 @@ export class MbiVpAdapter implements VcProofProvider {
     // which MBI treats as "reveal all" — the prior default.
     const revealAttributes = this.present.revealAttribute ?? dcqlToRevealAttributes(input.credentialQuery, this.present.vc)
 
-    // Auth for /vp/ext/*: sign the holder's own address once, reuse for both calls below.
-    const { signBlob: signedData, publicKey: authPublicKey } = await this.signMessage(this.holderAddress)
-    const auth = { signedData, publicKey: authPublicKey }
-
     // 1. Derive the unsigned VP blob (BBS+ selective disclosure server-side, from the issuer's key).
     const createBody: Record<string, unknown> = {
       vc: this.present.vc,
       revealAttributes,
     }
     if (this.present.rangeProof !== undefined) createBody.rangeProof = this.present.rangeProof
-    const created = await this.mbi.createVp(createBody as { vc: unknown; revealAttributes: string[]; rangeProof?: unknown }, auth)
+    const created = await this.mbi.createVp(createBody as { vc: unknown; revealAttributes: string[]; rangeProof?: unknown }, this.signMessage)
 
     const blobId = created.blobId
     const blob = created.blob
@@ -199,7 +240,7 @@ export class MbiVpAdapter implements VcProofProvider {
     const { signBlob, publicKey } = await this.signHexBlob(blob)
 
     // 3. Submit + get the finished VP back in the same call (no separate read-back).
-    const submitted = await this.mbi.submitVp({ blobId, signedBlob: signBlob, publicKey, includeVp: true }, auth)
+    const submitted = await this.mbi.submitVp({ blobId, signedBlob: signBlob, publicKey, includeVp: true }, this.signMessage)
     if (!submitted.vp) {
       throw new Error('MbiVpAdapter: /vp/ext/submit did not return vp (includeVp not honored?)')
     }

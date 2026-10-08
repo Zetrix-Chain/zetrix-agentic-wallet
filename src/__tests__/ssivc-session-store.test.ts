@@ -148,7 +148,7 @@ describe('createFsSsivcSessionStore', () => {
     expect(await store.get()).toBeNull()
   })
 
-  // BT-3009: get() used to map EVERY failure to null, so a genuine I/O error (EPERM, an antivirus
+  // get() used to map EVERY failure to null, so a genuine I/O error (EPERM, an antivirus
   // file-lock, ...) read as "no session exists" — checkExistingVerifiedVc would then pay for a
   // second session for a holder who may already have one. Only "file absent" and "file content
   // unusable" are safe to report as null; an unknown-state read failure must propagate.

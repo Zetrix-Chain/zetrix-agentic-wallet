@@ -21,7 +21,9 @@
  *   policy_preflight                    — free validation and plain-words reading of a draft policy
  *   check_policy_decision               — would this spend be permitted right now? (asks the PDP)
  *   write_policy                        — deploy a policy on chain, paying the fee over x402
- *   check_policy_write                  — resume a paid-for policy write from its receipt
+ *   update_policy                       — replace a deployed policy's attributes and validity, paying the update fee
+ *   remove_policy                       — remove a deployed policy (free; lifts its limits; needs confirm)
+ *   check_policy_write                  — resume a paid-for policy write or update from its receipt
  *   transfer_token                      — send native ZTX or any ZTP20 token to an address
  */
 
@@ -52,17 +54,27 @@ import {
   getTemplateViaRegistry,
   readOwnerPolicies,
 } from './clients/policy-read-client.js'
-import { policyPreflight, unavailableResult, type DraftPolicy } from './orchestrator/policy-preflight.js'
+import { policyPreflight, unavailableResult, type DraftPolicy, type PolicyPreflightDeps } from './orchestrator/policy-preflight.js'
+import { confirmTemplateId, deriveTemplateId, discoverTemplates } from './clients/policy-template-discovery.js'
 import { checkPolicyDecision } from './orchestrator/policy-decision.js'
 import type { DecisionRequest, PolicyDecisionClient } from './clients/policy-decision-client.js'
+import type { VocabularyRead } from './clients/policy-vocabulary-client.js'
+import { attachAttributeMeanings } from './orchestrator/policy-attribute-meanings.js'
 import {
   writePolicy,
+  updatePolicy,
+  removePolicy,
   checkPolicyWrite,
   type CheckPolicyWriteInput,
+  type RemovePolicyInput,
+  type UpdatePolicyInput,
   type WritePolicyDeps,
   type WritePolicyInput,
 } from './orchestrator/write-policy.js'
 import { transferToken, type TransferDeps, type TransferOpts } from './orchestrator/transfer.js'
+import { describeAttributes, type VerificationLinkInput, type VerificationLinkResult } from './orchestrator/verification-qr.js'
+import { defaultRevealFor, type VerifiableCredentialKind } from './default-reveal.js'
+import { revealablePaths } from './clients/mbi-vp-adapter.js'
 
 export interface ToolDeps {
   config: {
@@ -73,6 +85,10 @@ export interface ToolDeps {
     policyRegistryAddress?: string
     /** Policy Template address, for the id-only lookup the Registry does not proxy. */
     policyTemplateAddress?: string
+    /** The publisher whose templates are offered when the caller names none; see Config. */
+    policyTemplatePublisher?: string
+    /** The Verified AI Birthcert's templateId; undefined on a network where it is not confirmed. create_verification_qr prefers a credential of this template. */
+    aiBirthcertVerifiedTemplateId?: string
   }
   /** Builds a per-request X401Wallet bound to the client-supplied VC. */
   makeWallet: (present: VcPresentInput) => X401Wallet
@@ -88,6 +104,8 @@ export interface ToolDeps {
   queryTokenBalance?: (token: string) => Promise<TokenBalanceResult>
   /** The configured MAX_PAYMENT_AMOUNT map, so preflight can report cap headroom without attempting a payment. */
   paymentCaps?: Record<string, string>
+  /** True when the owner's spending policy governs an asset, so the default cap is not applied. */
+  policyGoverns?: (asset: string) => Promise<boolean>
   /**
    * The RAW read-only contract seam, as distinct from `queryContract` below, which is the
    * higher-level wrapper. The policy client needs the raw form because it interprets the
@@ -114,6 +132,17 @@ export interface ToolDeps {
    * believing they already are.
    */
   isValidAddress?: (address: string) => boolean
+  /**
+   * The registered tokens and the decimals reader `policy_preflight` uses to name a token address and
+   * state an amount in whole tokens. Built by `buildPreflightTokenDeps` — the same builder the
+   * pre-payment check inside `write_policy` uses. Optional: without it those hints are absent.
+   */
+  preflightTokenDeps?: Pick<PolicyPreflightDeps, 'knownTokens' | 'describeUnit' | 'readVocabulary'>
+  /**
+   * The service's attribute vocabulary, which `get_policy_template_schema` attaches to what a template
+   * declares. Optional: without it the schema is the chain's name and type only, as before.
+   */
+  readPolicyVocabulary?: () => Promise<VocabularyRead>
   /**
    * The Policy Decision Point client. Absent when no decision service is configured, which is the
    * normal state today — see `Config.policyDecisionUrl`. Its absence produces an `undetermined`
@@ -145,10 +174,21 @@ export interface ToolDeps {
    */
   cache?: VcCacheStore
   /**
+   * Whether this wallet already holds a valid copy of a credential, answered locally (see held-credential.ts). Lets
+   * credential_preflight say "you already have one" before anything is collected. Optional: without it nothing is checked.
+   */
+  findHeldCredential?: (credential: string) => Promise<import('./orchestrator/preflight.js').HeldCredential | undefined>
+  /**
    * Drives myid's SSIVC AI Birthcert session API. Optional in this type only so tests can omit
    * it — index.ts always wires it in practice; there is no config gate. Session creation is
    * x402-payment-gated (self-pay, capped by MAX_PAYMENT_AMOUNT), not bearer-token-gated.
    */
+  /**
+   * Backs create_verification_qr: presents a VC to MBI and builds MyID's link and QR for the reference id.
+   * Optional in this type only so tests can omit it — index.ts always wires it; whether a link template is
+   * configured is decided inside it, which is why an unconfigured wallet answers `created: false` with the reason.
+   */
+  createVerificationLink?: (input: VerificationLinkInput) => Promise<VerificationLinkResult>
   verifyAiBirthcert?: {
     request: (input: RequestAiBirthcertVerificationInput) => Promise<RequestVerificationResult>
     check: () => Promise<CheckVerificationResult>
@@ -244,6 +284,104 @@ export function createTools(deps: ToolDeps) {
         issuerKeys: input.issuerKeys,
       })
       return proveIdentity(wallet, input.proofRequest, deps.config.holderDid)
+    },
+
+    /**
+     * A link and QR that open this wallet's credential in MyID. The credential is chosen the way prove_identity
+     * chooses it, but a choice that cannot be made is an ordinary answer (`created: false` plus the reason) rather
+     * than a thrown error, so the agent reads one result shape whether or not a link came back.
+     */
+    async create_verification_qr(input: { vc?: unknown; revealAttribute?: string[]; revealAll?: boolean; expiryMinutes?: number } = {}): Promise<VerificationLinkResult> {
+      if (!deps.createVerificationLink) {
+        return { created: false, reason: 'create_verification_qr is not configured on this wallet.' }
+      }
+      let vc = input.vc
+      let credentialUsed = 'the credential you supplied'
+      let kind: VerifiableCredentialKind | undefined
+      // Nothing named and no revealAll: the wallet's standard minimal set applies (see default-reveal.ts).
+      const wantsDefault = (input.revealAttribute === undefined || input.revealAttribute.length === 0) && input.revealAll !== true
+      const verifiedId = deps.config.aiBirthcertVerifiedTemplateId
+      const basicId = resolveTemplateAlias('ai birthcert', deps.config.network)
+      if (vc === undefined) {
+        // Only the two credentials this wallet supports for human verification, in this order of preference. Any
+        // other credential held (an older kind, say) is never picked for the caller; naming it means passing it.
+        const held = await loadValidCachedCredentials(deps.cache)
+        const verified = verifiedId ? held.find((entry) => entry.templateId === verifiedId) : undefined
+        const basic = basicId ? held.find((entry) => entry.templateId === basicId) : undefined
+        const chosen = verified ?? basic
+        if (!chosen) {
+          return {
+            created: false,
+            reason:
+              'the wallet holds neither a Verified AI Birthcert nor a Basic AI Birthcert, so there is nothing to present. ' +
+              'Create one first: request_ai_birthcert_verification (then check_ai_birthcert_verification) gets the Verified AI ' +
+              'Birthcert, which is preferred, or subscribe_and_issue gets the Basic AI Birthcert. Then call create_verification_qr again.',
+          }
+        }
+        vc = chosen.vc
+        credentialUsed = verified ? 'Verified AI Birthcert' : 'Basic AI Birthcert'
+        kind = verified ? 'verified' : 'basic'
+      } else if (wantsDefault && typeof vc === 'object' && vc !== null && !Array.isArray(vc)) {
+        // A credential passed in gets the standard set only when it is one the wallet holds and recognises; for any
+        // other the wallet has no standard set, so the caller has to say what to reveal.
+        const id = (vc as { id?: unknown }).id
+        const match = typeof id === 'string' ? (await loadValidCachedCredentials(deps.cache)).find((e) => (e.vc as { id?: unknown } | null)?.id === id) : undefined
+        if (match && verifiedId && match.templateId === verifiedId) kind = 'verified'
+        else if (match && basicId && match.templateId === basicId) kind = 'basic'
+      }
+      // The holder check and the reveal check below both read the credential's fields, and a value that is not an
+      // object (a JSON string is a common slip for a model) would skip them. Refuse it rather than let it through.
+      if (typeof vc !== 'object' || vc === null || Array.isArray(vc)) {
+        return { created: false, reason: 'vc must be the credential object itself, not a string, an array or null.' }
+      }
+      // MBI refuses a credential whose subject is not the signed-in holder, but the wallet need not spend a round
+      // trip (and three signatures) to learn that a credential issued to someone else is not its own to present.
+      const subject = (vc as { credentialSubject?: { id?: unknown } } | null)?.credentialSubject?.id
+      if (typeof subject === 'string' && subject !== deps.config.holderDid) {
+        return {
+          created: false,
+          reason: `the credential's subject is ${subject}, not this wallet (${deps.config.holderDid}) — a credential issued to someone else cannot be presented from here.`,
+        }
+      }
+      let revealAttribute = input.revealAttribute
+      let revealedByDefault = false
+      if (wantsDefault && kind) {
+        // Only the standard attributes the credential actually has; with its attributes out of view (nothing to
+        // check against) the set goes on unfiltered and the orchestrator decides.
+        const standard = defaultRevealFor(kind)
+        const available = revealablePaths(vc)
+        const chosenPaths = available.length === 0 ? standard : standard.filter((path) => available.includes(path))
+        if (chosenPaths.length === 0) {
+          return {
+            created: false,
+            reason:
+              `none of the standard set (${standard.join(', ')}) is in this credential, so there is nothing to reveal by default. ` +
+              'Name the attributes to reveal. ' +
+              describeAttributes(vc),
+          }
+        }
+        revealAttribute = chosenPaths
+        revealedByDefault = true
+      }
+      const result = await deps.createVerificationLink({
+        vc,
+        revealAttribute,
+        revealAll: input.revealAll,
+        expiryMinutes: input.expiryMinutes,
+      })
+      if (!result.created) return result
+      // Say which credential was presented and what was revealed: the agent did not choose either, and the user
+      // should be told. A Basic credential must not be passed off as an owner-verified one.
+      const basicNote =
+        kind === 'basic'
+          ? " This is a Basic AI Birthcert: it shows the agent's registered username only and does not mean the owner was verified, so do not describe the agent as owner-verified."
+          : ''
+      return {
+        ...result,
+        credentialUsed,
+        ...(revealedByDefault ? { revealedByDefault: true } : {}),
+        ...(basicNote ? { message: result.message + basicNote } : {}),
+      }
     },
 
     pay_and_fetch(input: PayRequest) {
@@ -375,6 +513,8 @@ export function createTools(deps: ToolDeps) {
           },
           queryTokenBalance: deps.queryTokenBalance,
           caps: deps.paymentCaps,
+          policyGoverns: deps.policyGoverns,
+          ...(deps.findHeldCredential ? { findHeld: deps.findHeldCredential } : {}),
         },
         input,
       )
@@ -389,44 +529,80 @@ export function createTools(deps: ToolDeps) {
     async get_policy_template_schema(input: { templateId?: string; publisher?: string; policyKey?: string } = {}) {
       const registry = deps.config.policyRegistryAddress
       const templateContract = deps.config.policyTemplateAddress
-      const hasPair = Boolean(input.publisher && input.policyKey)
+      const defaultPublisher = deps.config.policyTemplatePublisher
 
       if (!registry && !templateContract) {
         return { error: `Policy contracts are not deployed on ${deps.config.network}.` }
       }
-      if (!hasPair && !input.templateId) {
-        return { error: 'Provide either { publisher, policyKey } or { templateId }.' }
-      }
 
-      // An explicit templateId wins. The pair route only reaches the same contract through the
-      // Registry, so honouring a caller's exact id is never worse and is what they asked for.
-      const read = input.templateId
-        ? templateContract
-          ? await getTemplateById(input.templateId, templateContract, deps.chainQuery)
-          : null
-        : registry
-          ? await getTemplateViaRegistry(input.publisher!, input.policyKey!, registry, deps.chainQuery)
-          : null
-
-      if (!read) {
-        // Distinguish "you gave me too little" from "this network has no contract to ask" —
-        // telling a caller to supply what they already supplied is a dead end.
+      // An explicit templateId wins, exactly as before. Nothing below changes that route.
+      if (input.templateId) {
+        if (!templateContract) {
+          return {
+            error: `A templateId lookup needs the policy template contract, which is not configured on ${deps.config.network}.`,
+          }
+        }
+        const read = await getTemplateById(input.templateId, templateContract, deps.chainQuery)
+        // A failed read stays a failure. Reporting it as found:false would tell the user their
+        // template does not exist, which is a different and wrong instruction.
+        if ('error' in read) return { error: read.detail }
+        if (read.found === false) return { found: false }
         return {
-          error: input.templateId
-            ? `A templateId lookup needs the policy template contract, which is not configured on ${deps.config.network}.`
-            : `A publisher + policyKey lookup needs the policy registry, which is not configured on ${deps.config.network}.`,
+          found: true,
+          declared: [...declaredVocabulary(read.value).entries()].map(([name, type]) => ({ name, type })),
+          ...(read.value.templateAttributeIds ? { templateAttributeIds: read.value.templateAttributeIds } : {}),
         }
       }
-      // A failed read stays a failure. Reporting it as found:false would tell the user their
-      // template does not exist, which is a different and wrong instruction.
+
+      // Everything else needs a publisher, and the wallet supplies one when the caller did not.
+      // Without a default the caller used to be asked for an address it had no way to know, which
+      // is what made "show me the policy template" a dead end for anyone with no deployed policy.
+      const publisher = input.publisher || defaultPublisher
+      if (!publisher) {
+        return {
+          error:
+            `No template publisher is configured for ${deps.config.network}, so there is nothing to ` +
+            `look up by default. Pass { publisher } to list a publisher's templates, { publisher, ` +
+            `policyKey } to read one, or { templateId }.`,
+        }
+      }
+      const publisherSource = input.publisher ? ('supplied' as const) : ('default' as const)
+
+      // A key with no publisher of its own reads against the default one; a publisher with no key
+      // lists everything that publisher has. No arguments at all lists the default publisher's.
+      if (!input.policyKey) {
+        if (!templateContract) {
+          return {
+            error: `Listing templates needs the policy template contract, which is not configured on ${deps.config.network}.`,
+          }
+        }
+        const listing = await discoverTemplates(publisher, templateContract, deps.chainQuery)
+        if ('error' in listing) return { error: listing.error }
+        if (listing.found === false) return { found: false, publisher, publisherSource }
+        return { ...listing, publisherSource }
+      }
+
+      // The Registry route carries `templateAttributeIds`; without a Registry the same template is read
+      // through the Template contract by its derived id, so { policyKey } alone still works when only
+      // the Template contract is configured. The id is confirmed below either way.
+      const read = registry
+        ? await getTemplateViaRegistry(publisher, input.policyKey, registry, deps.chainQuery)
+        : await getTemplateById(deriveTemplateId(publisher, input.policyKey), templateContract as string, deps.chainQuery)
       if ('error' in read) return { error: read.detail }
-      if (read.found === false) return { found: false }
+      if (read.found === false) return { found: false, publisher, publisherSource }
+
+      // The id the write path needs, and the one no read returns — derived, then CONFIRMED.
+      const id = await confirmTemplateId(publisher, input.policyKey, templateContract, deps.chainQuery)
       return {
         found: true,
+        publisher,
+        publisherSource,
+        ...(id.confirmed ? { templateId: id.templateId } : {}),
+        templateIdConfirmed: id.confirmed,
+        ...(id.confirmed ? {} : { templateIdNote: id.reason }),
         declared: [...declaredVocabulary(read.value).entries()].map(([name, type]) => ({ name, type })),
         // Present only on the Registry route; the id-only read does not return them. Carried
-        // through rather than dropped, since it is the stated reason to prefer that route and the
-        // write path needs it.
+        // through rather than dropped, since it is the stated reason to prefer that route.
         ...(read.value.templateAttributeIds ? { templateAttributeIds: read.value.templateAttributeIds } : {}),
       }
     },
@@ -437,7 +613,26 @@ export function createTools(deps: ToolDeps) {
       if (!registry) return { error: `The policy registry is not deployed on ${deps.config.network}.` }
       const owner = input.owner ?? deps.config.zetrixAddress
       if (!owner) return { error: 'No owner address — pass one, or configure ZETRIX_ADDRESS.' }
-      return readOwnerPolicies(owner, registry, deps.chainQuery)
+      const owned = await readOwnerPolicies(owner, registry, deps.chainQuery)
+      // The chain hands updatedAtBlock back as a NUMBER; update_policy sends it on as a STRING. Say so, per policy, rather
+      // than leaving the agent to convert (and to guess) it.
+      return {
+        ...owned,
+        policies: owned.policies.map((p) => {
+          const block = 'found' in p.result && p.result.found === true ? p.result.value.policy.updatedAtBlock : undefined
+          const asString = typeof block === 'number' && Number.isFinite(block) ? String(block) : typeof block === 'string' ? block : undefined
+          if (asString === undefined || !/^\d+$/.test(asString)) return p
+          return {
+            ...p,
+            forUpdate: {
+              expectedUpdatedAtBlock: asString,
+              note:
+                'To change this policy with update_policy, pass this exact value (a string) as expectedUpdatedAtBlock. ' +
+                'If the policy changes before you update it, the update is refused for free.',
+            },
+          }
+        }),
+      }
     },
 
     /** Validate a draft policy before anything signs or pays for it. Free, signs nothing. */
@@ -465,6 +660,7 @@ export function createTools(deps: ToolDeps) {
           // ToolDeps field doc. Read straight off deps; built by buildAddressValidator, which is
           // where it is tested.
           isValidAddress: deps.isValidAddress,
+          ...deps.preflightTokenDeps,
           readTemplate: async (draft) =>
             // An explicit templateId wins. `draft.policyKey` is the key this policy would be
             // STORED under, which is not necessarily the template's key — preferring the pair
@@ -475,7 +671,9 @@ export function createTools(deps: ToolDeps) {
                 ? getTemplateViaRegistry(draft.publisher, draft.policyKey, registry, deps.chainQuery)
                 : {
                     error: 'query_failed' as const,
-                    detail: 'no template identifier supplied — pass templateId, or publisher with policyKey',
+                    detail:
+                      'no template identifier supplied — pass templateId (call get_policy_template_schema ' +
+                      'with no arguments to list the templates and their ids)',
                   },
         },
         input,
@@ -511,6 +709,34 @@ export function createTools(deps: ToolDeps) {
         }
       }
       return writePolicy(deps.policyWriteDeps, input)
+    },
+
+    /**
+     * Replace a deployed policy's attributes and validity window, paying the update fee over x402. PAYS REAL MONEY, and
+     * only after a person has agreed (`confirm`). Every refusal that can be known first is free.
+     */
+    async update_policy(input: UpdatePolicyInput) {
+      if (!deps.policyWriteDeps) {
+        return {
+          state: 'unavailable' as const,
+          message: `Policy updates are not available on ${deps.config.network}. Nothing was paid.`,
+        }
+      }
+      return updatePolicy(deps.policyWriteDeps, input)
+    },
+
+    /**
+     * Remove a deployed policy. FREE, but it removes every limit the policy set, so nothing is sent without `confirm: true`
+     * and it is reported as removed only once the chain no longer holds it.
+     */
+    async remove_policy(input: RemovePolicyInput) {
+      if (!deps.policyWriteDeps) {
+        return {
+          state: 'unavailable' as const,
+          message: `Policy removal is not available on ${deps.config.network}. Nothing was removed.`,
+        }
+      }
+      return removePolicy(deps.policyWriteDeps, input)
     },
 
     /** Resume phase 3 from a stored receipt. FREE — this tool never pays, on any path. */
@@ -552,6 +778,12 @@ export function createTools(deps: ToolDeps) {
       return deps.verifyAiBirthcert.clearStuckReceipt(input)
     },
   }
+
+  // The service's description of each declared attribute rides beside what the chain returned. Wrapped
+  // here rather than threaded through the four return sites above, so none of them can forget it.
+  const readSchema = tools.get_policy_template_schema
+  tools.get_policy_template_schema = (async (input: Parameters<typeof readSchema>[0] = {}) =>
+    attachAttributeMeanings(await readSchema(input), deps.readPolicyVocabulary)) as typeof readSchema
 
   return tools
 }

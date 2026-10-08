@@ -28,8 +28,21 @@ function extractVcPassImagePaths(result: unknown): string[] {
   return paths.filter((p): p is string => typeof p === 'string')
 }
 
+/**
+ * A QR code (create_verification_qr) arrives as base64 PNG on the result. It goes out as an image block and is
+ * dropped from the JSON text, where a few kilobytes of base64 would only crowd the model's context.
+ */
+function splitQrCode(result: unknown): { text: unknown; qrCodePngBase64?: string } {
+  if (typeof result !== 'object' || result === null) return { text: result }
+  const { qrCodePngBase64, ...rest } = result as Record<string, unknown>
+  if (typeof qrCodePngBase64 !== 'string' || qrCodePngBase64 === '') return { text: result }
+  return { text: rest, qrCodePngBase64 }
+}
+
 export async function buildToolContent(result: unknown, readFile: (path: string) => Promise<Buffer>): Promise<ToolContentBlock[]> {
-  const blocks: ToolContentBlock[] = [{ type: 'text', text: JSON.stringify(result) }]
+  const { text, qrCodePngBase64 } = splitQrCode(result)
+  const blocks: ToolContentBlock[] = [{ type: 'text', text: JSON.stringify(text) }]
+  if (qrCodePngBase64 !== undefined) blocks.push({ type: 'image', data: qrCodePngBase64, mimeType: 'image/png' })
 
   for (const path of extractVcPassImagePaths(result)) {
     // Best-effort: an unreadable pass image must never hide the rest of the (already-issued,

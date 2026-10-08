@@ -44,7 +44,7 @@ import {
   type MbiClient,
   type MbiApplyBody,
   type MbiVcEntry,
-  type MbiVpAuth,
+  type MbiRequestSigner,
   type PayRequirement,
 } from '../clients/mbi-client.js'
 import { isSponsored } from '../accept-selection.js'
@@ -52,6 +52,7 @@ import { zetrixHexStringToBytes } from '../zetrix-hex.js'
 import { type VcCacheStore, isVcValid, extractValidUntil, extractAttributeKeys } from '../clients/vc-cache.js'
 import type { TemplateFields } from '../clients/template-info-client.js'
 import { PaymentReadinessError, type PaymentShortfall } from '../payment-readiness.js'
+import { describePolicyRefusal, policyRefusalFlags, toPaymentPolicyError } from '../policy-refusal.js'
 import type { DownloadQuarantineStore } from '../clients/ssivc-download-quarantine-store.js'
 import { extractVcPassBase64, writeVcPassImages } from '../clients/vc-pass-image.js'
 
@@ -114,13 +115,13 @@ export interface SubscribeDeps {
   passDesignId?: string
   /**
    * VC pass image (extraData.vcPassBase64), fetched from `/v1/vc/ext/download` after a successful
-   * basic issuance and written to disk as PNG(s). All four of `auth`/`address`/`quarantine`/
+   * basic issuance and written to disk as PNG(s). All four of `signRequest`/`address`/`quarantine`/
    * `passImagesDir` and `mbi.downloadVcs` must be wired for this to run; when any is missing the
    * step is skipped silently — the VC issuance itself never depends on it. See mbi-client.ts's
    * `downloadVcs` docstring: this download is one-shot per vcId, so `quarantine` guards against a
    * retry burning it (mirrors verify-ai-birthcert.ts's use of the same store).
    */
-  auth?: () => Promise<MbiVpAuth>
+  signRequest?: MbiRequestSigner
   address?: string
   quarantine?: DownloadQuarantineStore
   passImagesDir?: string
@@ -229,6 +230,16 @@ export interface SubscribeResult {
   /** Set instead of issuing when the wallet lacks funds for gas or the resource payment. See payment-readiness.ts. */
   insufficientFunds?: PaymentShortfall
   /**
+   * Wallet BE refused to sign the fee payment because the owner's spending policy DENIED it. A decision, not a
+   * failure: retrying will not help. Nothing was signed or paid and no credential was issued. See policy-refusal.ts.
+   */
+  policyDenied?: true
+  /**
+   * Wallet BE could not complete the policy check, so it refused to sign; nothing was paid and no credential was
+   * issued. Transient: trying again shortly is right.
+   */
+  policyCheckUnavailable?: true
+  /**
    * The template's full declared schema (from chain) — attached whenever `resolveTemplateFields`
    * resolves it, on every outcome (success, dry-run quote, or missing-attribute error), so the
    * caller always sees the complete required+optional field list rather than only what went wrong.
@@ -313,11 +324,11 @@ async function pollSettlementOutcome(
  */
 async function resolveVcPassImagePaths(deps: SubscribeDeps, vcId: string): Promise<string[] | undefined> {
   const downloadVcs = deps.mbi.downloadVcs
-  const auth = deps.auth
+  const signRequest = deps.signRequest
   const address = deps.address
   const quarantine = deps.quarantine
   const passImagesDir = deps.passImagesDir
-  if (!downloadVcs || !auth || !address || !quarantine || !passImagesDir) return undefined
+  if (!downloadVcs || !signRequest || !address || !quarantine || !passImagesDir) return undefined
 
   // Everything below this point runs after the one-shot download may already have been consumed,
   // so a failure here (a full quarantine store, an unwritable pass-images dir) must degrade to
@@ -334,7 +345,7 @@ async function resolveVcPassImagePaths(deps: SubscribeDeps, vcId: string): Promi
 
       let downloaded: MbiVcEntry[]
       try {
-        downloaded = await downloadVcs({ address }, await auth())
+        downloaded = await downloadVcs({ address }, signRequest)
       } catch {
         return undefined
       }
@@ -628,6 +639,21 @@ export async function subscribeAndIssue(deps: SubscribeDeps, opts: SubscribeOpts
   } catch (err) {
     if (err instanceof PaymentReadinessError) {
       return { issued: false, reason: `insufficient funds: ${err.message}`, insufficientFunds: err.shortfall }
+    }
+    // The signature is the last step before the X-PAYMENT header exists, so a refusal there means no money moved and
+    // nothing was issued; what DID happen is the holder signature and the issuer's payment request, neither of which
+    // moves money. Everything else still throws, as before.
+    const refusal = toPaymentPolicyError(err)
+    if (refusal) {
+      return {
+        issued: false,
+        ...policyRefusalFlags(refusal),
+        reason: describePolicyRefusal(
+          refusal,
+          'No credential was issued. The issuer was asked for a payment request, which moves no money.',
+        ),
+        ...(schema ? { schema } : {}),
+      }
     }
     throw err
   }

@@ -28,11 +28,13 @@
  * An earlier revision of this comment said a transfer was "bounded by nothing but these guards".
  * That was true when it was written and is no longer the design.
  *
- * NOT WIRED YET, and the reason this file still leans on the per-call cap: Wallet BE does not
- * enforce policy today, and has no agreed way to REPORT a policy refusal. Until it does, a denial
- * would arrive through `sign` as an ordinary failure and be reported as "signing failed" —
- * indistinguishable from the HSM being down. Telling those apart needs a stable status/code from
- * Wallet BE, matched on a field rather than on message text. See `isPolicyRefusal` below.
+ * WALLET BE NOW ENFORCES, WHEN IT IS SWITCHED ON (`policy.pep.enabled`). It ships ON for dev and OFF
+ * for test, UAT and prod, so whether a given deployment enforces is a deployment setting this file cannot
+ * see — which is why the per-call cap above still matters. When it does enforce, a refusal arrives through
+ * `sign` as HTTP 200 with a numeric `errorCode`: 1000033 for a DENY (a decision), 1000034 when the policy
+ * check could not complete (transient, fails closed). They are matched on that field, never on message
+ * text, and kept apart from each other and from an ordinary signing failure. See `isPolicyRefusal` and
+ * `isPolicyCheckUnavailable` below.
  *
  * ALSO NOT COVERED, deliberately: aggregate/session spend limits and an audit log. The per-call cap
  * means N calls spend N × cap — which is precisely the gap the policy engine exists to close, and
@@ -41,6 +43,10 @@
 
 import { toBaseUnits, toHumanAmount } from '../amount-units.js'
 import type { TokenBalanceResult } from '../clients/token-balance-client.js'
+import { boundedReason, isPolicyCheckUnavailable, isPolicyRefusal } from '../policy-refusal.js'
+
+// Kept exported from here: the matching moved to ../policy-refusal.ts when the x402 paths needed it.
+export { isPolicyCheckUnavailable, isPolicyRefusal }
 
 /** Native coin sentinel — BlobBuilder maps this to a PAY_COIN operation. */
 export const NATIVE_ASSET = 'ZTX'
@@ -93,7 +99,7 @@ export interface TransferDeps {
   sign: (blob: string) => Promise<{ signBlob: string; publicKey: string }>
   submit: (p: { blob: string; signBlob: string; publicKey: string }) => Promise<{ hash: string }>
   /** Per-call ceiling (MAX_PAYMENT_AMOUNT). Throws when exceeded. */
-  assertWithinCap: (asset: string, amount: string) => void
+  assertWithinCap: (asset: string, amount: string) => void | Promise<void>
 }
 
 export interface TransferOpts {
@@ -141,6 +147,13 @@ export interface TransferResult {
    * transient and worth retrying. See isPolicyRefusal.
    */
   policyDenied?: boolean
+
+  /**
+   * Wallet BE could not complete the policy check, so it refused to sign and NOTHING was signed or submitted.
+   * NOT a decision about this transfer — transient, and trying again shortly is right. See
+   * isPolicyCheckUnavailable.
+   */
+  policyCheckUnavailable?: boolean
 }
 
 /** Resolve `token` to the wire asset, or report that we need to be told the contract address. */
@@ -175,31 +188,6 @@ function resolveAsset(
       `Ask the user for the ZTP20 contract address and pass it as \`token\`, or use a registered ` +
       `symbol. Registered symbols need no address.`,
   }
-}
-
-/**
- * Is this signing failure a POLICY DENIAL rather than the signer being unavailable?
- *
- * Wallet BE is the policy enforcement point (see the file header), so a denial arrives here as a
- * failed `sign`. Those two causes need different advice — a denial is a decision and retrying is
- * pointless, an outage is transient and retrying is exactly right — so they must not collapse into
- * one message.
- *
- * DELIBERATELY CONSERVATIVE, and currently expected to return false in production. Wallet BE has
- * not yet agreed how it reports a refusal, so there is no stable code to match on. Matching the
- * prose below is a placeholder and NOT a contract: a rewording on their side would silently turn
- * every denial back into "signing failed". Replace this with their real status/code the moment it
- * exists, and match on the field, never on the sentence — a mistake made before, and unpicked.
- *
- * Failing to recognise a denial is the safe direction: the transfer is still refused and nothing is
- * signed. Only the explanation is worse.
- */
-export function isPolicyRefusal(e: unknown): boolean {
-  const status = (e as { status?: unknown } | null)?.status
-  if (status === 403) return true
-  const code = (e as { policyCode?: unknown } | null)?.policyCode
-  if (typeof code === 'string' && code !== '') return true
-  return false
 }
 
 /**
@@ -297,7 +285,7 @@ export async function transferToken(deps: TransferDeps, opts: TransferOpts): Pro
   const base = { token, asset, amount, amountHuman, decimals }
 
   try {
-    deps.assertWithinCap(asset, amount)
+    await deps.assertWithinCap(asset, amount)
   } catch (e) {
     return { sent: false, ...base, reason: (e as Error).message }
   }
@@ -346,7 +334,8 @@ export async function transferToken(deps: TransferDeps, opts: TransferOpts): Pro
   const { blob } = deps.buildBlob({ asset, payTo: to, amount, clientAddress: deps.sourceAddress, nonce, gasPrice: fee.gasPrice, feeLimit: fee.feeLimit })
 
   // Signing happens locally-ish (Wallet BE HSM) and moves nothing, so a failure here is clean.
-  // It is ALSO where a policy denial will arrive once Wallet BE enforces one — see isPolicyRefusal.
+  // It is ALSO where a policy refusal arrives when Wallet BE enforces: errorCode 1000033 for a DENY and
+  // 1000034 for a check that could not complete — see isPolicyRefusal and isPolicyCheckUnavailable.
   let signed
   try {
     signed = await deps.sign(blob)
@@ -357,11 +346,20 @@ export async function transferToken(deps: TransferDeps, opts: TransferOpts): Pro
       return {
         sent: false, ...base, fee, nonce, policyDenied: true,
         reason:
-          `refused by your spending policy, nothing was submitted: ${(e as Error).message}. ` +
+          `refused by your spending policy, nothing was submitted: ${boundedReason(e)}. ` +
           `This is a decision, not a failure — retrying will not help. Review the policy with get_my_policy.`,
       }
     }
-    return { sent: false, ...base, fee, nonce, reason: `signing failed, nothing was submitted: ${(e as Error).message}` }
+    if (isPolicyCheckUnavailable(e)) {
+      return {
+        sent: false, ...base, fee, nonce, policyCheckUnavailable: true,
+        reason:
+          `the policy check could not be completed, so nothing was signed or submitted: ${boundedReason(e)}. ` +
+          `This is not a decision about your transfer — it is transient, and trying again shortly is right. ` +
+          `If it keeps happening, the policy service is unavailable.`,
+      }
+    }
+    return { sent: false, ...base, fee, nonce, reason: `signing failed, nothing was submitted: ${boundedReason(e)}` }
   }
 
   // Past this point the transaction may be on chain even if we never hear back.

@@ -39,17 +39,20 @@ Your host may present them slightly differently — match on the part after the 
 | `get_template_schema` | no | What attributes a credential template requires |
 | `query_contract` | no | Read-only contract or account state |
 | `prove_identity` | no | Answering an identity proof request with a held credential |
+| `create_verification_qr` | no | Giving a person a link and QR code that open the agent's credential in the MyID app, to verify the agent. It presents the Verified AI Birthcert if held, otherwise the Basic AI Birthcert, otherwise tells you to get one first. It reveals a standard minimal set by default (Verified: agentName, evidenceProvider, ownerVerified; Basic: agentUsername) — other attributes only if the user asks (`revealAttribute`), everything only if the user explicitly asks (`revealAll`); a Basic credential does not mean the owner was verified; on mainnet it answers `created: false` until the `myidVerifyLinkTemplate` setting is set (testnet has a built-in UAT link) |
 | `pay_and_fetch` | **yes** | Fetching a resource that returned HTTP 402 |
 | `subscribe_and_issue` | **yes** | Buying and receiving a verifiable credential |
 | `create_holder_account` | no | Creating an additional holder account (rarely needed) |
 | `request_ai_birthcert_verification` | **yes** | Starting a Verified AI Birthcert session (MyDigitalID owner verification) |
 | `check_ai_birthcert_verification` | no | Status, **the verification link**, and advancing a payment that is still clearing, for the most recent Verified AI Birthcert session |
 | `clear_stuck_payment_receipt` | no | **Last resort, destructive** — discard a payment receipt that is genuinely stuck, forfeiting that payment |
-| `get_policy_template_schema` | no | Which spending rules a policy template allows you to write |
+| `get_policy_template_schema` | no | Which spending rules a policy template allows — call it with no arguments to list the templates and get the templateId you need to write one |
 | `get_my_policy` | no | The spending policies this wallet owner has deployed on chain |
 | `policy_preflight` | no | Checking a draft spending policy — is it valid, and does it MEAN what the user thinks |
 | `check_policy_decision` | no | Asking whether a spend is permitted RIGHT NOW — but a permitted answer RESERVES capacity for ~15 min, so never poll it |
 | `write_policy` | **YES** | Deploying a spending policy on chain. Run `policy_preflight` first and show the user what it MEANS |
+| `update_policy` | **YES** | Changing a deployed spending policy (the full replacement set). Read it with `get_my_policy` first; preflight and show what it MEANS |
+| `remove_policy` | no | Removing a deployed spending policy. Free, but it lifts every limit it set, so it needs the user's clear yes |
 | `check_policy_write` | no | Finishing a policy write already paid for — the right answer to "did it get created?" |
 | `transfer_token` | **yes** | Sending ZTX or a ZTP20 token to an address — **moves real funds, irreversible** |
 
@@ -61,7 +64,9 @@ plainly — mainnet spends real funds, testnet does not.
 
 ## Before collecting anything for a credential
 
-When a user asks for a credential, your **first** action is `credential_preflight`. It is free,
+When a user asks for a credential, your **first** action is `credential_preflight`. If it returns `alreadyHeld`, the wallet already holds a
+valid copy: tell the user, name it, and **stop** — do not ask for an agent name or any other detail and do not begin an issuance. Buying another
+would replace it and cost the fee. Only if the user explicitly says they want a replacement, run it again with `replacing: true`. It is free,
 spends nothing and starts nothing. Do this **before you collect** a single application detail — not
 after, and not just before paying. Asking someone for a name and optional metadata and only then
 telling them it costs money, or that their wallet cannot pay, wastes their time and reads as a
@@ -233,6 +238,11 @@ contract address. Never guess one.
 **If a result comes back with `outcomeUnknown: true`, do NOT retry.** The transaction may already be
 on chain. Report the nonce and tell the user to check it before anything else is attempted.
 
+**`policyDenied: true` is a decision, not a failure — do NOT retry.** The user's spending policy refused
+the transfer and nothing was signed. Show them the reason (it names which limit) and point them to
+`get_my_policy`. **`policyCheckUnavailable: true` is different:** the policy check itself could not be
+completed, nothing was signed or sent, and trying again shortly is safe. Never describe one as the other.
+
 ## Spending policies
 
 A policy is the user's own spending rulebook for this wallet, stored on chain. Reading one is
@@ -248,12 +258,54 @@ be refused by their own agent. Read `remaining` from ONE answer and work it out 
 retry automatically after a timeout either: the call may have succeeded and reserved already.
 Read `ignored` back even on a permitted answer —
 it lists constraints the policy carries that the service could not enforce.
+**To write a policy, start by listing the templates — do not ask the user for an address.** Call
+get_policy_template_schema with no arguments: it returns the templates on offer, each with its
+declared attributes and a templateId the chain has confirmed. Use that id in write_policy and leave
+templateContractAddress out. A user has no way to know a publisher, a policy key or a template
+contract address, and a wallet with no deployed policy has no other source for a templateId. Only if
+the result says no default publisher is configured should you ask for one. To tell the user
+what a write will cost BEFORE paying, call write_policy with dryRun: it runs the free checks and
+returns the quote, paying nothing and writing no policy. The result also says whether the wallet can afford
+it (`affordability`): tell the user about any shortfall — fee asset, gas or the payment cap — and
+treat "unknown" as not yet confirmed, never as a yes. A quote is not a promise the payment will be
+allowed — balances move and the cap is enforced again when paying. assetScope is exactly "native" or
+"ztp20", never a token symbol; a token policy also needs its tokenAddress — the contract address,
+which wallet_status({ token }) returns as tokenAddress, so do not ask the user for the address of a
+token the wallet knows. Amounts are RAW BASE units: policy_preflight's interpretation says what each
+means in whole tokens (1 of a 6-decimal token is 0.000001 of it), so show it. A non-zero amount
+under one whole token is refused until you say what is meant: when the user states an amount in
+tokens ("1 JMYR"), pass amountUnit "whole" and give the amount as they said it ("1") — the wallet
+converts it and shows the raw value before anything is paid. Use "base" only when the user really
+means that tiny a raw value. To give an amount in tokens instead, use valueHuman on that attribute ("100" for 100 JMYR): the
+wallet converts it with the token's own decimals and shows both forms. It is only for perTransactionMax, cumulativeMax and
+velocityCap (and any attribute the service lists as an amount) — never put convertedAmounts in it, and write a fractional amount as text such as "0.5" — maxTransactionCount is a count and a window is a duration, and neither is ever scaled. Send write_policy the SAME attributes and the SAME amountUnit you
+preflighted with — never the convertedAmounts, which are for showing the user and would be converted
+a second time (the wallet refuses a "whole" draft in which every amount already looks raw, and its message
+gives the raw value to send with "base" if you really mean a cap that large). The guard
+cannot catch a raw value that is already one whole token or more, and it does nothing when the
+token's decimals cannot be read, so always show interpretation and notChecked. A window is a duration
+such as 7d, 12h or 30m — never "week" and never a bare number.
+
 **A policy write that is `settling` or `submitted` has ALREADY BEEN PAID FOR.** No policy exists
 yet, and that is the normal window rather than a failure. Never call `write_policy` again for it —
 pass its `paymentReceipt` to `check_policy_write`, which never pays. `submitted` carries a
 `txHash` and still is not a written policy: the block has not confirmed it, so do not tell the user
 their policy exists. Only `written` means that. The one state where paying again is right is
 "receipt_void", and it sets `payFresh` to say so.
+
+**To change a policy, read it first, then use `update_policy`.** `get_my_policy` gives each policy's current attributes and
+`forUpdate.expectedUpdatedAtBlock`. Pass that value as `expectedUpdatedAtBlock`: if the policy has changed since you read it, the
+update is refused for free (`modified`) and nothing is paid — read it again and start from what it holds now. `attributes` is the
+FULL replacement set, not a patch, so start from the current attributes and change only what the user asked. Do not pass a
+templateId (the policy keeps its own), and the validity window is kept unless the user names a new one. An update pays a fee, so the
+same rules as `write_policy` apply: preflight it, show the interpretation and the price, and pass `confirm: true` only after the user
+has said yes. `settling` and `submitted` mean a payment has been made — pass the `paymentReceipt` to `check_policy_write`, never call
+`update_policy` again for it, and do not say the policy is updated until the state is `written`.
+
+**`remove_policy` removes every limit the policy set.** Once it is gone Wallet BE signs spends of that asset without any limit, so show
+the user what the policy currently limits (the unconfirmed call returns it as `currentAttributes`) and what removing it means, and call
+again with `confirm: true` only if they clearly agree. `removed` is the only state that means it is gone; `submitted` is not, so check
+with `get_my_policy` (a policy that is no longer listed is gone). Calling it again is free and never submits a second removal.
 
 **Always run `policy_preflight` on a draft before anyone deploys it, and always show the user its
 `interpretation` — including when `ready` is true.** The chain validates nothing: a policy can be

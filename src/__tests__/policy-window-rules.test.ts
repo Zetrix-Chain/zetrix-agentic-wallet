@@ -95,7 +95,7 @@ describe('window rules (pinned from Windows.java)', () => {
     // The real templates name them recipientAllowlist / recipientDenylist / allowedMethods —
     // none of which match any naming convention. The first cut guessed at `_LIST`, then camelCase
     // `List`, and caught NONE of the three, so the deny-everything blocker never fired on a real
-    // attribute (BT-3000). List-ness was always the type.
+    // attribute. List-ness was always the type.
     expect(isListType('ADDRESS_LIST')).toBe(true)
     expect(isListType('STRING_LIST')).toBe(true)
     expect(isListType('NUMBER_LIST')).toBe(true)
@@ -122,7 +122,7 @@ describe('window rules (pinned from Windows.java)', () => {
 /**
  * LIST_POLARITY decides whether a list PERMITS or BLOCKS what it names, and the whole empty-list
  * and interpretation logic rests on it. It was unpinned entirely: flipping `allowedMethods` from
- * allow to deny, or deleting the row, each left the full suite green (BT-3000 round 2, APP-M01) —
+ * allow to deny, or deleting the row, each left the full suite green —
  * the same inversion APP-C01 was about, on the attribute deciding which contract methods an agent
  * may invoke.
  *
@@ -154,7 +154,7 @@ describe('LIST_POLARITY (source: ms-zetrix *Evaluator.java — see the module do
     // and hand-author the expected list inside this file, which restated LIST_POLARITY's own keys
     // and therefore checked nothing. An invented `['memoDenylist', 'allow']` row — a *Denylist*
     // given ALLOW polarity, the round-1 CRITICAL exactly — then survived the whole suite
-    // (BT-3000 round 4, APP-M01).
+    //.
     //
     // Derived again now, from V1_VOCABULARY, which lives in the fixtures file with its provenance.
     // Adding a polarity row costs evidence again: the name has to be in the vocabulary first.

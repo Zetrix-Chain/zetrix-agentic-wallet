@@ -1287,7 +1287,7 @@ describe('subscribeAndIssue — VC pass image (extraData.vcPassBase64 from /v1/v
     sign: vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' }),
     pay: vi.fn().mockResolvedValue('X-PAYMENT-B64'),
     holderDid,
-    auth: vi.fn().mockResolvedValue({ signedData: 'addr-sig', publicKey: 'authpk' }),
+    signRequest: vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' }),
     address: 'ZTX3Holder',
     quarantine: mkQuarantine(),
     passImagesDir,
@@ -1307,7 +1307,7 @@ describe('subscribeAndIssue — VC pass image (extraData.vcPassBase64 from /v1/v
 
     const out = await subscribeAndIssue(deps as never, opts)
 
-    expect(deps.mbi.downloadVcs).toHaveBeenCalledWith({ address: 'ZTX3Holder' }, { signedData: 'addr-sig', publicKey: 'authpk' })
+    expect(deps.mbi.downloadVcs).toHaveBeenCalledWith({ address: 'ZTX3Holder' }, deps.signRequest)
     expect(out.vcPassImagePaths).toHaveLength(1)
     expect(readFileSync(out.vcPassImagePaths![0], 'utf8')).toBe('pass-png-bytes')
   })

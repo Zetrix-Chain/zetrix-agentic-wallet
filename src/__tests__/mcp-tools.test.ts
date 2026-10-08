@@ -654,3 +654,330 @@ describe('createTools — AI Birthcert verification', () => {
     })
   })
 })
+
+describe('create_verification_qr', () => {
+  const link = { created: true, link: 'https://link.myid.test/agentic-verify?referenceId=v2-1', referenceId: 'v2-1' }
+  const VERIFIED = 'did:zid:9641ee92552e9bcec672f300b071ff86d340ac78c83c225e95971cab8108fb80'
+  const BASIC_TESTNET = 'did:zid:3c0fb79adff08e14e06dcd6e3243205010dd65f533434a3d96c55575d1d3d959'
+  const BASIC_MAINNET = 'did:zid:19091d19049abb8869b4b8e2f4a887bd1d1d86e5f5ebd0c8297000255f67765b'
+  const OTHER = 'did:zid:c042e49e55ffe1b0ee835e6a8b3d1aec720fb1cb01dca17c4b3e5c2194949a6c'
+  type Held = { templateId: string; vc: unknown; validUntil?: string }
+  const cacheOf = (...held: Held[]) => ({
+    get: vi.fn(),
+    set: vi.fn(),
+    list: vi.fn().mockResolvedValue(held.map((h) => ({ ...h, issuedAt: '2026-01-01T00:00:00Z' }))),
+  })
+  /** A wallet that holds `held`, on testnet where the Verified AI Birthcert's template id is known. */
+  const holding = (deps: ReturnType<typeof makeDeps>['deps'], ...held: Held[]) => ({
+    ...deps,
+    cache: cacheOf(...held),
+    config: { ...deps.config, aiBirthcertVerifiedTemplateId: VERIFIED },
+  })
+
+  describe('which credential it presents when none is named', () => {
+    it('presents the Verified AI Birthcert when the wallet holds one, and passes the other inputs through', async () => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+
+      const out = await createTools({ ...holding(deps, { templateId: VERIFIED, vc: { id: 'verified-vc' } }), createVerificationLink }).create_verification_qr({
+        revealAttribute: ['a.b'],
+        expiryMinutes: 10,
+      })
+
+      expect(createVerificationLink).toHaveBeenCalledWith({ vc: { id: 'verified-vc' }, revealAttribute: ['a.b'], revealAll: undefined, expiryMinutes: 10 })
+      expect(out).toEqual({ ...link, credentialUsed: 'Verified AI Birthcert' })
+    })
+
+    it('prefers the Verified AI Birthcert over the Basic one and over any other credential held', async () => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+
+      await createTools({
+        ...holding(deps, { templateId: OTHER, vc: { id: 'other-vc' } }, { templateId: BASIC_TESTNET, vc: { id: 'basic-vc' } }, { templateId: VERIFIED, vc: { id: 'verified-vc' } }),
+        createVerificationLink,
+      }).create_verification_qr({})
+
+      expect(createVerificationLink.mock.calls[0][0].vc).toEqual({ id: 'verified-vc' })
+    })
+
+    it('falls back to the Basic AI Birthcert when there is no Verified one', async () => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+
+      const out = await createTools({
+        ...holding(deps, { templateId: OTHER, vc: { id: 'other-vc' } }, { templateId: BASIC_TESTNET, vc: { id: 'basic-vc' } }),
+        createVerificationLink,
+      }).create_verification_qr({})
+
+      expect(createVerificationLink.mock.calls[0][0].vc).toEqual({ id: 'basic-vc' })
+      expect(out).toMatchObject({ credentialUsed: 'Basic AI Birthcert' })
+    })
+
+    it('falls back to the Basic one when the Verified one has expired', async () => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+
+      await createTools({
+        ...holding(deps, { templateId: VERIFIED, vc: { id: 'verified-vc' }, validUntil: '2020-01-01T00:00:00Z' }, { templateId: BASIC_TESTNET, vc: { id: 'basic-vc' } }),
+        createVerificationLink,
+      }).create_verification_qr({})
+
+      expect(createVerificationLink.mock.calls[0][0].vc).toEqual({ id: 'basic-vc' })
+    })
+
+    it("uses the active network's Basic template id, and copes with no Verified template id on mainnet", async () => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+      const mainnet = {
+        ...deps,
+        config: { ...deps.config, network: 'zetrix:mainnet', aiBirthcertVerifiedTemplateId: undefined },
+        cache: cacheOf({ templateId: BASIC_TESTNET, vc: { id: 'testnet-basic' } }, { templateId: BASIC_MAINNET, vc: { id: 'mainnet-basic' } }),
+      }
+
+      await createTools({ ...mainnet, createVerificationLink }).create_verification_qr({})
+
+      expect(createVerificationLink.mock.calls[0][0].vc).toEqual({ id: 'mainnet-basic' })
+    })
+
+    it.each([
+      ['holds only some other credential', [{ templateId: OTHER, vc: { id: 'other-vc' } }]],
+      ['holds nothing', []],
+    ])('tells the agent to create a credential first when the wallet %s, without calling MBI', async (_label, held) => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn()
+
+      const out = await createTools({ ...holding(deps, ...(held as Held[])), createVerificationLink }).create_verification_qr({})
+
+      expect(out).toMatchObject({ created: false })
+      const reason = (out as { reason: string }).reason
+      expect(reason).toMatch(/Verified AI Birthcert/)
+      expect(reason).toMatch(/Basic AI Birthcert/)
+      expect(reason).toMatch(/request_ai_birthcert_verification/)
+      expect(reason).toMatch(/subscribe_and_issue/)
+      expect(createVerificationLink).not.toHaveBeenCalled()
+    })
+
+    it('gives the same answer when there is no credential cache at all', async () => {
+      const { deps } = makeDeps()
+
+      const out = await createTools({ ...deps, createVerificationLink: vi.fn() }).create_verification_qr({})
+
+      expect(out).toMatchObject({ created: false })
+      expect((out as { reason: string }).reason).toMatch(/request_ai_birthcert_verification/)
+    })
+  })
+
+  describe('what it reveals when the caller does not say', () => {
+    const verifiedVc = {
+      id: 'verified-vc',
+      credentialSubject: {
+        id: 'did:zid:h',
+        verifiedAiBirthcert: { agentName: 'a', ownerName: 'n', ownerId: 'i', evidenceProvider: 'e', ownerVerified: true, dob: 'd' },
+      },
+    }
+    const basicVc = { id: 'basic-vc', credentialSubject: { id: 'did:zid:h', aiBirthcert: { agentUsername: 'u', id: 'u' } } }
+    const STANDARD_VERIFIED = ['verifiedAiBirthcert.agentName', 'verifiedAiBirthcert.evidenceProvider', 'verifiedAiBirthcert.ownerVerified']
+
+    it('reveals agentName, evidenceProvider and ownerVerified for the Verified AI Birthcert, and says it was the default', async () => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+
+      const out = await createTools({ ...holding(deps, { templateId: VERIFIED, vc: verifiedVc }), createVerificationLink }).create_verification_qr({})
+
+      expect(createVerificationLink).toHaveBeenCalledWith({ vc: verifiedVc, revealAttribute: STANDARD_VERIFIED, revealAll: undefined, expiryMinutes: undefined })
+      expect(out).toMatchObject({ revealedByDefault: true, credentialUsed: 'Verified AI Birthcert' })
+    })
+
+    it('reveals only the agent username for the Basic AI Birthcert, and says what a Basic credential does not show', async () => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn().mockResolvedValue({ ...link, message: 'Show the user the QR.' })
+
+      const out = (await createTools({ ...holding(deps, { templateId: BASIC_TESTNET, vc: basicVc }), createVerificationLink }).create_verification_qr({})) as {
+        message: string
+      }
+
+      expect(createVerificationLink.mock.calls[0][0].revealAttribute).toEqual(['aiBirthcert.agentUsername'])
+      expect(out.message).toMatch(/Basic AI Birthcert/)
+      expect(out.message).toMatch(/does not mean the owner was verified/)
+    })
+
+    it('does not add the Basic caveat to a Verified presentation', async () => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn().mockResolvedValue({ ...link, message: 'Show the user the QR.' })
+
+      const out = (await createTools({ ...holding(deps, { templateId: VERIFIED, vc: verifiedVc }), createVerificationLink }).create_verification_qr({})) as {
+        message: string
+      }
+
+      expect(out.message).not.toMatch(/does not mean the owner was verified/)
+    })
+
+    it('treats an empty revealAttribute as not given', async () => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+
+      await createTools({ ...holding(deps, { templateId: VERIFIED, vc: verifiedVc }), createVerificationLink }).create_verification_qr({ revealAttribute: [] })
+
+      expect(createVerificationLink.mock.calls[0][0].revealAttribute).toEqual(STANDARD_VERIFIED)
+    })
+
+    it('uses the attributes the caller names instead of the standard set, and does not call that a default', async () => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+
+      const out = await createTools({ ...holding(deps, { templateId: VERIFIED, vc: verifiedVc }), createVerificationLink }).create_verification_qr({
+        revealAttribute: ['verifiedAiBirthcert.ownerName'],
+      })
+
+      expect(createVerificationLink.mock.calls[0][0].revealAttribute).toEqual(['verifiedAiBirthcert.ownerName'])
+      expect(out).not.toHaveProperty('revealedByDefault')
+    })
+
+    it('does not apply the standard set when revealAll is asked for', async () => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+
+      const out = await createTools({ ...holding(deps, { templateId: VERIFIED, vc: verifiedVc }), createVerificationLink }).create_verification_qr({ revealAll: true })
+
+      expect(createVerificationLink).toHaveBeenCalledWith({ vc: verifiedVc, revealAttribute: undefined, revealAll: true, expiryMinutes: undefined })
+      expect(out).not.toHaveProperty('revealedByDefault')
+    })
+
+    it('reveals only the standard attributes the credential actually has', async () => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+      const noProvider = { ...verifiedVc, credentialSubject: { id: 'did:zid:h', verifiedAiBirthcert: { agentName: 'a', ownerVerified: true, ownerName: 'n' } } }
+
+      await createTools({ ...holding(deps, { templateId: VERIFIED, vc: noProvider }), createVerificationLink }).create_verification_qr({})
+
+      expect(createVerificationLink.mock.calls[0][0].revealAttribute).toEqual(['verifiedAiBirthcert.agentName', 'verifiedAiBirthcert.ownerVerified'])
+    })
+
+    it('refuses, naming what the credential has, when none of the standard attributes are there', async () => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn()
+      const odd = { id: 'odd', credentialSubject: { id: 'did:zid:h', verifiedAiBirthcert: { ownerName: 'n', dob: 'd' } } }
+
+      const out = await createTools({ ...holding(deps, { templateId: VERIFIED, vc: odd }), createVerificationLink }).create_verification_qr({})
+
+      expect(out).toMatchObject({ created: false })
+      expect((out as { reason: string }).reason).toMatch(/standard set/)
+      expect((out as { reason: string }).reason).toContain('verifiedAiBirthcert.ownerName')
+      expect(createVerificationLink).not.toHaveBeenCalled()
+    })
+
+    it('applies the standard set to a credential the caller passes in when it is the one the wallet holds', async () => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+
+      await createTools({ ...holding(deps, { templateId: VERIFIED, vc: verifiedVc }), createVerificationLink }).create_verification_qr({ vc: verifiedVc })
+
+      expect(createVerificationLink.mock.calls[0][0].revealAttribute).toEqual(STANDARD_VERIFIED)
+    })
+
+    it('has no standard set for a credential it does not recognise, so the caller must say', async () => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+
+      await createTools({ ...holding(deps, { templateId: VERIFIED, vc: verifiedVc }), createVerificationLink }).create_verification_qr({
+        vc: { id: 'some-other-vc', credentialSubject: { id: 'did:zid:h', thing: { a: 1 } } },
+      })
+
+      expect(createVerificationLink.mock.calls[0][0].revealAttribute).toBeUndefined()
+    })
+  })
+
+  it('presents the credential the caller names instead of the cache', async () => {
+    const { deps } = makeDeps()
+    const createVerificationLink = vi.fn().mockResolvedValue(link)
+    const cache = cacheOf({ templateId: VERIFIED, vc: { id: 'verified-vc' } })
+
+    const out = await createTools({ ...deps, cache, createVerificationLink }).create_verification_qr({ vc: { id: 'explicit' }, revealAttribute: ['a.b'] })
+
+    expect(createVerificationLink.mock.calls[0][0].vc).toEqual({ id: 'explicit' })
+    expect(cache.list).not.toHaveBeenCalled()
+    expect(out).toMatchObject({ credentialUsed: 'the credential you supplied' })
+  })
+
+  it('passes revealAll through', async () => {
+    const { deps } = makeDeps()
+    const createVerificationLink = vi.fn().mockResolvedValue(link)
+
+    await createTools({ ...holding(deps, { templateId: VERIFIED, vc: { id: 'verified-vc' } }), createVerificationLink }).create_verification_qr({ revealAll: true })
+
+    expect(createVerificationLink).toHaveBeenCalledWith({ vc: { id: 'verified-vc' }, revealAttribute: undefined, revealAll: true, expiryMinutes: undefined })
+  })
+
+  it('does not label a failure with a credential', async () => {
+    const { deps } = makeDeps()
+    const createVerificationLink = vi.fn().mockResolvedValue({ created: false, reason: 'nope' })
+
+    const out = await createTools({ ...holding(deps, { templateId: VERIFIED, vc: { id: 'verified-vc' } }), createVerificationLink }).create_verification_qr({})
+
+    expect(out).toEqual({ created: false, reason: 'nope' })
+  })
+
+  describe('a credential that is not this wallet\'s', () => {
+    // MBI refuses it too, but the wallet should not need a round trip to know a credential issued to someone else
+    // is not its own to present.
+    it.each([
+      ['named by the caller', (deps: ReturnType<typeof makeDeps>['deps']) => ({ ...deps, cache: cacheOf() }), { vc: { credentialSubject: { id: 'did:zid:someone-else' } } }],
+      ['loaded from the cache', (deps: ReturnType<typeof makeDeps>['deps']) => holding(deps, { templateId: VERIFIED, vc: { credentialSubject: { id: 'did:zid:someone-else' } } }), {}],
+    ])('is refused locally when it is %s', async (_label, withDeps, input) => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn()
+
+      const out = await createTools({ ...withDeps(deps), createVerificationLink }).create_verification_qr(input)
+
+      expect(out).toMatchObject({ created: false })
+      expect((out as { reason: string }).reason).toMatch(/did:zid:someone-else/)
+      expect((out as { reason: string }).reason).toMatch(/did:zid:h\b/)
+      expect(createVerificationLink).not.toHaveBeenCalled()
+    })
+
+    it('is presented when its subject is this wallet', async () => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+
+      await createTools({ ...deps, createVerificationLink }).create_verification_qr({ vc: { credentialSubject: { id: 'did:zid:h' } } })
+
+      expect(createVerificationLink).toHaveBeenCalledTimes(1)
+    })
+
+    it('is presented when it carries no subject id, leaving the decision to MBI', async () => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+
+      await createTools({ ...deps, createVerificationLink }).create_verification_qr({ vc: { id: 'no-subject' } })
+
+      expect(createVerificationLink).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  // The holder check and the reveal check both read the credential's fields; a value that is not an object skips
+  // them, so it is refused here rather than passed on.
+  it.each([
+    ['a JSON string', '{"credentialSubject":{"id":"did:zid:someone-else"}}'],
+    ['null', null],
+    ['an array', [{ credentialSubject: { id: 'did:zid:someone-else' } }]],
+    ['a number', 7],
+  ])('refuses a vc that is %s, without calling MBI', async (_label, vc) => {
+    const { deps } = makeDeps()
+    const createVerificationLink = vi.fn()
+
+    const out = await createTools({ ...deps, createVerificationLink }).create_verification_qr({ vc })
+
+    expect(out).toMatchObject({ created: false })
+    expect((out as { reason: string }).reason).toMatch(/credential object/)
+    expect(createVerificationLink).not.toHaveBeenCalled()
+  })
+
+  it('answers created:false when the capability is not wired', async () => {
+    const { deps } = makeDeps()
+
+    const out = await createTools({ ...holding(deps, { templateId: VERIFIED, vc: { id: 'a' } }) }).create_verification_qr({})
+
+    expect(out).toMatchObject({ created: false })
+    expect((out as { reason: string }).reason).toMatch(/not configured/)
+  })
+})

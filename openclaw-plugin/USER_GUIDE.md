@@ -26,7 +26,7 @@ Check it worked:
 ```bash
 openclaw plugins list          # zetrix-agentic-wallet, enabled
 openclaw mcp doctor            # zetrix-agentic-wallet: ok
-openclaw mcp probe zetrix-agentic-wallet   # 18 tools
+openclaw mcp probe zetrix-agentic-wallet   # 21 tools
 ```
 
 Nothing else is needed. No `npx`, no account signup, no password, no MCP configuration.
@@ -61,6 +61,7 @@ Other things that work straight away, all free:
 | What a credential template requires | no |
 | Reading on-chain contract data | no |
 | Proving your identity to a service | no |
+| Showing a person a link and QR code to verify the agent in the MyID app | no |
 | **Fetching a resource that charges per use** | **yes** |
 | **Obtaining a verifiable credential** | **yes** |
 | **Starting a Verified AI Birthcert check (owner identity verification via MyDigital ID)** | **yes** |
@@ -166,6 +167,25 @@ tell you so rather than retrying.
 > ⚠️ **Set this through the plugin settings, not by editing `openclaw.json` directly.** The plugin
 > manages its own entry in that file and will either overwrite your edit or stop managing the entry
 > altogether. Neither is obvious when it happens.
+
+## Verifying the agent in the MyID app
+
+Ask the agent to verify itself and it can give you a link and a QR code that open its credential in the MyID
+app. Anyone who holds the link can read what it reveals until it expires (5 minutes by default), so the agent
+shows it only to you and tells you which attributes it reveals.
+
+On testnet this works out of the box: the link points at MyID's UAT address. On mainnet it needs one setting until MyID's
+production side is verified: **MyID verification link** (`myidVerifyLinkTemplate`), an `https` link with `{referenceId}` where
+the reference id goes, for example `https://<MyID link domain>/<path>?referenceId={referenceId}`. Until it is set there the
+agent answers that it cannot create the link.
+
+```bash
+openclaw config set plugins.entries.zetrix-agentic-wallet.config.myidVerifyLinkTemplate \
+  'https://<MyID link domain>/<path>?referenceId={referenceId}'
+openclaw mcp reload
+```
+
+---
 
 ## Adding funds
 

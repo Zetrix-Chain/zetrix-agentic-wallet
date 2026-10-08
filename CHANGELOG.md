@@ -8,6 +8,290 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > Entries for 0.5.0 and earlier were reconstructed from commit history when this file was
 > introduced in 0.6.0, so they summarise each release rather than being exhaustive.
 
+## [Unreleased]
+
+## [0.14.0] — 8 October 2026
+
+### Fixed
+
+- **`credential_preflight` now says when the wallet already holds the credential, before the agent asks the user for anything.** A user with a
+  valid Verified AI Birthcert asked for one, was told "no blockers, 1 JMYR", and was asked to choose an agent name: the only check for an existing
+  credential was in the paid `request_ai_birthcert_verification` call (the free quote path skips it on purpose, so a price can be read while a
+  session is in flight), and preflight never looked at what the wallet holds. Preflight now looks, locally and for free, at the credentials the
+  wallet has saved; if a valid copy is held it stops with `ready: false` and `alreadyHeld` (what it is, its id, its expiry), prices nothing, and
+  tells the agent not to ask for a name or start an issuance. A new one would replace it and cost the fee, so only when the user explicitly wants a
+  replacement does the agent run it again with `replacing: true`. Works for the Basic AI Birthcert and any template credential too. An expired
+  credential does not count; a lookup that fails is reported in `notChecked`, never as "nothing is held". It does not see a credential that was
+  paid for and issued but never collected with `check_ai_birthcert_verification` — the paid call's own guard still covers that.
+
+### Changed
+
+- **`create_verification_qr` has a built-in link on testnet (UAT), and it is the one the MyID app is registered for.** `MYID_VERIFY_LINK_TEMPLATE`
+  now defaults to `https://ssivc-api-uat.myegdev.com/api/agentic-verify?referenceId={referenceId}` on testnet, so nobody has to set it. It was read from
+  the host's own `apple-app-site-association`, which claims exactly `/api/agentic-verify` with a `referenceId` query (plus an `assetlinks.json` for
+  `com.zetrix.myid.uat`), and that address serves an "open this on your phone" page. The first link the wallet was given,
+  `/v1/agent-verification/{referenceId}`, is claimed by neither: a phone would not hand it to the app, and the server answers 404. **Mainnet has
+  no default** until MyID's production side is verified (MyID stated `https://myid-verifier.zetrix.com/api/agentic-verify?referenceId={referenceId}`, but it was not deployed and its host sits behind a Cloudflare browser
+  check, so the association files could not be read): the tool refuses before it creates anything on MBI, as for any unverified mainnet value, and the stated link is
+  kept as `UNVERIFIED_MAINNET_MYID_VERIFY_LINK_TEMPLATE`. Set `MYID_VERIFY_LINK_TEMPLATE` to opt in. The variable still overrides the default on either
+  network, and only a value someone set is warned about at startup.
+
+### Added
+
+- **`valueHuman`: give one amount in whole tokens, and the wallet does the multiplication.** On any attribute of `policy_preflight`,
+  `write_policy` and `update_policy`, `valueHuman: "100"` stands in for `value` and means 100 whole tokens. The wallet converts it with
+  the asset's own on-chain decimals (native ZTX, or the token named by `tokenAddress`), returns the raw value in `convertedAmounts`, shows
+  both forms in `interpretation` ("perTransactionMax: 100 JMYR is written as 100000000"), and never sends `valueHuman` to the service.
+  What counts as an amount comes from the service's served vocabulary (`unit: SMALLEST_UNIT`) when it can be read, and from the built-in
+  list when it cannot; an attribute the service calls a COUNT or a DURATION is never scaled, whatever the built-in list believes
+  (`maxTransactionCount` and the windows are refused). Anything it cannot convert exactly is refused with nothing converted: unknown
+  asset, unreadable decimals, more decimal places than the token has, an exponent, a sign, a separator. A `value` given alongside must agree.
+  It is applied BEFORE `amountUnit`, which then leaves it alone, so a human amount is never converted twice. The tool descriptions now
+  also say that `maxTransactionCount` is a count, not an amount.
+
+- **`update_policy` and `remove_policy`: users manage a policy through the agent after it is deployed.** `write_policy` is create-only
+  (a second call with the same key answers `already_exists`); these add the other two on top of ms-zetrix's x402 routes.
+  - **`update_policy`** replaces a policy's attributes and validity window and **pays the update fee** (through the same payment cap and
+    `confirm: true` gate as `write_policy`, with the same `dryRun`). It takes the policy's `expectedUpdatedAtBlock` from
+    `get_my_policy` (new `forUpdate.expectedUpdatedAtBlock`, already a string — the chain returns a number and the service wants a string),
+    carries the policy's template forward rather than taking one, and keeps its validity window unless a new one is given (the service does
+    not default an omitted bound, so sending nothing would have stripped an existing expiry). It reads the policy first and checks the draft
+    against the policy's own template. Every refusal that can be known first is free and says nothing was paid: `not_found`, `modified`
+    (the policy changed since it was read), `template_unavailable`, `refused`. A paid update that the chain then rejects is `write_failed`
+    and says the policy is **unchanged** and a payment may have been taken.
+  - **`remove_policy`** is free but lifts every limit the policy set, so nothing is sent without `confirm: true`; the unconfirmed call
+    returns what the policy currently limits. It is reported as `removed` **only when a chain read shows the policy gone** — a submitted
+    transaction is `submitted`, never "removed" — and repeating it never submits a second removal.
+  - **`check_policy_write`** now collects an update receipt on the update route: the receipt bookmark records which write it pays for
+    (`operation`), and one saved before this change reads as a create.
+  - **`write_policy`'s default `requestKey`** is now a sha256 hex string. The old `owner-policyKey-timestamp` overflowed the service's
+    128-character column for a policy key longer than about 65 characters.
+  - A write the service says is already paid for is collected on the route **its own operation** names, which may not be the write just
+    asked for (previously it was always collected as a create).
+- **The service's own description of every policy attribute.** ms-zetrix now publishes the vocabulary at
+  `GET /policy/vocabulary` (version `v1`, sixteen attributes, each with a description, unit, role, what it
+  pairs with and what an empty list or a use outside its scope means). `get_policy_template_schema` returns
+  it beside `declared` as `attributeMeanings`, so an agent can say what a rule means instead of guessing, and
+  `policy_preflight` (and the check `write_policy` runs before paying) uses it to refuse what the built-in
+  rules cannot know: an attribute the service does not recognise (`unknownAttributePolicy` defaults to
+  deny, so it refuses every transfer) and an attribute used outside the scope it applies to
+  (`allowedMethods` or `approvalPolicy` on a native policy). When the service and the built-in rules
+  disagree about a role or about what a missing window means, that is reported in `notChecked` and the
+  STRICTER of the two answers is used, so a service label can tighten the "enforceable" refusal but never loosen
+  it. The read is strict (one malformed attribute fails the whole read, and an unknown version is refused),
+  bounded (descriptions are flattened to one line, stripped of invisible formatting characters such as bidi
+  overrides, cut at 600 characters, and shown as quoted text from ms-zetrix that describes and does not
+  instruct; "bounded, not scrubbed"), never follows a redirect, refuses a declared oversize body before reading
+  it, cached (ten minutes for a good answer, one for a failure) and never throws. **If it
+  cannot be read, nothing else changes**: every existing preflight result is as before plus one `notChecked`
+  line. Known limit: the route is behind a Cloudflare bot challenge that, as observed on 2026-10-06, some
+  non-browser clients (Node `fetch`, Git's OpenSSL curl) receive as an HTML page with HTTP 403 and
+  `cf-mitigated: challenge`; that is reported as `challenged` and the built-in rules are used until it is
+  exempted.
+
+- `create_verification_qr`: gives a human a link and a QR code that open the agent's credential in the MyID app. The wallet presents the credential to MBI, and the link holds only the reference id — which grants access to the revealed attributes until it expires, so by default only a standard minimal set is revealed — Verified AI Birthcert: `agentName`, `evidenceProvider`, `ownerVerified`; Basic AI Birthcert: `agentUsername` — never the owner's name, id or date of birth; other attributes need `revealAttribute`, and everything needs `revealAll: true`, which the agent uses only when the user explicitly asks. A Basic credential's result says it does not mean the owner was verified. The link is built from `MYID_VERIFY_LINK_TEMPLATE` (MyID's `https` universal link, with `{referenceId}` in the path or query); with none set, or one that breaks those rules, the tool refuses before anything is created on MBI, and a bad template is warned about at startup. A credential whose subject is not this wallet is refused locally. The link stays openable for 5 minutes by default, up to 60. With no `vc` given it presents the Verified AI Birthcert if the wallet holds one, otherwise the Basic AI Birthcert (the result says which, in `credentialUsed`), and if it holds neither it answers `created: false` and says to create one first; no other credential is picked for the caller. A refusal for a path the credential does not have lists the attribute names it does have. The OpenClaw plugin gains a `myidVerifyLinkTemplate` setting that is forwarded to the wallet. The named paths must each be a single attribute of the credential: a typo or a parent path is refused, and so is any path the wallet cannot check — a credential that is not an object, has no plain `credentialSubject`, or has an attribute name containing a dot — in which case the caller passes the credential object or uses `revealAll`. They are sent de-duplicated and in the credential's own order, and the result states what was revealed (`revealed`). The template is judged as a browser would read it: only printable ASCII, no backslash, no `@` before the host, and not containing the text `refidmarker`.
+
+- **A unit guard, and `amountUnit`, for policy amounts.** A real policy went on chain with
+  `perTransactionMax: 1` and `cumulativeMax: 100` for a 6-decimal token (JMYR) — 0.000001 and 0.0001 of
+  it, a million times tighter than the "1 JMYR" and "100 JMYR" the user meant. Amounts are raw base units,
+  and nothing made that visible before the payment. Now a non-zero `perTransactionMax`, `cumulativeMax` or
+  `velocityCap` under one whole token is refused by `policy_preflight` and `write_policy` unless
+  `amountUnit` says what is meant: `"whole"` gives whole-token amounts (`"1"`, `"0.5"`) which the wallet
+  converts by the token's decimals, returns in `convertedAmounts` and states in `interpretation` — and
+  `write_policy` then writes the converted raw values, so what is paid for is what the user saw; `"base"`
+  confirms a tiny raw value is intended. Silence is not an acknowledgement. Conversion refuses to guess:
+  unreadable decimals, a missing scale, more decimal places than the token has, or anything that is not a
+  plain number all refuse the draft. Counts (`maxTransactionCount`) are not amounts and are untouched.
+  A `"whole"` draft in which every amount is already 10^decimals tokens or more is refused too, because
+  that is what an already-converted value looks like and converting it again would write a cap a million
+  times looser; `convertedAmounts` is for showing the user and must never be sent back as the values.
+  Because a genuine cap that large looks identical, the refusal names BOTH readings with the exact raw value
+  for each (resend a copied raw value unchanged with `"base"`; send a real large cap as the value times
+  10^decimals with `"base"`). It needs every amount to look raw, so a copied draft that also contains a zero
+  or sub-token amount is not caught. Raw amounts are also bounded to 77 digits, the most a 256-bit number has.
+  Token decimals are now typed strictly and bounded (0–36) at the read: `null`, an empty string, `false`
+  or an array used to read as a genuine 0-decimal token, and an absurd value made preflight throw or
+  stall. The guard cannot catch a raw value that is already one whole token or more (`interpretation` states
+  what such an amount means), and does nothing when the decimals cannot be read (`notChecked` says so).
+- **`policy_preflight` no longer leaves a token policy to guesswork.** A real transcript ("limit 1 JMYR
+  per transaction, 100 a week") exposed three gaps. (1) The agent asked the user for the JMYR contract
+  address, which the wallet already holds: `wallet_status({ token })` now returns it as `tokenAddress`,
+  a `ztp20` draft with no `tokenAddress` names the registered ones, and a token symbol written where
+  the address belongs is refused with the address to use (the generic "ask the user, do not correct it"
+  advice is suppressed for that case, since correcting a registered symbol is the right move). (2) The
+  amounts were never stated in whole tokens, so `1` of a 6-decimal token — 0.000001 of it — read as
+  "1 JMYR"; `interpretation` now says what each amount means, and says so plainly when the decimals
+  cannot be read instead of assuming a scale. (3) Preflight accepted `cumulativeWindow: "week"`, which
+  the write service refuses: every `*Window` must be a duration such as `7d`, `12h` or `30m` (or ISO
+  `P7D`) — not a word, not a bare number (which would be read as milliseconds), and not padded with spaces,
+  and `interpretation` states each window's period in words, because `1M` is one minute, not one month. The window grammar is
+  restated from the service, so it is a tripwire rather than a guarantee; a window over the default 30d
+  retention is noted, not refused, because that limit is environment-specific.
+
+- **The wallet can now find a policy template on its own.** Asking it to "show me the policy
+  template" on a wallet with no deployed policy used to go nowhere: the tool described a template id
+  as something found "inside a deployed policy", a first-time user has none, and the only way to get
+  one is to write a policy — which needs the id. The agent ended up asking the user for a publisher
+  and a template contract address, neither of which a user can be expected to know.
+
+  `get_policy_template_schema` with no arguments now lists the default publisher's templates, each
+  with its declared attributes and the `templateId` that `write_policy` needs. A single template can
+  be read by key alone, and another publisher's listed by naming it. An id is only ever returned
+  once the chain has confirmed it — it is derived from the publisher and key, and one that does not
+  resolve is withheld. The listing is bounded and says what it left out.
+
+  New optional setting `POLICY_TEMPLATE_PUBLISHER`. The default is derived per network, and there is
+  none where no policy module is deployed.
+
+- **`policy_preflight` no longer approves drafts the write service refuses.** A real transcript
+  drafted "a 10 JMYR per-transaction max" as `assetScope: "JMYR"` on the native template and got
+  `ready: true` and "limited to JMYR" — for a draft the service rejects twice over. Preflight now
+  applies the service's scope rules: `assetScope` must be exactly `native` or `ztp20` (never a token
+  symbol), a `ztp20` policy needs a `tokenAddress` and says plainly when the chosen template cannot
+  express one, and an amount or count cap needs an `assetScope`. No meaning is offered for a scope it
+  is refusing. These are restated from the service, so they are a tripwire rather than a guarantee.
+
+- **`policy_preflight` refuses a repeated attribute name.** The scope and token rules read the first
+  attribute with a given name, so `assetScope: "native"` followed by `assetScope: "JMYR"` was read as
+  ready. Which value the write service would take is not knowable from the wallet, so a repeat is refused
+  rather than guessed at.
+
+- **`write_policy` can quote its price first.** `dryRun` runs every free check and returns what the
+  service asked for, paying, collecting and writing no policy — including never collecting a write that
+  has already been paid for (it only keeps a local bookmark so `check_policy_write` can finish it). Previously the price could only be learned by paying it.
+
+- **`write_policy` `dryRun` now says whether the wallet can afford the quote.** (The network fee is not
+  estimated, and a payment made in ZTX needs the amount plus that fee from one balance, so a ZTX balance
+  equal to the quote is short and `feeNotEstimated` says when "affordable" means only "holds the amount".) It reads the fee-asset
+  balance, ZTX for gas (only when the payer would check it) and the payment cap the policy payer
+  carries, and reports each shortfall separately under `affordability`. A balance that cannot be read
+  is `unknown`, never `affordable`. Nothing is paid, collected or written, and the check is not run on
+  a real deploy.
+
+### Fixed
+
+- **A collect that answers with an error no longer leaves a landed write as "unknown".** On staging an `update_policy` was paid and the service finished the collect, but it took 12.7 seconds and something in front of it answered HTTP 500 at about 10; the wallet could only say "unknown, ask again later", and asking again spends one of the service's few collect retries, while the chain already held the update. Now, when the collect step ends with an error that says nothing about the write (a 5xx, a gateway page, a status this wallet does not recognise, or the service's own "unknown"), the wallet reads the chain for up to 45 seconds, which is free and spends no retry, and reports `written` when the chain holds **exactly** the attributes that were submitted (for an update, with `updatedAtBlock` moved from the value it had before). A policy that holds the same attributes but did not move, one with an extra or missing or repeated attribute, an unreadable chain, and the service's own "the chain rejected it" are all left as they were: the wallet says `written` from a chain read only on exactly that (and, for a create, under the same template). The answers that start the read include every status the wallet does not recognise, a 4xx too. `check_policy_write` looks at the chain first for a receipt that still carries what to verify, so a write that already landed costs no collect. A receipt stops being verified once the service has said its write failed, or once a newer paid write for the same `policyKey` is made (so a later, separately paid write of the same values is never credited to an older receipt), and a receipt bought by another owner is never checked against this owner's policy. The read gets what is left of the poll budget (at least 10 s, at most 45 s) and each read is cut off at 10 s. The bookmark now records the submitted attributes and the prior `updatedAtBlock` (public policy rules, no credential; a malformed record is dropped on read and the receipt stays usable). The result also carries `upstream: { status, detail }`, the service's own answer kept apart from the wallet's wording (control characters and line breaks replaced, at most 200 characters; the service's own "unknown" carries it too), and a `written` inferred from the chain carries `paymentReceipt`. **Not changed here, and not the wallet's to change:** the 500 itself. It is a gateway or ingress timeout on a collect that takes longer than it allows; raising that timeout for `/collect` (or making collect return before it finishes) is a server-side fix.
+
+- **`valueHuman` review round 1.** A native policy that also names a `tokenAddress` is refused (the service ignores it for native payments, so it would not limit ZTX) and is never read as an amount of ZTX: before, a `valueHuman` on it was converted with ZTX decimals while the cap applied to the token, up to a million times off. An attribute with neither `value` nor `valueHuman` is refused for every type: before, a STRING attribute could reach the wire with no value. An attribute entry that is not an object is refused cleanly instead of with a raw error. An attribute the service lists with a unit other than the smallest unit is never scaled. A numeric `valueHuman` is accepted only as a safe whole number (write `"0.5"` as text), and a `value` that is not text beside a `valueHuman` is refused. The descriptions say never to put `convertedAmounts` into `valueHuman`.
+
+- **`update_policy` / `remove_policy` review round 1.** Recovering a write that was already paid for now collects on the
+  receipt's OWN route: a receipt the wallet holds decides it, the server's `operation` must agree or nothing is collected, and an
+  update whose operation neither side names is refused instead of being collected as a create (which could lose the receipt and
+  invite a second charge). `validFromBlock: null` / `validToBlock: null` are treated as "not named" and the current bound is carried
+  forward, and a malformed bound is refused for free, so an agent can no longer strip an expiry by sending `null`. A malformed error
+  envelope (`messages` that is not an array) can no longer throw out of a payment refusal. A paid create that is still being
+  completed (409 with `errorCode` 461529) is reported as in progress, not as "the policy already exists, nothing was paid", and
+  the messages no longer promise that asking again will hand back a receipt. An unexpected 2xx from remove, and a 5xx on the update
+  pre-check, are reported as unknown or unavailable instead of "nothing was removed" / "refused"; a `getPolicy` reply with no
+  boolean `found` is a failed read, not "removed". The idempotence of `remove_policy` is described as the server's, not the
+  wallet's. Not done here, deliberately: saving the receipt before the phase-2 payment, which the server flag for owner-password
+  collection depends on; that flag must stay off until it ships.
+
+- **Follow-ups from the vocabulary review.** The quoting around a service description can no longer be closed by a
+  double quote in the description (it is JSON-escaped, so it stays one quoted span). A pairing the service reports with a window the built-in rules do not name (a renamed
+  window) is always reported in `notChecked`, and refused when the service says that without it the cap is unenforceable or not
+  a limit at all, so a rename is never silent.
+  The `maxTransactionCount` blocker states its reading as ms-zetrix's published vocabulary as read on 2026-10-07 rather
+  than a hard-coded claim, `get_policy_template_schema` says the meanings are data from ms-zetrix and not instructions, and
+  `attributeMeaningsSource` is listed in the README.
+
+- **A `maxTransactionCount` with no `countWindow` is refused.** It was a quiet note on a `ready: true` result, so the
+  owner paid for a policy with no count limit: the wallet's own rule says a count with no period is not requested at
+  all, and ms-zetrix describes it as refusing every transfer, and neither gives the limit the owner wrote. The fix
+  (add `countWindow`) is free, so it is now a blocker, as a `velocityCap` without its window already was. A pairing
+  the service calls unenforceable and the built-in rules call something looser is refused too. Which reading is
+  right still needs confirming with ms-zetrix.
+- **An attribute the service does not know restricts nothing when `unknownAttributePolicy` is `"ignore"`**, so it no
+  longer counts as the policy's enforceable constraint.
+
+- **`tokenAddress` counted as an enforceable constraint.** The service's vocabulary calls it a QUALIFIER (it
+  says which token a policy governs and caps nothing), and the wallet's built-in set did not, so a policy of
+  `assetScope` plus `tokenAddress` alone passed preflight although the service would answer
+  `NO_ENFORCEABLE_CONSTRAINTS` and refuse every transfer. It is now a qualifier.
+
+- **The paying tools report a Wallet BE spending-policy refusal as what it is.** `transfer_token` told a policy denial
+  (`1000033`, a decision) from a check that could not complete (`1000034`, transient) from a signing failure; the four x402
+  paths did not, and Wallet BE signs the same way for all of them. `pay_and_fetch`, `subscribe_and_issue`, the Verified AI
+  Birthcert session fee and `write_policy`'s fee surfaced the raw `Wallet BE /wallet/hsm/sign-blob errorCode 1000033: …`
+  as a thrown error, with nothing to tell an agent that one is final and the other worth retrying. They now return
+  `policyDenied: true` or `policyCheckUnavailable: true` with a message that says plainly what was and was not done: the
+  refusal arrives at the signature, before the X-PAYMENT header exists, so nothing was paid, and each path adds what it
+  had already done (a quote, the free pre-check, the issuer's payment request — none moves money). Matched on the numeric
+  `errorCode` only, never on message text, and the failure text is bounded like `transfer_token`'s. A refusal is never
+  retried on the other gas option. `write_policy` reports a denial as state `refused` and an unavailable check as
+  `unavailable`, with `paid: false`. Every other failure still throws, as before. The matching moved to a shared module
+  (`policy-refusal.ts`) and `pay_and_fetch`'s payer to `orchestrator/pay.ts`, where it can be tested.
+
+- **`transfer_token` now tells a policy refusal from a signing failure.** Wallet BE enforces the user's
+  policy at signing and answers a refusal as HTTP 200 with a numeric `errorCode`: `1000033` when
+  the policy decision service said DENY (a decision, with the reason code in the message) and `1000034`
+  when the policy check could not complete (it fails closed; transient). The wallet only recognised an HTTP
+  403 or a `policyCode` field, neither of which Wallet BE sends, so both surfaced as "signing failed" — the
+  same words as the signer being down, with nothing to tell an agent that one is final and the other is
+  worth retrying. `1000033` now yields `policyDenied: true` ("a decision, retrying will not help", with the
+  reason shown) and `1000034` yields `policyCheckUnavailable: true` ("transient, trying again shortly is
+  right"). They are matched on the numeric field only, never on message text, so a lookalike message or a
+  string code does not classify, and every other Wallet BE error is still "signing failed". The failure text
+  is bounded on every path, including an ordinary "signing failed" — bounded and flattened to one line (whitespace and
+  control characters collapse, so a remote message cannot lay out fake lines), cut by character so a surrogate pair is never
+  split, and total (it never throws), but NOT scrubbed: markup in a remote message is still shown. A bare HTTP 403 no longer counts as a policy
+  denial: it can come from a proxy or WAF, and reporting that as a final decision would be the inverse of this
+  bug; a structured `policyCode` and `errorCode` 1000033 still do. Nothing changes for an environment where
+  Wallet BE enforcement is off (the shipped default
+  for test, UAT and prod). Only `transfer_token` is changed; the x402 payment paths surface the Wallet BE
+  message as before.
+
+- Existing tests used `cumulativeWindow: "43200"` — a bare number the service refuses — as a valid
+  window, encoding the same false assurance. They now use `12h`.
+
+- **A gateway's 5xx on `collect` is no longer reported as the chain rejecting the write.** A real run got a
+  Spring `500` from `/collect` and then Cloudflare's "origin returned an invalid response" page as a `502`;
+  the wallet read the second as the service's own `WRITE_FAILED` and told the user the chain had rejected a
+  paid write, when nothing was known about it. The service's own 502 and 504 always carry JSON with
+  `state: "WRITE_FAILED"` / `"UNKNOWN"`, so a 502/504 now counts as the service's only when its body says so.
+  Any other 5xx is a new `server_error` outcome: state `unknown`, receipt kept, never retried (a failed
+  collect uses one of a small number of retries), no claim about the chain, and one later `check_policy_write`.
+  A gateway page is quoted as bounded plain text, and a 5xx carrying a state the wallet does not know stays on
+  the unrecognised path. The `500` itself is an unhandled exception in ms-zetrix and needs fixing there.
+
+### Changed
+
+- **A spending policy for an asset replaces the default wallet cap for that asset; mainnet gets the same default cap as testnet.**
+  A payment had to pass the wallet's own per-payment cap and then Wallet BE's policy, so a policy allowing 2 JMYR did not
+  raise the default 1 JMYR cap: a 1.5 JMYR payment was refused by the wallet before the policy was consulted. Now, when the
+  owner has a policy that governs the asset being paid (`assetScope` native for ZTX, or ztp20 with that `tokenAddress`, a
+  `perTransactionMax`, and no block range), the DEFAULT cap is not applied on any paying path (`pay_and_fetch`,
+  `subscribe_and_issue`, the AI Birthcert fee, `write_policy`'s fee, `transfer_token`) nor in the cap shown by
+  `credential_preflight` and the `write_policy` quote, which then say the policy governs. It fails closed: no policy
+  registry (mainnet today), a failed or timed-out read of the policy list, a policy for another asset, one with no
+  `perTransactionMax`, one that repeats `assetScope`, `tokenAddress` or `perTransactionMax`, a native policy that also names a
+  token (the service ignores it for native payments), or a policy bounded in time all leave the cap in force, and an explicit `MAX_PAYMENT_AMOUNT` is never bypassed. A good reading is cached for 30
+  seconds, so a removed policy can still stand the cap aside for up to that long. Only the cap stands aside: a malformed amount in a payment challenge is still refused. **`write_policy` now needs
+  `confirm: true` to pay and write** (without it the call returns the price, `needsConfirmation: true`, and nothing is paid),
+  because the agent could otherwise write a high `perTransactionMax` and lift its own cap in two calls; the wallet cannot verify
+  that a person said yes, it is an instruction to the agent like `transfer_token` `confirm`. The gate also covers collecting a write that was paid for elsewhere (a "already in flight" answer is neither saved nor collected without `confirm: true`, so `check_policy_write` has nothing to collect), and `pay_and_fetch` refuses the policy-write service's paid paths. A read of the policy list that times out is never cached when it finally answers, and no further read starts while it runs. **Two things this accepts, agreed with the
+  reviewer:** the general default cap on mainnet is now 1 JMYR per call (it was refuse-all, deliberately, so `pay_and_fetch`
+  could not auto-pay an arbitrary URL), with no running total; and the bypass trusts Wallet BE to enforce the policy, which it
+  does not in prod as shipped.
+
+- **Corrected the `notChecked` text on preflight results.** It said the deploy path "is not built
+  yet", which stopped being true when `write_policy` shipped, and stated as fact that nothing consults
+  the decision service — something this wallet cannot see.
+
+- **`write_policy` no longer asks for `templateContractAddress`.** The wallet already knows the one
+  Template contract it trusts and refuses any other before any payment, so requiring the caller to
+  supply it could only invite a wrong value. Leave it out; one that is supplied and differs is still
+  refused.
+
+- **The wallet now signs each request it makes to MBI's `/ext` endpoints, instead of signing its own
+  address once.** Creating and submitting a presentation, and downloading the Verified AI Birthcert,
+  used to log in with a signature over the wallet's own address. That value never changes, so one
+  captured set of headers stayed valid for that address indefinitely, and MBI has marked the scheme
+  deprecated. Each call now signs its method, path, a hash of the exact body sent, and a fresh
+  timestamp, and the signature is good for that one request. MBI has accepted this since 31 July 2026.
+  If a Verified AI Birthcert download fails at the signing step, `check_ai_birthcert_verification`
+  now reports it as a retryable fetch error instead of failing outright.
+
 ## [0.13.0] — 29 September 2026
 
 ### Added

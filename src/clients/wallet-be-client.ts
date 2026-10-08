@@ -20,6 +20,19 @@ export class WalletBeError extends Error {
   }
 }
 
+/**
+ * Wallet BE refused to sign because the policy decision service said DENY. A DECISION about the
+ * transfer, with the reason code in the message — retrying will not help. Sent as HTTP 200 with this
+ * `errorCode`, like every Wallet BE answer, so it is matched on the number and never on the message.
+ */
+export const WALLET_BE_POLICY_DENIED = 1000033
+
+/**
+ * Wallet BE could not complete the policy check, so it refused to sign (it fails closed). TRANSIENT and not a
+ * decision about the transfer: nothing was signed, and trying again shortly is right.
+ */
+export const WALLET_BE_POLICY_CHECK_UNAVAILABLE = 1000034
+
 export interface HsmSignResult {
   signBlob: string
   publicKey: string

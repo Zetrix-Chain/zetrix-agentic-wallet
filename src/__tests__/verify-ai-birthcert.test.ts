@@ -6,6 +6,7 @@ import { requestAiBirthcertVerification, checkAiBirthcertVerification, clearStuc
 import { PaymentReadinessError } from '../payment-readiness'
 import { PaymentCapError } from '../payment-guard'
 import { SsivcError } from '../clients/ssivc-client'
+import { MbiClient } from '../clients/mbi-client'
 
 // Mirrors the (unexported) noAutoRecheckMessage() in verify-ai-birthcert.ts, whose wording depends
 // on how much time is actually left on the link.
@@ -279,7 +280,7 @@ describe('requestAiBirthcertVerification', () => {
       verificationUrl: 'https://zvg.test/verify/old-tok', paymentReceipt: 'receipt-old',
     })
     getSession.mockResolvedValue({ sessionId: 's-old', status: 'issued', expiresAt: '2026-08-17T08:30:00+00:00', vcId: 'did:zid:vc-old' })
-    // BT-3009/APP-C01: the cache is empty, so the pre-payment existing-VC check resolves this
+    // APP-C01: the cache is empty, so the pre-payment existing-VC check resolves this
     // issued session's VC via MBI before deciding whether to pay — expired, so it auto-replaces.
     deps.mbi.downloadVcs.mockResolvedValue([
       { vc: { id: 'did:zid:vc-old', credentialSubject: { id: 'did:zid:owner123' }, validUntil: '2026-01-01T00:00:00Z' } },
@@ -303,7 +304,7 @@ describe('requestAiBirthcertVerification', () => {
       verificationUrl: 'https://zvg.test/verify/old-tok', paymentReceipt: 'receipt-old',
     })
     getSession.mockResolvedValue({ sessionId: 's-old', status: 'issued', expiresAt: '2026-08-17T08:30:00+00:00', vcId: 'did:zid:vc-old' })
-    // BT-3009/APP-C01: same as above — resolved as expired, so the pre-payment check auto-replaces.
+    // APP-C01: same as above — resolved as expired, so the pre-payment check auto-replaces.
     deps.mbi.downloadVcs.mockResolvedValue([
       { vc: { id: 'did:zid:vc-old', credentialSubject: { id: 'did:zid:owner123' }, validUntil: '2026-01-01T00:00:00Z' } },
     ])
@@ -521,10 +522,10 @@ async function runRequestRaw(overrides: Partial<Record<string, unknown>> = {}) {
 // subscribe_and_issue already reports a shortfall as structured `insufficientFunds` alongside its
 // prose reason. This path returned prose only, so a caller had to parse the sentence to learn which
 // asset was short and by how much — and the skill renders guidance per shortfall `reason`.
-// BT-2993: the live incident. SSIVC's expiry was labelled +08:00 (16:11:24) while the wallet's clock -
+// the live incident. SSIVC's expiry was labelled +08:00 (16:11:24) while the wallet's clock -
 // like the host agent's - is naturally UTC. The agent subtracted across the two and reported 8 hours;
 // the true window was 15 minutes. The wallet now hands over the answer itself.
-describe('session expiry is worked out by the wallet, across timezones (BT-2993)', () => {
+describe('session expiry is worked out by the wallet, across timezones', () => {
   const NOW = new Date('2026-09-24T07:56:24Z')
   const expiring = { sessionId: 's-tz', verificationUrl: 'https://zvg.test/verify/tz', expiresAt: '2026-09-24T16:11:24+08:00' }
 
@@ -693,7 +694,7 @@ describe('dryRun: quote without paying (R2)', () => {
   })
 })
 
-describe('an existing Verified Birthcert VC is checked before paying for a new one (BT-3009)', () => {
+describe('an existing Verified Birthcert VC is checked before paying for a new one', () => {
   it('no cached VC: proceeds to pay as normal', async () => {
     const { deps, pay } = makeDeps()
     deps.cache.get.mockResolvedValue(null)
@@ -1283,7 +1284,7 @@ describe('sponsored settlement retry', () => {
       expect(pay).toHaveBeenCalledTimes(1) // never re-paid
     })
 
-    // BT-2993: the agent's own gloss on this state ("this is normal", "will be picked up automatically")
+    // the agent's own gloss on this state ("this is normal", "will be picked up automatically")
     // was the other half of the confusion, so it is handed a sentence to relay instead.
     it('gives the agent a sentence to relay that claims nothing beyond sent / still processing / saved / do not pay again', async () => {
       const out = await runRequestRaw({ ssivc: queuedSsivc(1), sleep: vi.fn().mockResolvedValue(undefined) })
@@ -1305,7 +1306,7 @@ describe('sponsored settlement retry', () => {
       expect(out.message).not.toMatch(/failed|did not go through/i)
     })
 
-    // APP-M01 (BT-3009 review): the expired-VC notice was only attached to the immediately-settled
+    // APP-M01: the expired-VC notice was only attached to the immediately-settled
     // branch. Sponsored gas is the default, and a queued settlement is a normal outcome on that
     // path — dropping the note there means the holder is never told their old VC expired whenever
     // settlement doesn't clear synchronously.
@@ -2044,11 +2045,11 @@ describe('R10: the paid-this-call wording is pinned on every half of every branc
     expect(text(out)).not.toMatch(/Nothing is lost/i)
   })
 
-  // BT-2974. The young-receipt wording used to say "Nothing has gone wrong and no funds are lost" for
+  // The young-receipt wording used to say "Nothing has gone wrong and no funds are lost" for
   // ANY undetermined outcome - including 69 (SSIVC itself says it cannot confirm the settlement) and a
   // 409 blob_already_settled (which most likely means the money DID move). Neither can support that
   // sentence, and a settlement can confirm on chain after SSIVC has answered with either code
-  // (SPEC.md section 6). Pinned by TEXT, per BT-2970 R3-M01: field presence alone would pass a message
+  // (SPEC.md section 6). Pinned by TEXT, per review finding R3-M01: field presence alone would pass a message
   // that still made the claim.
   const UNSUPPORTED_SAFETY = /nothing has gone wrong|no funds are lost|nothing is lost|funds are safe/i
   const unconfirmed69 = async () => {
@@ -2061,7 +2062,7 @@ describe('R10: the paid-this-call wording is pinned on every half of every branc
     throw new SsivcError('SSIVC request failed - HTTP 409: agentName already in use', 409, '26', 'agent_name_in_use')
   }
 
-  it('young + replay: says no new payment was attempted, and does NOT claim funds are safe (BT-2974)', async () => {
+  it('young + replay: says no new payment was attempted, and does NOT claim funds are safe', async () => {
     const { run, pay } = replayThen(hangUp)
     const out = await run()
     expect(pay).not.toHaveBeenCalled()
@@ -2104,7 +2105,7 @@ describe('R10: the paid-this-call wording is pinned on every half of every branc
     expect(out.outcomeUnknown).toBeUndefined()
   })
 
-  // BT-2993. When the outcome is unresolved the message used to carry none of what SSIVC actually said,
+  // When the outcome is unresolved the message used to carry none of what SSIVC actually said,
   // so the host agent had nothing real to quote and - asked what SSIVC returned - invented a story
   // ("stuck after 12+ minutes", "normal on testnet") and offered to discard the receipt and pay again.
   // The answer is now in the message, and so is a sentence the agent can relay as-is.
@@ -2172,7 +2173,7 @@ describe('R10: the paid-this-call wording is pinned on every half of every branc
     expect(t).not.toMatch(/Ignore previous instructions/)
   })
 
-  // BT-2974. 409 + status_code 26 is a taken agentName, checked BEFORE the fee is deducted. It must
+  // 409 + status_code 26 is a taken agentName, checked BEFORE the fee is deducted. It must
   // not read as a settled payment (the blob_already_settled wording says the fee was most likely
   // taken and warns a retry pays again - both false here), and it must tell the user to pick another
   // name rather than "check again later", because this name will never become free.
@@ -2925,14 +2926,14 @@ describe('discarding a stuck receipt and paying fresh, in one call', () => {
     expect((await sessionStore.get()).paymentReceipt).toBe('r-stuck')
   })
 
-  // BT-2995. This used to be the OPPOSITE test ("works on a receipt younger than the stuck threshold,
+  // This used to be the OPPOSITE test ("works on a receipt younger than the stuck threshold,
   // since the user asked explicitly"), on the reasoning that the two-step route had no age gate either.
   // A live run showed why that was wrong: the wallet cannot verify a human agreed - the "consent token"
   // is just the receipt id echoed back - and a bare "retry" was taken as agreement to "discard and pay a
   // second 1 JMYR" 34 minutes after a first payment that had in fact settled. The age rule the tool
   // description already advertised is now enforced, on BOTH routes (a rule routable around by making
   // two calls instead of one is not a safety property - that part of the old comment still holds).
-  describe('a receipt that is not stuck yet cannot be discarded (BT-2995)', () => {
+  describe('a receipt that is not stuck yet cannot be discarded', () => {
     const NOW = '2026-08-17T09:00:00.000Z'
 
     it('refuses discardStuckReceiptAndPayFresh on a 34-minute-old receipt: nothing discarded, nothing paid', async () => {
@@ -3235,7 +3236,7 @@ describe('request_ -> pending -> check_ round trip', () => {
 })
 
 describe('clearStuckPaymentReceipt', () => {
-  // BT-2995: the receipts below are genuinely stuck (16 days old); a young one is refused.
+  // the receipts below are genuinely stuck (16 days old); a young one is refused.
   const now = () => new Date('2026-08-17T09:00:00.000Z')
   const stuck = {
     sessionId: '',
@@ -4152,7 +4153,7 @@ describe('checkAiBirthcertVerification', () => {
 
     const out = await checkAiBirthcertVerification(deps as never)
 
-    expect(deps.mbi.downloadVcs).toHaveBeenCalledWith({ address: deps.address }, { signedData: 'sig', publicKey: 'b001pk' })
+    expect(deps.mbi.downloadVcs).toHaveBeenCalledWith({ address: deps.address }, deps.messageSigner)
     expect(out).toMatchObject({ status: 'issued', vcId: 'did:zid:vc-1', vc })
     expect(deps.cache.set).toHaveBeenCalledWith('did:zid:verified-template', expect.objectContaining({
       templateId: 'did:zid:verified-template', vc, vcId: 'did:zid:vc-1', validUntil: '2028-08-13T00:00:00Z',
@@ -4270,6 +4271,31 @@ describe('checkAiBirthcertVerification', () => {
     expect(deps.quarantine.set).not.toHaveBeenCalled()
     expect(out).toMatchObject({ status: 'issued', vcId: 'did:zid:vc-1' })
     expect((out as { cacheError?: string }).cacheError).toMatch(/failed to fetch credential from MBI/i)
+  })
+
+  // Each /ext request is now signed inside MbiClient, so a Wallet BE signing failure happens during the
+  // download call rather than before it. It must take the same retryable cacheError path as any other
+  // failed fetch (not throw), and it must not send the one-shot download or touch the quarantine store.
+  it('on issued: reports a cacheError, sends no download request and writes no quarantine when signing fails', async () => {
+    const { deps, sessionStore, getSession } = makeDeps()
+    await sessionStore.set({ sessionId: 's-1', agentName: 'Procurement Assistant', createdAt: '2026-08-13T09:00:00.000Z' })
+    getSession.mockResolvedValue({ sessionId: 's-1', status: 'issued', expiresAt: '2026-08-13T09:30:00+00:00', vcId: 'did:zid:vc-1' })
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      deps.mbi = new MbiClient('https://mbi.test') as never
+      deps.messageSigner = vi.fn().mockRejectedValue(new Error('Wallet BE unavailable'))
+
+      const out = await checkAiBirthcertVerification(deps as never)
+
+      expect(fetchMock).not.toHaveBeenCalled()
+      expect(deps.quarantine.set).not.toHaveBeenCalled()
+      expect(deps.cache.set).not.toHaveBeenCalled()
+      expect(out).toMatchObject({ status: 'issued', vcId: 'did:zid:vc-1' })
+      expect((out as { cacheError?: string }).cacheError).toMatch(/failed to fetch credential from MBI.*Wallet BE unavailable/i)
+    } finally {
+      vi.unstubAllGlobals()
+    }
   })
 
   it('on issued: refuses to cache a VC with no validUntil, and reports it rather than caching silently', async () => {

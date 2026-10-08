@@ -12,6 +12,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import { createTools } from '../mcp-tools'
 import { ZTP20_V1 } from './fixtures/real-policy-templates'
+import { deriveTemplateId } from '../clients/policy-template-discovery'
 
 type Handlers = Record<string, (input?: unknown) => Promise<Record<string, unknown>>>
 
@@ -22,7 +23,7 @@ const OWNER = 'ZTX3YzAyKBxjbSaMPeaPKEBpV93wjzN4SjTaN'
 /**
  * The REAL ztp20-v1 template. Was an invented body using `x402`/`uint` and an ARRAY of
  * templateAttributeIds — a shape this repo has since confirmed on chain to be a MAP, and the exact
- * values BT-3000 names as the fiction that caused it. Left behind when the other files moved; the
+ * values that review names as the fiction that caused it. Left behind when the other files moved; the
  * only handler-level policy test is the last place it should have survived (APP-L06).
  */
 const TEMPLATE_BODY = ZTP20_V1
@@ -131,14 +132,42 @@ describe('get_policy_template_schema handler', () => {
     expect(String(result.error)).toMatch(/publisher.*policyKey|templateId/i)
   })
 
-  it('does not tell a caller to supply what they already supplied', async () => {
-    // APP-L01. With a pair given but no registry configured, the old message asked for the pair.
-    const result = await tools({ policyTemplateAddress: TEMPLATE }).get_policy_template_schema({
+  it('reads a publisher + key through the Template contract when no Registry is configured', async () => {
+    // The tool promises that { policyKey } (or a pair) works. With only the Template contract
+    // configured it used to answer "needs the policy registry"; it now reads the same template by its
+    // derived id, and never asks the caller to supply what they already supplied.
+    const chainQuery = vi.fn().mockResolvedValue(rets(JSON.stringify(TEMPLATE_BODY)))
+    const result = await tools({ policyTemplateAddress: TEMPLATE }, chainQuery).get_policy_template_schema({
       publisher: OWNER,
       policyKey: 'ztp20-v1',
     })
-    expect(String(result.error)).toMatch(/registry/i)
-    expect(String(result.error)).not.toMatch(/Provide either/i)
+    expect(result.found).toBe(true)
+    expect(result.declared).toContainEqual({ name: 'cumulativeMax', type: 'NUMBER' })
+    expect(String(result.error ?? '')).not.toMatch(/registry|Provide either/i)
+    // Read through getTemplateById on the Template contract, with the id derived from the pair.
+    const first = JSON.parse((chainQuery.mock.calls[0][0] as { input: string }).input)
+    expect(first.method).toBe('getTemplateById')
+    expect(first.params.templateId).toBe(deriveTemplateId(OWNER, 'ztp20-v1'))
+    expect((chainQuery.mock.calls[0][0] as { contractAddress: string }).contractAddress).toBe(TEMPLATE)
+  })
+
+  it('reports a template that is not there as not found, with no Registry configured', async () => {
+    const chainQuery = vi.fn().mockResolvedValue(rets(JSON.stringify({ found: false })))
+    const result = await tools({ policyTemplateAddress: TEMPLATE }, chainQuery).get_policy_template_schema({
+      publisher: OWNER,
+      policyKey: 'nope-v1',
+    })
+    expect(result.found).toBe(false)
+  })
+
+  it('reports a failed read as an error, never as not found, with no Registry configured', async () => {
+    const chainQuery = vi.fn().mockRejectedValue(new Error('ECONNRESET'))
+    const result = await tools({ policyTemplateAddress: TEMPLATE }, chainQuery).get_policy_template_schema({
+      publisher: OWNER,
+      policyKey: 'ztp20-v1',
+    })
+    expect(result).toHaveProperty('error')
+    expect(result.found).toBeUndefined()
   })
 
   it('surfaces templateAttributeIds from the Registry route', async () => {

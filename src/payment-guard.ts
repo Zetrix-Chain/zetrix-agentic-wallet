@@ -196,7 +196,11 @@ export interface PaymentCapDescription {
   asset: string
   /** The limit that applies, in raw base units. `null` means none applies — see `matchedKey`. */
   capRaw: string | null
-  /** The key the limit came from, `'*'` for the fallback, or `null` when nothing applies. */
+  /**
+   * The key the limit came from, `'*'` for the fallback, `'policy'` when the owner's spending policy governs the asset
+   * and the default wallet cap is not applied (`capRaw` is then `null` and `wouldPass` true; Wallet BE decides), or
+   * `null` when nothing applies.
+   */
   matchedKey: string | null
   /** Whether `requiredRaw` would be permitted. */
   wouldPass: boolean
@@ -229,10 +233,28 @@ export function describePaymentCap(
   return { asset, capRaw, matchedKey, wouldPass }
 }
 
+/** What the read-only reports say for an asset the owner's spending policy governs. */
+export function describePolicyGovernedCap(asset: string): PaymentCapDescription {
+  return { asset, capRaw: null, matchedKey: 'policy', wouldPass: true }
+}
+
 /** The single place "which cap key applies" is decided, shared by the enforcer and the describer. */
 function resolveCap(asset: string, caps: Record<string, string>): { capRaw: string | undefined; matchedKey: string } {
   const explicit = caps[asset]
   return explicit !== undefined ? { capRaw: explicit, matchedKey: asset } : { capRaw: caps['*'], matchedKey: '*' }
+}
+
+/**
+ * The amount a 402 challenge asks for must be a plain non-negative integer string. Split out of the cap check so it can run
+ * on its own: a spending policy that governs the asset stands the CAP aside, and a malformed amount must still be
+ * refused before it reaches the payment engine. Returns the validated amount.
+ */
+export function assertValidAmount(accept: PaymentRequirement): string {
+  const requiredRaw = accept.maxAmountRequired ?? '0'
+  if (!isNonNegativeIntegerString(requiredRaw)) {
+    throw new PaymentCapError(`payment blocked: maxAmountRequired "${requiredRaw}" is not a non-negative integer string`)
+  }
+  return requiredRaw
 }
 
 export function assertWithinPaymentCap(accept: PaymentRequirement, caps: Record<string, string> | undefined): void {
@@ -244,10 +266,7 @@ export function assertWithinPaymentCap(accept: PaymentRequirement, caps: Record<
     throw new PaymentCapError(`payment blocked: no MAX_PAYMENT_AMOUNT entry for asset "${asset}" and no "*" fallback configured`)
   }
 
-  const requiredRaw = accept.maxAmountRequired ?? '0'
-  if (!isNonNegativeIntegerString(requiredRaw)) {
-    throw new PaymentCapError(`payment blocked: maxAmountRequired "${requiredRaw}" is not a non-negative integer string`)
-  }
+  const requiredRaw = assertValidAmount(accept)
 
   const required = BigInt(requiredRaw)
   const cap = BigInt(capRaw)

@@ -11,7 +11,7 @@
  * resource and settles asynchronously afterwards — on a write that would put a policy on chain
  * nobody paid for. Phase 2 ends in a 202 with NOTHING WRITTEN, and only a confirmed settlement in
  * phase 3 produces a policy. The wallet's side of that bargain is that a 202 is never reported as
- * a failure (the ticket's AC #1).
+ * a failure.
  *
  * WHAT THIS FILE DOES NOT DO, and the reason the ticket calls it assembly rather than capability:
  * no blob building, no permit digest, no canonical-attributes JSON, no node submission. ms-zetrix
@@ -20,7 +20,7 @@
  * TypeScript would have to match the contract's re-serialisation byte for byte, and a one-byte
  * difference is an invalid signature discovered only after gas is spent.
  *
- * FOUR PLACES WHERE THE SERVER DIFFERS FROM THE TICKET'S TEXT, all read from `developv2` 2026-09-28
+ * FOUR PLACES WHERE THE SERVER DIFFERS FROM THE SPEC'S TEXT, all read from `developv2` 2026-09-28
  * and all recorded on the ticket:
  *
  *   1. Phase 3 requires `ownerHsmPassword`, which AC #8 says it must not send. The server signs
@@ -45,12 +45,14 @@ export type PrecheckResult =
   | { kind: 'payment_required'; challenge: PaymentChallenge }
   /** This owner already has a policy under that key. A real refusal; no payment was attempted. */
   | { kind: 'already_exists'; detail: string }
+  /** POLICY_PAID_WRITE_IN_FLIGHT: a paid write for this policy is still being completed and no receipt came with it. Not "it exists". */
+  | { kind: 'in_progress'; detail: string }
   /**
    * ALREADY PAID FOR — collect it. The server returns the existing receipt rather than a fresh
    * 402, because "a settlement that hangs must never turn into a second charge". This is also how
    * a wallet that lost its bookmark gets it back, so it is a RECOVERY path, not a failure.
    */
-  | { kind: 'already_in_flight'; blobId: string; detail: string }
+  | { kind: 'already_in_flight'; blobId: string; operation?: 'CREATE' | 'UPDATE'; detail: string }
   /** Malformed, or refused by the write validator. Free, and paying would not have helped. */
   | { kind: 'refused'; status: number; detail: string }
   /** We could not tell. Never treated as "no policy exists" and never as permission to pay. */
@@ -96,11 +98,84 @@ export type CollectResult =
    * A status this flow does not define — a 404 or 410 for a receipt the sweeper has already
    * cleared, say. TERMINAL, not retryable: round 1 reported it as `unreachable`, which made the
    * poll loop keep going and re-present the HSM password each time. The server's retry series is
-   * six keys wide and a failure consumes one (the ticket), so a client that retries into an
+   * six keys wide and a failure consumes one, so a client that retries into an
    * unrecognised status can exhaust the series for a write that has already been paid for.
    */
   | { kind: 'unrecognised'; status: number; detail: string }
+  /**
+   * A 5xx that is NOT the service reporting a money state. The service's own 502 and 504 always
+   * carry JSON with `state: "WRITE_FAILED"` / `"UNKNOWN"`; anything else — a Spring default error
+   * body, a Cloudflare "origin returned an invalid response" page, a bare 503 — means the result
+   * of the write was NEVER SEEN. `gateway` is true when something in front of the service answered
+   * instead of it. Reading a gateway 502 as the service's "the chain rejected it" tells a user a
+   * paid write failed on chain when nobody knows what happened to it.
+   */
+  | { kind: 'server_error'; status: number; gateway: boolean; detail: string }
   | { kind: 'unreachable'; detail: string }
+
+/** What an UPDATE records when the payment is taken. No template fields (the server carries the current one forward) and no requestKey (the server derives it). */
+export interface UpdateRequest {
+  ownerAddress: string
+  policyKey: string
+  /** The full replacement set. */
+  attributes: Array<{ attributeName: string; attributeType?: string; value: string }>
+  /** Sent as given, never defaulted: an omitted bound would strip an existing one. */
+  validFromBlock?: string
+  validToBlock?: string
+  /** The policy's `updatedAtBlock` as the caller read it, as a string. A mismatch is refused before any charge. */
+  expectedUpdatedAtBlock: string
+}
+
+/** Which paid route a payment or a receipt belongs to. */
+export type WriteRoute = 'adopt-template' | 'update'
+
+/** Phase 1 of an update — free. Everything but `payment_required` means nothing was asked of the wallet's money. */
+export type UpdatePrecheckResult =
+  | { kind: 'payment_required'; challenge: PaymentChallenge }
+  /** A paid write for this policy is waiting to be collected. `operation` says which write the receipt pays for; it may not be the one just asked for. */
+  | { kind: 'already_in_flight'; blobId: string; operation?: 'CREATE' | 'UPDATE'; detail: string }
+  /** POLICY_KEY_NOT_FOUND: there is nothing to update. */
+  | { kind: 'not_found'; detail: string }
+  /** POLICY_MODIFIED: the policy changed since `expectedUpdatedAtBlock` was read. */
+  | { kind: 'modified'; detail: string }
+  /** POLICY_TEMPLATE_NOT_FOUND: the template the policy references no longer exists. */
+  | { kind: 'template_unavailable'; detail: string }
+  /** POLICY_PAID_WRITE_IN_FLIGHT: a write for this policy is still in progress, and no receipt came with it. */
+  | { kind: 'in_progress'; detail: string }
+  | { kind: 'refused'; status: number; detail: string }
+  | { kind: 'unreachable'; detail: string }
+
+/** The free remove. `submitted` is NOT removed: only a chain read showing the policy gone says that. */
+export type RemoveResult =
+  | { kind: 'submitted'; txHash?: string; policyKey?: string; state?: string; retryAfterSeconds: number }
+  /** There was no such policy: it never existed, or it has already been removed. */
+  | { kind: 'not_found'; detail: string }
+  /** A paid update for this policy has not been collected yet. */
+  | { kind: 'in_progress'; detail: string }
+  | { kind: 'refused'; status: number; detail: string }
+  | { kind: 'server_error'; status: number; gateway: boolean; detail: string }
+  /** A 2xx that is not the documented 202: whether the removal went through is NOT known. */
+  | { kind: 'unrecognised'; status: number; detail: string }
+  | { kind: 'unreachable'; detail: string }
+
+/** The service's numeric error codes (ms-zetrix `ErrorCode`), as they arrive in `messages[].errorCode`. */
+const ERROR_POLICY_MODIFIED = 461503
+const ERROR_POLICY_KEY_NOT_FOUND = 461505
+const ERROR_POLICY_TEMPLATE_NOT_FOUND = 461512
+const ERROR_PAID_WRITE_IN_FLIGHT = 461529
+
+/** The first numeric `errorCode` in the service's error envelope `{ messages: [{ errorCode, message }] }`. */
+function errorCodeOf(body: string): number | undefined {
+  // `messages` is only trusted when it really is an array: a string, object or number there (a gateway, a non-standard body)
+  // has no `.find`, and this runs after a payment may have been presented, so it must never throw.
+  const messages = (parseJson<unknown>(body) as { messages?: unknown } | null | undefined)?.messages
+  if (!Array.isArray(messages)) return undefined
+  for (const m of messages) {
+    const code = (m as { errorCode?: unknown } | null)?.errorCode
+    if (typeof code === 'number') return code
+  }
+  return undefined
+}
 
 /** Mirrors `fetch`, injected so tests exercise the status handling rather than the network. */
 export type HttpSend = (
@@ -156,16 +231,21 @@ export class PolicyWriteClient {
     }
 
     if (res.status === 409) {
-      const body = parseJson<{ state?: string; receipt?: string; detail?: string }>(res.body)
+      const body = parseJson<{ state?: string; receipt?: string; operation?: string; detail?: string }>(res.body)
       // Two meanings, and they could not be further apart: one says the write is impossible, the
       // other says it is already bought and waiting to be collected.
       if (body?.state === 'ALREADY_IN_FLIGHT' && typeof body.receipt === 'string' && body.receipt !== '') {
         return {
           kind: 'already_in_flight',
           blobId: body.receipt,
+          // Which write the receipt pays for. It may not be the one just asked for, and it decides the collect route.
+          ...(body.operation === 'CREATE' || body.operation === 'UPDATE' ? { operation: body.operation } : {}),
           detail: body.detail ?? 'this write has already been paid for — collect it',
         }
       }
+      // POLICY_PAID_WRITE_IN_FLIGHT (461529): a paid write for this policy is still being completed and no receipt came with
+      // it. That is not "the policy already exists", and "nothing was paid" is NOT true of it.
+      if (errorCodeOf(res.body) === ERROR_PAID_WRITE_IN_FLIGHT) return { kind: 'in_progress', detail: describe(res.status, res.body) }
       return { kind: 'already_exists', detail: body?.detail ?? clip(res.body) }
     }
 
@@ -179,10 +259,10 @@ export class PolicyWriteClient {
 
   /**
    * Phase 2. The payment header is built by the wallet's own payment path — this client never
-   * signs anything and never sees the HSM password.
+   * signs anything and never sees the HSM password. `route` is the paid route being paid for; it defaults to the create.
    */
-  async pay(request: AdoptTemplateRequest, paymentHeader: string): Promise<PayResult> {
-    const res = await this.post('/pay/policy/adopt-template', request, { [HEADER_PAYMENT]: paymentHeader })
+  async pay(request: AdoptTemplateRequest | UpdateRequest, paymentHeader: string, route: WriteRoute = 'adopt-template'): Promise<PayResult> {
+    const res = await this.post(`/pay/policy/${route}`, request, { [HEADER_PAYMENT]: paymentHeader })
     if (!res.reached) return { kind: 'unreachable', detail: res.detail }
 
     if (res.status === 202) {
@@ -223,9 +303,14 @@ export class PolicyWriteClient {
    * Phase 3. Takes the password because the server signs the permit here and cannot without it —
    * see the file header. It is used for this one call and never stored.
    */
-  async collect(blobId: string, ownerAddress: string, ownerHsmPassword: string): Promise<CollectResult> {
+  async collect(
+    blobId: string,
+    ownerAddress: string,
+    ownerHsmPassword: string,
+    operation: 'CREATE' | 'UPDATE' = 'CREATE',
+  ): Promise<CollectResult> {
     const res = await this.post(
-      '/pay/policy/adopt-template/collect',
+      operation === 'UPDATE' ? '/pay/policy/update/collect' : '/pay/policy/adopt-template/collect',
       { ownerAddress, ownerHsmPassword },
       { [HEADER_RECEIPT]: blobId },
     )
@@ -246,12 +331,123 @@ export class PolicyWriteClient {
         : { kind: 'settling', retryAfterSeconds: retryAfter, detail }
     }
     if (res.status === 402) return { kind: 'void', detail }
-    if (res.status === 502) return { kind: 'write_failed', txHash: body?.txHash, detail }
-    if (res.status === 504) return { kind: 'unknown', detail }
+    // 502 and 504 are the SERVICE's only when its body says so. A bare status code is not enough: a
+    // proxy in front of it returns the same codes with an HTML page, and for 502 that is the
+    // difference between "the chain rejected the write" and "we never heard back".
+    const serviceState = typeof body?.state === 'string' ? body.state : undefined
+    if (res.status === 502 && serviceState === 'WRITE_FAILED') return { kind: 'write_failed', txHash: body?.txHash, detail }
+    if (res.status === 504 && serviceState === 'UNKNOWN') return { kind: 'unknown', detail }
+    // The service answered with a state this wallet does not know: its word, but not one we can read.
+    // Unrecognised (terminal, receipt kept), NOT a gateway fault — nothing intervened.
+    if (res.status >= 500 && serviceState !== undefined) {
+      return { kind: 'unrecognised', status: res.status, detail: `unexpected ${res.status} from collect: ${clip(res.body)}` }
+    }
+    if (res.status >= 500) {
+      const html = looksLikeHtml(res.body)
+      const gateway = serviceState === undefined && (html || [502, 503, 504].includes(res.status) || res.status >= 520)
+      return {
+        kind: 'server_error',
+        status: res.status,
+        gateway,
+        // An HTML error page is markup, not a message: show its text, bounded.
+        detail: html ? clip(stripTags(res.body), 160) : clip(res.body),
+      }
+    }
 
     // Anything else is not a state this flow defines, and it is NOT an outage — the service
     // answered. Terminal, so the caller stops rather than spending another retry key on it.
     return { kind: 'unrecognised', status: res.status, detail: `unexpected ${res.status} from collect: ${clip(res.body)}` }
+  }
+
+  /**
+   * Phase 1 of an UPDATE. Free, and it never sends a payment header. The same shape as {@link precheck}, with the
+   * refusals an update adds: the policy is not there, it changed since `expectedUpdatedAtBlock` was read, or the
+   * template it references is gone. Each of those is answered BEFORE any charge, so none of them can cost money.
+   */
+  async precheckUpdate(request: UpdateRequest): Promise<UpdatePrecheckResult> {
+    const res = await this.post('/pay/policy/update', request)
+    if (!res.reached) return { kind: 'unreachable', detail: res.detail }
+
+    if (res.status === 402) {
+      const challenge = parseJson<PaymentChallenge>(res.body)
+      if (!challenge || !Array.isArray(challenge.accepts) || challenge.accepts.length === 0) {
+        return { kind: 'unreachable', detail: `the 402 carried no usable terms: ${clip(res.body)}` }
+      }
+      return { kind: 'payment_required', challenge }
+    }
+
+    const code = errorCodeOf(res.body)
+    const detail = describe(res.status, res.body)
+
+    if (res.status === 409) {
+      const body = parseJson<{ state?: string; receipt?: string; operation?: string; detail?: string }>(res.body)
+      if (body?.state === 'ALREADY_IN_FLIGHT' && typeof body.receipt === 'string' && body.receipt !== '') {
+        return {
+          kind: 'already_in_flight',
+          blobId: body.receipt,
+          ...(body.operation === 'CREATE' || body.operation === 'UPDATE' ? { operation: body.operation } : {}),
+          detail: body.detail ?? 'a paid write for this policy is waiting to be collected',
+        }
+      }
+      if (code === ERROR_POLICY_MODIFIED) return { kind: 'modified', detail }
+      if (code === ERROR_PAID_WRITE_IN_FLIGHT) return { kind: 'in_progress', detail }
+      return { kind: 'refused', status: res.status, detail }
+    }
+    if (res.status === 404) {
+      if (code === ERROR_POLICY_KEY_NOT_FOUND) return { kind: 'not_found', detail }
+      if (code === ERROR_POLICY_TEMPLATE_NOT_FOUND) return { kind: 'template_unavailable', detail }
+      return { kind: 'refused', status: res.status, detail }
+    }
+    if (res.status >= 200 && res.status < 300) {
+      return { kind: 'unreachable', detail: `unexpected ${res.status} from the free pre-check: ${clip(res.body)}` }
+    }
+    // A 5xx or a gateway page is the service not answering, not a refusal of this update. Nothing was paid either way.
+    if (res.status >= 500) {
+      return { kind: 'unreachable', detail: `the service answered HTTP ${res.status} instead of a decision: ${looksLikeHtml(res.body) ? clip(stripTags(res.body), 160) : detail}` }
+    }
+    return { kind: 'refused', status: res.status, detail }
+  }
+
+  /**
+   * The free, one-call REMOVE (`POST /pay/policy/remove`). No payment and no collect: the permit is signed in this
+   * call, so the password travels with it and is used for this call alone.
+   *
+   * A 202 means SUBMITTED. The policy is gone only once the block confirms it, and the server says the same: "read it
+   * back to be sure". Repeating the call never submits a second removal, so a retry is safe.
+   */
+  async remove(ownerAddress: string, policyKey: string, ownerHsmPassword: string): Promise<RemoveResult> {
+    const res = await this.post('/pay/policy/remove', { ownerAddress, policyKey, ownerHsmPassword })
+    if (!res.reached) return { kind: 'unreachable', detail: res.detail }
+
+    if (res.status === 202) {
+      const body = parseJson<{ state?: string; policyKey?: string; txHash?: string }>(res.body)
+      return {
+        kind: 'submitted',
+        ...(typeof body?.txHash === 'string' ? { txHash: body.txHash } : {}),
+        ...(typeof body?.policyKey === 'string' ? { policyKey: body.policyKey } : {}),
+        ...(typeof body?.state === 'string' ? { state: body.state } : {}),
+        retryAfterSeconds: retrySeconds(res.headers.get('Retry-After')),
+      }
+    }
+
+    const code = errorCodeOf(res.body)
+    const detail = describe(res.status, res.body)
+    if (res.status === 404 && code === ERROR_POLICY_KEY_NOT_FOUND) return { kind: 'not_found', detail }
+    if (res.status === 409 && code === ERROR_PAID_WRITE_IN_FLIGHT) return { kind: 'in_progress', detail }
+    // A 2xx that is not the documented 202 may well mean the removal went through: it is UNKNOWN, never "nothing was removed".
+    if (res.status >= 200 && res.status < 300) {
+      return { kind: 'unrecognised', status: res.status, detail: `unexpected ${res.status} from remove: ${clip(res.body)}` }
+    }
+    if (res.status >= 500) {
+      const html = looksLikeHtml(res.body)
+      return {
+        kind: 'server_error',
+        status: res.status,
+        gateway: html || [502, 503, 504].includes(res.status) || res.status >= 520,
+        detail: html ? clip(stripTags(res.body), 160) : detail,
+      }
+    }
+    return { kind: 'refused', status: res.status, detail }
   }
 
   private async post(
@@ -293,11 +489,35 @@ function retrySeconds(header: string | null): number {
 }
 
 function describe(status: number, body: string): string {
-  const detail = parseJson<{ detail?: string; message?: string }>(body)
-  return detail?.detail ?? detail?.message ?? `HTTP ${status}${body ? `: ${clip(body)}` : ''}`
+  const parsed = parseJson<unknown>(body)
+  const obj = parsed !== null && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : undefined
+  const text = (v: unknown): string | undefined => (typeof v === 'string' && v !== '' ? v : undefined)
+  // The service's error envelope keeps its words in messages[].message. Only an ARRAY is read (see errorCodeOf), and a
+  // malformed one falls through to the next source instead of throwing: this is called after a payment may have been presented.
+  let fromEnvelope: string | undefined
+  if (Array.isArray(obj?.messages)) {
+    for (const m of obj.messages as unknown[]) {
+      const t = text((m as { message?: unknown } | null)?.message)
+      if (t !== undefined) {
+        fromEnvelope = t
+        break
+      }
+    }
+  }
+  return text(obj?.detail) ?? text(obj?.message) ?? (fromEnvelope !== undefined ? clip(fromEnvelope) : undefined) ?? `HTTP ${status}${body ? `: ${clip(body)}` : ''}`
 }
 
 /** Upstream text reaches an LLM agent as tool output, so it is bounded here rather than downstream. */
+/** Does this body look like an HTML page rather than the JSON this API speaks? */
+function looksLikeHtml(text: string): boolean {
+  return /^\s*<(!doctype|html|head|body)\b/i.test(text)
+}
+
+/** Text content of an HTML page, whitespace collapsed. Good enough to quote, not to parse. */
+function stripTags(html: string): string {
+  return html.replace(/<(script|style)[\s\S]*?<\/\1>/gi, ' ').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim()
+}
+
 function clip(text: string, max = 200): string {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text
 }

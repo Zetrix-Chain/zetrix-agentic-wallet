@@ -3,10 +3,13 @@
  * window is left out.
  *
  * SOURCE: `Windows.java` (and `AttributeClassifier`, `strategy/impl/*Evaluator`) in the ms-zetrix
- * policy registry. These rules are NOT served by any API — `GET /policy/vocabulary` returns only
- * `{name, type, appliesTo}`, a projection of `AttributeName.values()` with no pairing information
- * at all — so they are hardcoded here by the decision of 2026-09-21, to avoid blocking work that
- * can otherwise start immediately.
+ * policy registry. They were hardcoded here by the decision of 2026-09-21 because no API served them.
+ * Since 2026-10 `GET /policy/vocabulary` does (`pairsWith`, `withoutPairMeans`, `emptyMeans`, `role`),
+ * and the wallet reads it when it can. These copies remain as the FALLBACK when that read
+ * fails — a Cloudflare challenge, a timeout, an unknown version — and as the thing the tests compare
+ * the recorded vocabulary against, so a disagreement is visible instead of silent. One is pinned in
+ * `policy-vocabulary-checks.test.ts`: the service says `maxTransactionCount` without `countWindow` is
+ * UNENFORCEABLE, while the rule below says `not-requested`.
  *
  * Because they are a copy, `src/__tests__/policy-window-rules.test.ts` pins all three verbatim and
  * names this source. That is a TRIPWIRE, NOT A GUARANTEE: there is no shared CI between the two
@@ -14,9 +17,8 @@
  * notices; it does not ensure it. See the policy write review for what an untripwired copied rule cost last time —
  * a javadoc claiming cross-repo agreement that had not been true for a long while.
  *
- * The real fix is to extend `/policy/vocabulary` with `pairsWith` / `pairingRule` /
- * `withoutPairMeans` / `emptyMeans`, derived from the evaluators rather than hand-maintained, with
- * tests that die when the served data and `Windows`/`SpendAggregator` diverge. Not ticketed yet.
+ * `not-requested` is no longer a quiet interpretation: preflight refuses a cap with that outcome, because the owner
+ * does not get the limit they wrote.
  */
 
 /**
@@ -99,6 +101,10 @@ export const INFORMATIONAL_ATTRIBUTES: ReadonlySet<string> = new Set(['approvalP
 export const QUALIFIER_ATTRIBUTES: ReadonlySet<string> = new Set([
   'assetScope',
   'unknownAttributePolicy',
+  // The service's vocabulary calls it a QUALIFIER (it says WHICH token a policy governs and caps nothing
+  // itself). It was missing here until this set was compared this set with the recorded vocabulary, so a
+  // policy of `assetScope` + `tokenAddress` alone counted as having an enforceable constraint.
+  'tokenAddress',
   ...WINDOW_RULES.map((rule) => rule.window),
 ])
 

@@ -8,6 +8,7 @@
 
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { checkVerifyLinkTemplate } from './verify-link-template.js'
 import { parsePaymentCaps } from './payment-guard.js'
 import type { GasPreference } from './accept-selection.js'
 
@@ -68,6 +69,19 @@ export interface AgenticWalletConfig {
    */
   policyTemplateAddress?: string
   /**
+   * The publisher whose templates this wallet offers by default.
+   *
+   * Without one, a wallet with no deployed policy cannot find a template at all: a template id
+   * is derived from the publisher, and the only other place the wallet could learn one was
+   * "inside a deployed policy", which a first-time user does not have. The agent ended up asking
+   * the user for an address the user has no way to know.
+   *
+   * Derived per network like the other policy addresses, and absent where the policy module is
+   * not deployed — a guessed publisher on such a network would read as "this publisher has no
+   * templates" rather than "there is no policy system here". POLICY_TEMPLATE_PUBLISHER overrides.
+   */
+  policyTemplatePublisher?: string
+  /**
    * Base URL of the Policy DECISION service (ms-zetrix). Separate from every other URL here
    * because it is the one endpoint the wallet cannot currently reach: `/policy/**` carries no
    * entry in the server's `PUBLIC_PATHS`, so it inherits `anyRequest().authenticated()`, and this
@@ -75,6 +89,13 @@ export interface AgenticWalletConfig {
    * developer points it at a reachable instance today.
    */
   policyDecisionUrl?: string
+  /**
+   * The link create_verification_qr hands the user, with `{referenceId}` where the MBI reference id goes —
+   * MyID's universal link, so a phone without the app is sent to the store. On testnet it defaults to the UAT link (see
+   * deriveMyidVerifyLinkTemplate). On mainnet there is **no default** until MyID's production side is verified, and the tool
+   * then refuses before it creates anything on MBI. MYID_VERIFY_LINK_TEMPLATE overrides either.
+   */
+  myidVerifyLinkTemplate?: string
   /**
    * `Authorization` header value for the decision service, when one is available. Optional on
    * purpose: with none, the call is still made and the 401 is reported as "we could not tell",
@@ -85,7 +106,7 @@ export interface AgenticWalletConfig {
    * Base URL of the pay-gated policy WRITE endpoint.
    *
    * Public by construction: the two paths live under `/pay/**`, which is gated by on-chain
-   * payment rather than by a JWT, and the ticket confirmed exactly
+   * payment rather than by a JWT, and a bug exposed exactly
    * `/api/pay/policy/adopt-template` and `…/collect` through ms-public-proxy on 2026-09-24 —
    * two exact paths, deliberately not a `/policy/**` wildcard.
    *
@@ -98,15 +119,21 @@ export interface AgenticWalletConfig {
   zidResolverBaseUrl: string
   /**
    * Per-asset x402 auto-pay ceiling, asset -> max raw-unit string, `"*"` as fallback.
-   * Defaults to `{ "*": "0" }` — every payment is refused until a cap is set explicitly.
+   * Defaults to 1 JMYR per call (the JMYR contract of the active network) and refuses every other asset; an explicit
+   * `MAX_PAYMENT_AMOUNT` replaces it. Mainnet now has the same default as testnet.
    * See src/payment-guard.ts.
    */
   maxPaymentAmount: Record<string, string>
   /**
+   * True when `MAX_PAYMENT_AMOUNT` was set. An explicit cap is the user's own limit and is never bypassed by a spending
+   * policy; only the DEFAULT caps stand aside for an asset the policy governs.
+   */
+  paymentCapsExplicit: boolean
+  /**
    * The cap for credential issuance specifically (`subscribe_and_issue`, Verified AI Birthcert).
-   * Identical to `maxPaymentAmount` whenever `MAX_PAYMENT_AMOUNT` is set; when it is not, this one
-   * permits the credential fee on mainnet while `maxPaymentAmount` keeps `pay_and_fetch`
-   * fail-closed there. See `defaultCredentialIssuanceCaps`.
+   * Identical to `maxPaymentAmount` whenever `MAX_PAYMENT_AMOUNT` is set. When it is not, the two defaults are now the
+   * same too (1 JMYR per call); they were different on mainnet, where `maxPaymentAmount` kept `pay_and_fetch`
+   * fail-closed. See `defaultCredentialIssuanceCaps`.
    */
   credentialIssuanceCaps: Record<string, string>
   /**
@@ -169,6 +196,32 @@ function deriveWalletBeUrl(network: string): string {
     : 'https://wallet-api.zetrix.com/server'
 }
 
+/**
+ * MyID's production universal link, as MyID stated it. UNVERIFIED: not read from the host, and not deployed when it was recorded.
+ * Kept as a named constant so confirming it later is a one-line change (return it from deriveMyidVerifyLinkTemplate's mainnet
+ * branch) and so a test pins the exact string.
+ */
+export const UNVERIFIED_MAINNET_MYID_VERIFY_LINK_TEMPLATE = 'https://myid-verifier.zetrix.com/api/agentic-verify?referenceId={referenceId}'
+
+/**
+ * MyID's universal link for create_verification_qr, per network.
+ *
+ * TESTNET (UAT): read from the MyID app's own registration, not from a description of it. ssivc-api-uat.myegdev.com publishes
+ * an apple-app-site-association that claims exactly `/api/agentic-verify` with a `referenceId` query (and an assetlinks.json
+ * for com.zetrix.myid.uat), and serves a "open this on your phone" page at that address. The first link the wallet was given,
+ * `/v1/agent-verification/{referenceId}`, is claimed by neither: the phone opened the browser and the server answered 404.
+ *
+ * MAINNET: deliberately none, so create_verification_qr refuses before it creates anything on MBI rather than store a presentation
+ * behind a link nobody can open. MyID has stated `https://myid-verifier.zetrix.com/api/agentic-verify?referenceId={referenceId}`
+ * (see {@link UNVERIFIED_MAINNET_MYID_VERIFY_LINK_TEMPLATE}), but their production side was not deployed and the host sits behind a
+ * Cloudflare browser check, so its association files could not be read. Do NOT wire the constant into this function's return
+ * value until the host publishes apple-app-site-association and assetlinks.json for the production app and serves the "open on your
+ * phone" page. MYID_VERIFY_LINK_TEMPLATE is the way to opt in before then.
+ */
+function deriveMyidVerifyLinkTemplate(network: string): string | undefined {
+  return network.includes('testnet') ? 'https://ssivc-api-uat.myegdev.com/api/agentic-verify?referenceId={referenceId}' : undefined
+}
+
 function deriveMbiBaseUrl(network: string): string {
   return network.includes('testnet') ? 'https://mbi-vc-sandbox.zetrix.com' : 'https://mbi-vc.zetrix.com'
 }
@@ -219,6 +272,17 @@ export function derivePolicyWriteUrl(network: string): string | undefined {
   return isTestnet(network) ? 'https://public-api-sandbox.zetrix.com/api' : undefined
 }
 
+/**
+ * The publisher of the two deployed testnet templates, `native-v1` and `ztp20-v1`.
+ *
+ * Read from chain 2026-09-30: `listTemplateKeys` for this address returns both keys, and both
+ * derived ids resolve through `getTemplateById`. Undefined off testnet for the same reason as
+ * {@link derivePolicyRegistryAddress}.
+ */
+export function derivePolicyTemplatePublisher(network: string): string | undefined {
+  return isTestnet(network) ? 'ZTX3QFo5oc3Ep8rdJZKgfPDFNN29qjxn5ofED' : undefined
+}
+
 export function derivePolicyTemplateAddress(network: string): string | undefined {
   return isTestnet(network) ? 'ZTX3WfTbuZwsLQDWe4f7mzrfULiNdDU84BLJ5' : undefined
 }
@@ -267,18 +331,19 @@ const TOKEN_REGISTRY: Record<string, { testnet: string; mainnet: string }> = {
  * The GENERAL spending cap applied when `MAX_PAYMENT_AMOUNT` is unset — the ceiling on
  * `pay_and_fetch`, which auto-pays whatever an arbitrary URL demands behind a 402.
  *
- * **Mainnet stays refuse-all here, deliberately.** `pay_and_fetch` is the confused-deputy surface:
- * a prompt-injected or misled agent can point it at a hostile endpoint, and a permissive default
- * would auto-pay real value with nobody having configured anything. That is the attack
- * `payment-guard.ts` exists to close, and no default should reopen it. Testnet keeps the credential
- * fee allowance because the funds are worthless there.
+ * **Mainnet now carries the same default as testnet: 1 JMYR per call, everything else refused.** This was
+ * refuse-all on mainnet, deliberately, because `pay_and_fetch` is the confused-deputy surface: a prompt-injected or
+ * misled agent can point it at a hostile endpoint, and a permissive default auto-pays real value with nobody having
+ * configured anything. Giving mainnet the same default is a deliberate decision; what it
+ * costs is that an unconfigured mainnet wallet can now be made to pay up to 1 JMYR per call to an arbitrary URL, with no
+ * running total. An explicit `MAX_PAYMENT_AMOUNT` replaces it, and a spending policy for JMYR stands it aside.
  *
  * The narrower credential allowance lives in {@link defaultCredentialIssuanceCaps} — see its note
  * for why the two are separate.
  */
 function defaultPaymentCaps(network: string): Record<string, string> {
   const jmyr = resolveTokenAddress('JMYR', network)
-  return isTestnet(network) && jmyr ? { [jmyr]: '1000000', '*': '0' } : { '*': '0' }
+  return jmyr ? { [jmyr]: '1000000', '*': '0' } : { '*': '0' }
 }
 
 /**
@@ -289,12 +354,13 @@ function defaultPaymentCaps(network: string): Record<string, string> {
  * limit nobody had told them about. Both networks now allow exactly the AI Birthcert fee (1 JMYR)
  * under JMYR's per-network address, and nothing else.
  *
- * **Why this is separate from {@link defaultPaymentCaps}.** The product decision was that a first
+ * **Why this was separate from {@link defaultPaymentCaps}.** The product decision was that a first
  * credential should work out of the box on mainnet too — the requirement's own words are "so user
  * can apply the first VC without any issue". Granting that through the shared cap would also have
- * handed the same allowance to `pay_and_fetch` against any URL on earth, which nobody asked for and
- * which is the one direction that carries real risk. Scoping it to issuance delivers the ask
- * without reopening that surface.
+ * handed the same allowance to `pay_and_fetch` against any URL on earth, so it was scoped to issuance
+ * to keep that surface closed. The general cap was then given the same default (1 JMYR per call) on
+ * both networks, deliberately (see above), so that surface IS open to that amount now; the two
+ * functions stay separate so they can diverge again.
  *
  * Still true, and worth knowing: the cap is enforced PER CALL with no cumulative ceiling, so an
  * unconfigured mainnet wallet can pay this fee more than once. An explicit `MAX_PAYMENT_AMOUNT`
@@ -331,6 +397,15 @@ function isTestnet(network: string): boolean {
   return network.includes('testnet')
 }
 
+/** Every registered token on this network, symbol -> contract address. */
+export function knownTokensFor(network: string): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [symbol, entry] of Object.entries(TOKEN_REGISTRY)) {
+    out[symbol] = isTestnet(network) ? entry.testnet : entry.mainnet
+  }
+  return out
+}
+
 export function resolveTokenAddress(symbol: string, network: string): string | undefined {
   const entry = TOKEN_REGISTRY[symbol.toUpperCase()]
   if (!entry) return undefined
@@ -364,6 +439,19 @@ export function loadConfig(env: NodeJS.ProcessEnv): AgenticWalletConfig {
   const policyDecisionUrlOverride = opt('POLICY_DECISION_URL')
   const policyWriteUrlOverride = opt('POLICY_WRITE_URL')
 
+  // Checked now rather than on the first call, so a bad template shows up at startup. It is a warning, not a
+  // failure: an optional feature's setting must not stop the wallet starting, and create_verification_qr
+  // refuses with the same reason when it is used.
+  // Only a value someone SET is checked and warned about: the built-in default is tested to pass, and a person has no say in it.
+  const myidVerifyLinkOverride = opt('MYID_VERIFY_LINK_TEMPLATE')
+  if (myidVerifyLinkOverride !== undefined) {
+    const problem = checkVerifyLinkTemplate(myidVerifyLinkOverride)
+    if (problem) {
+      process.stderr.write(`agentic-wallet-mcp: ${problem} create_verification_qr will refuse until this is fixed.\n`)
+    }
+  }
+  const myidVerifyLinkTemplate = myidVerifyLinkOverride ?? deriveMyidVerifyLinkTemplate(network)
+
   const explicitCaps = parsePaymentCaps(opt('MAX_PAYMENT_AMOUNT'), {
     resolveSymbol: (symbol) => resolveTokenAddress(symbol, network),
     onWarn: (message) => process.stderr.write(`agentic-wallet-mcp: ${message}\n`),
@@ -388,18 +476,22 @@ export function loadConfig(env: NodeJS.ProcessEnv): AgenticWalletConfig {
     zidResolverBaseUrl: stripTrailingSlash(opt('ZID_RESOLVER_BASE_URL') ?? deriveZidResolverBaseUrl(network)),
     policyRegistryAddress: opt('POLICY_REGISTRY_ADDRESS') ?? derivePolicyRegistryAddress(network),
     policyDecisionUrl: policyDecisionUrlOverride ? stripTrailingSlash(policyDecisionUrlOverride) : undefined,
+    myidVerifyLinkTemplate,
     policyDecisionAuth: opt('POLICY_DECISION_AUTH'),
     policyWriteUrl: policyWriteUrlOverride
       ? stripTrailingSlash(policyWriteUrlOverride)
       : derivePolicyWriteUrl(network),
     policyTemplateAddress: opt('POLICY_TEMPLATE_ADDRESS') ?? derivePolicyTemplateAddress(network),
-    // Fail closed: an unset cap means "spend nothing", not "spend anything". A wallet that starts
-    // with no configuration at all must not be able to auto-pay a hostile x402 challenge. Raising
-    // it is a deliberate act.
+    policyTemplatePublisher: opt('POLICY_TEMPLATE_PUBLISHER') ?? derivePolicyTemplatePublisher(network),
+    // An unset cap is a small default, not "spend anything": 1 JMYR per call and every other asset refused (on
+    // both networks). A wallet that starts with no configuration can still be made to pay up to that amount to a hostile x402
+    // challenge, per call and with no running total. Raising it is a deliberate act, and so is lowering it.
     //
-    // An explicit MAX_PAYMENT_AMOUNT governs BOTH caps below — a user who sets a limit means it
-    // everywhere. Only the defaults differ, and only because the two surfaces carry different risk.
+    // An explicit MAX_PAYMENT_AMOUNT governs BOTH caps below — a user who sets a limit means it everywhere, and it is never
+    // bypassed by a spending policy. The two defaults are the same today; the two functions stay separate so they can differ
+    // again if the two surfaces come to carry different risk.
     maxPaymentAmount: explicitCaps ?? defaultPaymentCaps(network),
+    paymentCapsExplicit: explicitCaps !== undefined,
     credentialIssuanceCaps: explicitCaps ?? defaultCredentialIssuanceCaps(network),
     ssivcBaseUrl: (() => {
       const v = opt('SSIVC_BASE_URL') ?? deriveSsivcBaseUrl(network)

@@ -30,12 +30,17 @@ describe('loadConfig', () => {
       zidResolverBaseUrl: 'https://zid-resolver-sandbox.zetrix.com',
       policyRegistryAddress: 'ZTX3Z2Fgsssx5fVq5v8EnhTBh6mqxJ8FQFqnk',
       policyTemplateAddress: 'ZTX3WfTbuZwsLQDWe4f7mzrfULiNdDU84BLJ5',
+      myidVerifyLinkTemplate: 'https://ssivc-api-uat.myegdev.com/api/agentic-verify?referenceId={referenceId}',
+      // Derived like the other policy addresses; undefined on mainnet, where there is no policy
+      // system to have a publisher for (see derivePolicyTemplatePublisher).
+      policyTemplatePublisher: 'ZTX3QFo5oc3Ep8rdJZKgfPDFNN29qjxn5ofED',
       // Derived like every other service URL; undefined on mainnet, where the policy module
       // is not enabled at all (see derivePolicyWriteUrl).
       policyWriteUrl: 'https://public-api-sandbox.zetrix.com/api',
       // Testnet default: exactly the AI Birthcert fee, nothing else. See the network-scoped block below.
       maxPaymentAmount: { ZTX3WeinXtt28YMyr4vUZ14ddTgEMGeuc1e6b: '1000000', '*': '0' },
       credentialIssuanceCaps: { ZTX3WeinXtt28YMyr4vUZ14ddTgEMGeuc1e6b: '1000000', '*': '0' },
+      paymentCapsExplicit: false,
       stateDir: join(homedir(), '.agentic-wallet-mcp'),
       ssivcBaseUrl: 'https://ssivc-api-uat.myegdev.com/api',
       aiBirthcertVerifiedTemplateId: 'did:zid:9641ee92552e9bcec672f300b071ff86d340ac78c83c225e95971cab8108fb80',
@@ -206,8 +211,16 @@ describe('loadConfig', () => {
       expect(cfgFor('zetrix:mainnet').credentialIssuanceCaps).toEqual({ [JMYR_MAINNET]: '1000000', '*': '0' })
     })
 
-    it('keeps the GENERAL mainnet cap refuse-all, so pay_and_fetch cannot auto-pay an arbitrary url', () => {
-      expect(cfgFor('zetrix:mainnet').maxPaymentAmount).toEqual({ '*': '0' })
+    // mainnet's GENERAL default is no longer refuse-all. It was, deliberately, so that
+    // pay_and_fetch could not auto-pay an arbitrary URL on a wallet nobody had configured; now it can, up to 1 JMYR per call.
+    it('gives mainnet the same GENERAL default as testnet: 1 JMYR per call, everything else refused', () => {
+      expect(cfgFor('zetrix:mainnet').maxPaymentAmount).toEqual({ [JMYR_MAINNET]: '1000000', '*': '0' })
+    })
+
+    it('records whether the caps were set by the user, because an explicit cap is never bypassed by a policy', () => {
+      expect(cfgFor('zetrix:mainnet').paymentCapsExplicit).toBe(false)
+      const explicit = loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet', MAX_PAYMENT_AMOUNT: '{"*":"0"}' } as NodeJS.ProcessEnv)
+      expect(explicit.paymentCapsExplicit).toBe(true)
     })
 
     // The two networks use different JMYR contracts, so a cap keyed to the wrong one would silently
@@ -392,4 +405,107 @@ describe('policy contract addresses', () => {
     expect(cfg.policyRegistryAddress).toBe('ZTX3local')
     expect(cfg.policyTemplateAddress).toBe('ZTX3localTemplate')
   })
+})
+
+describe('MYID_VERIFY_LINK_TEMPLATE', () => {
+  // UAT's link is the one the MyID app is registered for: ssivc-api-uat.myegdev.com publishes an apple-app-site-association that
+  // claims exactly /api/agentic-verify with a referenceId query. The first link the wallet was given, /v1/agent-verification/{id},
+  // matched none of it: the phone opened the browser and the server answered 404.
+  const UAT_LINK = 'https://ssivc-api-uat.myegdev.com/api/agentic-verify?referenceId={referenceId}'
+
+  it('defaults to the UAT universal link on testnet, so nobody has to set it', () => {
+    expect(loadConfig(base).myidVerifyLinkTemplate).toBe(UAT_LINK)
+  })
+
+  // PRODUCTION: MyID has stated this link, but their production side was not deployed and the host's association files could not be
+  // read, so mainnet fails closed (no default) like the other unverified mainnet values, and an operator opts in with the variable.
+  const PROD_LINK = 'https://myid-verifier.zetrix.com/api/agentic-verify?referenceId={referenceId}'
+
+  it('has no default on mainnet until MyID production is verified, so create_verification_qr refuses before creating anything', () => {
+    const mainnet = { ...base, ZETRIX_NETWORK: 'zetrix:mainnet' } as NodeJS.ProcessEnv
+
+    expect(loadConfig(mainnet).myidVerifyLinkTemplate).toBeUndefined()
+  })
+
+  it('pins the production link MyID stated, and it is a link the wallet would accept once switched on', async () => {
+    const { UNVERIFIED_MAINNET_MYID_VERIFY_LINK_TEMPLATE } = await import('../config')
+    const { checkVerifyLinkTemplate } = await import('../verify-link-template')
+
+    expect(UNVERIFIED_MAINNET_MYID_VERIFY_LINK_TEMPLATE).toBe(PROD_LINK)
+    expect(checkVerifyLinkTemplate(UNVERIFIED_MAINNET_MYID_VERIFY_LINK_TEMPLATE)).toBeNull()
+  })
+
+  it('lets a mainnet operator opt in to the production link with the variable', () => {
+    const mainnet = { ...base, ZETRIX_NETWORK: 'zetrix:mainnet', MYID_VERIFY_LINK_TEMPLATE: PROD_LINK } as NodeJS.ProcessEnv
+
+    expect(loadConfig(mainnet).myidVerifyLinkTemplate).toBe(PROD_LINK)
+  })
+
+  it('is overridden by MYID_VERIFY_LINK_TEMPLATE, on either network', () => {
+    const own = 'https://link.myid.test/v?referenceId={referenceId}'
+
+    expect(loadConfig({ ...base, MYID_VERIFY_LINK_TEMPLATE: own } as NodeJS.ProcessEnv).myidVerifyLinkTemplate).toBe(own)
+    expect(loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet', MYID_VERIFY_LINK_TEMPLATE: own } as NodeJS.ProcessEnv).myidVerifyLinkTemplate).toBe(own)
+  })
+
+  it('falls back when the variable is blank: to the UAT link on testnet, to nothing on mainnet', () => {
+    expect(loadConfig({ ...base, MYID_VERIFY_LINK_TEMPLATE: '   ' } as NodeJS.ProcessEnv).myidVerifyLinkTemplate).toBe(UAT_LINK)
+    expect(
+      loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet', MYID_VERIFY_LINK_TEMPLATE: '   ' } as NodeJS.ProcessEnv).myidVerifyLinkTemplate,
+    ).toBeUndefined()
+  })
+
+  it('builds a default link the wallet itself accepts', async () => {
+    const { checkVerifyLinkTemplate } = await import('../verify-link-template')
+
+    expect(checkVerifyLinkTemplate(loadConfig(base).myidVerifyLinkTemplate as string)).toBeNull()
+  })
+
+  it('puts the reference id where the MyID app is registered to read it: the referenceId query of /api/agentic-verify', async () => {
+    const { buildVerificationLink } = await import('../orchestrator/verification-qr')
+    const link = buildVerificationLink(loadConfig(base).myidVerifyLinkTemplate, 'v2-e61eab66-45e2-4716-a7a2-37798be7ebf4')
+    const url = new URL(link)
+
+    expect(url.origin).toBe('https://ssivc-api-uat.myegdev.com')
+    expect(url.pathname).toBe('/api/agentic-verify')
+    expect(url.searchParams.get('referenceId')).toBe('v2-e61eab66-45e2-4716-a7a2-37798be7ebf4')
+  })
+
+  it('is read as given, trimmed, and not altered (the placeholder and query must survive)', () => {
+    const cfg = loadConfig({ ...base, MYID_VERIFY_LINK_TEMPLATE: '  https://link.myid.test/agentic-verify?referenceId={referenceId}  ' })
+    expect(cfg.myidVerifyLinkTemplate).toBe('https://link.myid.test/agentic-verify?referenceId={referenceId}')
+  })
+
+  describe('is checked when the config loads', () => {
+    function loadCapturingStderr(env: NodeJS.ProcessEnv): { stderr: string } {
+      const writes: string[] = []
+      const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+        writes.push(String(chunk))
+        return true
+      })
+      try {
+        loadConfig(env)
+        return { stderr: writes.join('') }
+      } finally {
+        spy.mockRestore()
+      }
+    }
+
+    it.each([
+      ['http', 'http://link.myid.test/v?referenceId={referenceId}'],
+      ['a placeholder in the host', 'https://{referenceId}.link.myid.test/v'],
+      ['no placeholder', 'https://link.myid.test/v'],
+    ])('warns on stderr about %s, and the wallet still starts', (_label, template) => {
+      const { stderr } = loadCapturingStderr({ ...base, MYID_VERIFY_LINK_TEMPLATE: template } as NodeJS.ProcessEnv)
+
+      expect(stderr).toMatch(/MYID_VERIFY_LINK_TEMPLATE/)
+      expect(stderr).toMatch(/create_verification_qr will refuse/)
+    })
+
+    it('says nothing for a good template or for none', () => {
+      expect(loadCapturingStderr({ ...base, MYID_VERIFY_LINK_TEMPLATE: 'https://link.myid.test/v?referenceId={referenceId}' } as NodeJS.ProcessEnv).stderr).toBe('')
+      expect(loadCapturingStderr(base).stderr).toBe('')
+    })
+  })
+
 })

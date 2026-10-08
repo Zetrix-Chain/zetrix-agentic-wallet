@@ -32,11 +32,24 @@ import {
   listPolarity,
   windowRuleFor,
 } from '../policy-window-rules.js'
+import { isAmountCap, isAssetDenominatedCap, isAssetScope } from '../policy-scope-rules.js'
+import { checkWindowValue, describeDuration, exceedsDefaultRetention, isWindowAttribute, windowHint } from '../policy-window-format.js'
+import { formatHumanAmount, MAX_TOKEN_DECIMALS } from '../clients/token-info-client.js'
+import { ZTX_DECIMALS } from '../clients/token-balance-client.js'
+import type { PolicyVocabulary, VocabularyRead } from '../clients/policy-vocabulary-client.js'
+import { checkAgainstVocabulary, isEnforceableAttribute } from './policy-vocabulary-checks.js'
 
 export interface DraftPolicyAttribute {
   attributeName: string
   attributeType: string
+  /** The raw value. Absent only when `valueHuman` is given instead. */
   value: string
+  /**
+   * A human amount, in whole tokens, for an amount attribute (perTransactionMax, cumulativeMax, velocityCap) — "100" for
+   * 100 JMYR. The wallet converts it with the asset's own decimals and writes the raw value. Raw MCP input, so typed
+   * `unknown` and validated here. Never for a count or a duration.
+   */
+  valueHuman?: unknown
 }
 
 export interface DraftPolicy {
@@ -47,6 +60,13 @@ export interface DraftPolicy {
   /** Either identifies the template; the caller supplies whichever it has. */
   templateId?: string
   publisher?: string
+  /**
+   * How the amount caps (perTransactionMax, cumulativeMax, velocityCap) are written. Omitted: raw base
+   * units, and a non-zero cap under one whole token is refused as probably a unit mistake. `"whole"`:
+   * whole-token amounts, converted by the wallet. `"base"`: raw units, and the small-value guard is
+   * explicitly acknowledged. Typed `unknown` because it is raw MCP input and is validated here.
+   */
+  amountUnit?: unknown
 }
 
 export interface PolicyPreflightResult {
@@ -70,6 +90,11 @@ export interface PolicyPreflightResult {
   interpretation: string[]
   /** What preflight could not verify, so a clean result is not mistaken for a guarantee. */
   notChecked: string[]
+  /**
+   * Present only when `amountUnit: "whole"` converted amounts: attribute name -> the RAW value that
+   * will be written. `write_policy` applies it, so the value paid for is the value shown here.
+   */
+  convertedAmounts?: Record<string, string>
 }
 
 export interface PolicyPreflightDeps {
@@ -90,6 +115,24 @@ export interface PolicyPreflightDeps {
    * Both halves are now true.
    */
   isValidAddress?: (address: string) => boolean
+  /**
+   * Registered tokens on this network, symbol -> contract address. Lets preflight tell an agent the
+   * address it would otherwise have to ask the user for, and recognise a SYMBOL written where an
+   * address belongs. Optional: without it those two hints are simply absent.
+   */
+  knownTokens?: Readonly<Record<string, string>>
+  /**
+   * Symbol and decimals for an asset — `"native"` or a token contract address — so an amount can be
+   * stated in whole tokens. Returns null when the decimals cannot be read. Optional: without it
+   * preflight says it could not state the unit, and never assumes one.
+   */
+  describeUnit?: (asset: string) => Promise<{ symbol: string; decimals: number } | null>
+  /**
+   * The service's own attribute vocabulary (`GET /policy/vocabulary`). Optional: without it preflight
+   * runs on its built-in rules alone and says nothing about the vocabulary. When it IS wired and the
+   * read fails, the result says so in `notChecked` and every other finding is unchanged.
+   */
+  readVocabulary?: () => Promise<VocabularyRead>
 }
 
 /**
@@ -347,9 +390,11 @@ function parseList(value: unknown): { ok: true; entries: unknown[] } | { ok: fal
  */
 export function baseNotChecked(network?: string): string[] {
   const items = [
-    'Whether the policy will actually be ENFORCED. Nothing outside the policy registry currently ' +
-      'consults the decision service, so a valid policy may gate nothing today.',
-    'Whether the write will be accepted, and what it will cost — the deploy path is not built yet.',
+    'Whether the policy will actually be ENFORCED. This wallet cannot see whether anything ' +
+      'consults the decision service for a given spend, so a valid policy may still gate nothing.',
+    'Whether the write will be accepted, and what it will cost. The write service applies rules of ' +
+      'its own that this check mirrors but cannot guarantee, and the price is only known from its ' +
+      'quote — write_policy with dryRun asks for it without paying.',
     // NOT "STEP_UP": the decision service answers ALLOW or DENY and has no third verdict — its
     // DecisionRespDto enforces that at both ends. This sentence shipped naming a state that does
     // not exist, in text an LLM agent reads back to a user.
@@ -408,9 +453,30 @@ function structuralBlockers(draft: DraftPolicy): string[] {
     )
   ) {
     blockers.push('every entry in attributes must be an object with a string attributeName.')
+  } else {
+    // Each name once. Every scope and token rule below reads the FIRST attribute with a name, so a
+    // repeat could carry a value those rules never see — `assetScope: "native"` followed by
+    // `assetScope: "JMYR"` read as ready. Which one the service takes is not knowable from here, so a
+    // repeat is refused outright rather than guessed at.
+    const counts = new Map<string, number>()
+    for (const a of draft.attributes) counts.set(a.attributeName, (counts.get(a.attributeName) ?? 0) + 1)
+    const repeated = [...counts].filter(([, count]) => count > 1)
+    if (repeated.length > 0) {
+      const shown = repeated.slice(0, MAX_REPEATED_SHOWN).map(([name, count]) => `"${echoSafe(name)}" (${count} times)`)
+      const more = repeated.length > shown.length ? ` and ${repeated.length - shown.length} more` : ''
+      blockers.push(
+        `Each attribute may appear only once, but ${shown.join(', ')}${more} appear more than once. Which value ` +
+          `the write service would take is not something this wallet can tell, so a repeated name is refused ` +
+          `rather than guessed at — most dangerously for "assetScope" and "tokenAddress", where the repeat ` +
+          `could carry a value the service refuses.`,
+      )
+    }
   }
   return blockers
 }
+
+/** How many repeated names the duplicate blocker spells out; the rest are counted. */
+const MAX_REPEATED_SHOWN = 5
 
 /** What one attribute contributes to the three result arrays. */
 interface AttributeFindings {
@@ -425,6 +491,7 @@ function checkAttribute(
   vocabulary: Map<string, string> | null,
   present: ReadonlySet<string>,
   isValidAddress: ((address: string) => boolean) | undefined,
+  knownTokens: Readonly<Record<string, string>> | undefined,
 ): { blockers: string[]; interpretation: string[]; notChecked: string[] } {
   const blockers: string[] = []
   const interpretation: string[] = []
@@ -454,7 +521,18 @@ function checkAttribute(
 
   const rule = windowRuleFor(name)
   if (rule && !present.has(rule.window)) {
-    if (rule.outcome === 'denied') {
+    if (rule.outcome === 'not-requested') {
+      // Not an interpretation: with no period the count is not the limit that was asked for. The wallet's own rule says it
+      // is not requested at all and ms-zetrix describes it as refusing every transfer; either way the owner does not get
+      // the limit they wrote, and the fix (add the window) is free. Consistent with how a velocityCap without its window
+      // is already refused.
+      blockers.push(
+        `"${echoSafe(name)}" has no "${rule.window}", so it is not the limit you asked for: ${rule.withoutWindowMeans}. ` +
+          `ms-zetrix's published vocabulary (read 2026-10-07) says that without it every transfer is refused; either way it ` +
+          `gives no count limit. ` +
+          `Add "${rule.window}" (a duration such as 1d).`,
+      )
+    } else if (rule.outcome === 'denied') {
       blockers.push(
         `"${echoSafe(name)}" has no "${rule.window}", so the chain rejects it as VALUE_INVALID: ` +
           `${rule.withoutWindowMeans}.`,
@@ -470,7 +548,7 @@ function checkAttribute(
 
   const found = isListType(type)
     ? checkListAttribute(name, type, value, isValidAddress)
-    : checkScalarAttribute(name, type, value, vocabulary, rule, isValidAddress)
+    : checkScalarAttribute(name, type, value, vocabulary, rule, isValidAddress, knownTokens)
 
   return {
     blockers: [...blockers, ...found.blockers],
@@ -578,12 +656,17 @@ function checkScalarAttribute(
   vocabulary: Map<string, string> | null,
   rule: ReturnType<typeof windowRuleFor>,
   isValidAddress: ((address: string) => boolean) | undefined,
+  knownTokens: Readonly<Record<string, string>> | undefined,
 ): AttributeFindings {
   const blockers: string[] = []
   const interpretation: string[] = []
   const notChecked: string[] = []
   if (type === ATTRIBUTE_TYPES.NUMBER && !isNumericString(value)) {
     blockers.push(`"${echoSafe(name)}" is declared NUMBER but its value "${echoSafe(value)}" is not a whole number.`)
+  } else if (type === ATTRIBUTE_TYPES.ADDRESS && isValidAddress && !isValidAddress(value) && name === 'tokenAddress' && registeredSymbol(value, knownTokens)) {
+    // A registered SYMBOL where an address belongs. The draft-level token rule already says what
+    // to write instead — and the generic advice below ("ask the user, do not correct it") would
+    // contradict it, since for a registered token correcting it IS the right move.
   } else if (type === ATTRIBUTE_TYPES.ADDRESS && isValidAddress && !isValidAddress(value)) {
     // Checksum, not shape. The same KIND of gate transfer_token uses, injected separately — not
     // the same instance; see ToolDeps.isValidAddress. A one-character Base58 typo in a
@@ -608,7 +691,14 @@ function checkScalarAttribute(
     // an uncapped value here floods the agent's context with no error anywhere to explain it. It is
     // also where a 20,000-deep nested value used to throw RangeError out of the whole tool, because
     // a bare template literal calls Array.prototype.toString, which recurses.
-    interpretation.push(`"${echoSafe(name)}" is limited to ${echoSafe(value)}.`)
+    if (name === 'assetScope') {
+      // A scope the service refuses gets NO meaning here: it is a draft-level blocker, and
+      // "limited to JMYR" beside that blocker is the confident claim about an unusable value that
+      // this rule exists to stop. A recognised one gets what it actually governs.
+      if (isAssetScope(value)) interpretation.push(scopeMeaning(value))
+    } else {
+      interpretation.push(`"${echoSafe(name)}" is limited to ${echoSafe(value)}.`)
+    }
   }
 
   return { blockers, interpretation, notChecked }
@@ -644,6 +734,523 @@ function checkBlockRange(draft: DraftPolicy): string[] {
   return blockers
 }
 
+/**
+ * The write service's scope rules, applied to a whole draft — see `policy-scope-rules.ts` for what
+ * they are, where they come from and why they are here.
+ *
+ * Draft-level, so they are pushed BEFORE the per-attribute blockers: attribute faults are as many
+ * as the caller sends, and `capLines` would otherwise drop exactly these.
+ *
+ * `vocabulary` is only used to say something useful about a `ztp20` draft against a template that
+ * cannot express one. It is null when the template could not be read, and the rules still apply —
+ * none of them needs the template.
+ */
+/** The registered token whose SYMBOL this value is, if any — exact, case-insensitive. */
+function registeredSymbol(value: unknown, knownTokens: Readonly<Record<string, string>> | undefined): string | undefined {
+  if (typeof value !== 'string' || !knownTokens) return undefined
+  const symbol = value.trim().toUpperCase()
+  return Object.prototype.hasOwnProperty.call(knownTokens, symbol) ? symbol : undefined
+}
+
+function knownTokenList(knownTokens: Readonly<Record<string, string>> | undefined): string {
+  const entries = Object.entries(knownTokens ?? {})
+  return entries.map(([symbol, address]) => `${echoSafe(symbol)} is ${echoSafe(address)}`).join('; ')
+}
+
+function checkScopeRules(
+  attributes: DraftPolicyAttribute[],
+  vocabulary: Map<string, string> | null,
+  knownTokens?: Readonly<Record<string, string>>,
+): string[] {
+  const blockers: string[] = []
+  const scopeAttribute = attributes.find((a) => a.attributeName === 'assetScope')
+  const scope: unknown = scopeAttribute?.value
+  const recognised = isAssetScope(scope)
+
+  // Rule 1. A scope the service does not recognise — and no meaning is offered for it anywhere else.
+  if (scopeAttribute && !recognised) {
+    blockers.push(
+      `"assetScope" is "${echoSafe(scope)}", which the write service refuses. It must be written ` +
+        `exactly "native" or "ztp20" — lower case, and never a token symbol such as JMYR. A token is ` +
+        `named by its address in "tokenAddress", with "assetScope" set to "ztp20".`,
+    )
+  }
+
+  // Rule 5. A native policy that also names a token governs only that token and is ignored for native payments,
+  // so it would not limit ZTX at all while reading as if it did. Built in, not read from the vocabulary, so it holds when the
+  // vocabulary could not be read.
+  if (recognised && scope === 'native' && attributes.some((a) => a.attributeName === 'tokenAddress')) {
+    blockers.push(
+      `"assetScope" is "native" but a "tokenAddress" is also named. A policy that names a token governs only that token and never ` +
+        `native payments, so this one would not limit ZTX at all. Use "assetScope": "ztp20" with the "tokenAddress" for a token, or ` +
+        `remove "tokenAddress" for ZTX.`,
+    )
+  }
+
+  // Rule 2. A ztp20 policy must say which token.
+  if (recognised && scope === 'ztp20') {
+    const token = attributes.find((a) => a.attributeName === 'tokenAddress')
+    const named = typeof token?.value === 'string' && token.value.trim() !== ''
+    if (!named) {
+      blockers.push(
+        `"assetScope" is "ztp20" but no "tokenAddress" says which token. Without one the cap does not ` +
+          `limit "ztp20 spending" — it gives every token its own full-sized budget.` +
+          // Only when we KNOW the template lacks it. An unread template says nothing either way.
+          (vocabulary && !vocabulary.has('tokenAddress')
+            ? ` The template you chose does not declare "tokenAddress", so it cannot express a ztp20 ` +
+              `policy at all — choose a template that does (get_policy_template_schema lists them).`
+            : '') +
+          // The wallet already knows these. Saying so is the difference between an agent that asks the
+          // user to paste a contract address and one that does not need to.
+          (Object.keys(knownTokens ?? {}).length > 0
+            ? ` Tokens this wallet knows on this network: ${knownTokenList(knownTokens)}. Use the address that matches ` +
+              `the token the user named; if it is none of these, ask the user for the contract address.`
+            : ''),
+      )
+    }
+  }
+
+  // Rule 4. A token SYMBOL where the contract address belongs.
+  const tokenAttribute = attributes.find((a) => a.attributeName === 'tokenAddress')
+  const symbol = registeredSymbol(tokenAttribute?.value, knownTokens)
+  if (symbol && knownTokens) {
+    blockers.push(
+      `"tokenAddress" is "${echoSafe(tokenAttribute?.value)}", which is a token symbol, not an address. ` +
+        `${echoSafe(symbol)} on this network is ${echoSafe(knownTokens[symbol])} — write that address instead.`,
+    )
+  }
+
+  // Rule 3. A cap with no asset is a cap of nothing. When a scope IS present but unrecognised, rule 1
+  // has already said what is wrong and repeating it per cap would only add noise.
+  if (!scopeAttribute) {
+    const caps = attributes.map((a) => a.attributeName).filter(isAssetDenominatedCap)
+    if (caps.length > 0) {
+      blockers.push(
+        `${caps.map((c) => `"${c}"`).join(', ')} ${caps.length > 1 ? 'are caps' : 'is a cap'} measured in an ` +
+          `asset, but no "assetScope" says which — a cap of 1000 with no asset is 1000 of nothing, and the ` +
+          `write service refuses it. Add "assetScope": "native" for ZTX, or "ztp20" together with a ` +
+          `"tokenAddress" for a token.`,
+      )
+    }
+  }
+
+  return blockers
+}
+
+/**
+ * Every `*Window` the service would refuse, and a note for one it may. Draft-level, like the scope
+ * rules, so a flood of attribute faults cannot push it out of the capped list. See
+ * policy-window-format.ts for the rule and its source.
+ */
+function checkWindowFormats(attributes: DraftPolicyAttribute[]): { blockers: string[]; notes: string[]; interpretation: string[] } {
+  const blockers: string[] = []
+  const notes: string[] = []
+  const interpretation: string[] = []
+  for (const attribute of attributes) {
+    if (!isWindowAttribute(attribute.attributeName)) continue
+    const name = echoSafe(attribute.attributeName)
+    const checked = checkWindowValue(attribute.value)
+    if (!checked.ok) {
+      const hint = windowHint(attribute.value)
+      blockers.push(
+        `"${name}" is "${echoSafe(attribute.value)}", which the write service refuses. A window is a duration ` +
+          `written like 7d, 12h, 30m or 45s (or ISO-8601, P7D) — ${
+            checked.reason === 'bare_number'
+              ? 'a bare number is refused because it would be read as milliseconds'
+              : checked.reason === 'not_positive'
+                ? 'it must be greater than zero'
+                : checked.reason === 'padded'
+                  ? 'it has spaces around it — write it with none'
+                  : checked.reason === 'too_large'
+                    ? 'it is longer than anything the service could retain'
+                    : `"${echoSafe(attribute.value)}" is not one`
+          }.` + (hint ? ` For that, write ${hint}.` : ''),
+      )
+    } else {
+      // The period, in words, beside the value as written. Without it a valid-but-wrong window passes
+      // silently: "1M" is one MINUTE, so a monthly cap written that way resets ~43,000 times a month.
+      interpretation.push(
+        `"${name}" is "${echoSafe(attribute.value)}", which is ${describeDuration(checked.ms, checked.subMs)}.`,
+      )
+      if (exceedsDefaultRetention(checked.ms)) notes.push(
+        `"${name}" is longer than 30d, which is the service's default retention. The service refuses a ` +
+          `window it cannot retain, and whether this environment allows longer is not visible from here.`,
+      )
+    }
+  }
+  return { blockers, notes, interpretation }
+}
+
+/** What an amount is denominated in — resolved once, because three things need it. */
+type UnitState = { kind: 'known'; symbol: string; decimals: number } | { kind: 'no-scope' } | { kind: 'unreadable' }
+
+/**
+ * The asset the amounts are in: native ZTX (a constant), or the token named by `tokenAddress`
+ * (read through `describeUnit`). `no-scope` when the draft does not name a usable asset — the scope
+ * rules have already blocked that, and a unit stated against an unknown asset would be a guess.
+ * `unreadable` when the decimals could not be read: never assumed, never defaulted to a scale.
+ */
+async function resolveUnit(attributes: DraftPolicyAttribute[], deps: PolicyPreflightDeps): Promise<UnitState> {
+  const scope = attributes.find((a) => a.attributeName === 'assetScope')?.value
+  const tokenValue = attributes.find((a) => a.attributeName === 'tokenAddress')?.value
+  // A policy that names a token governs ONLY that token and never native payments (the service's own words), so "native" with a
+  // tokenAddress is not an amount of ZTX: its cap applies to the token, whose decimals are not ZTX's. No asset is known, so nothing
+  // is converted; the scope rule below refuses the draft with the reason.
+  if (scope === 'native' && attributes.some((a) => a.attributeName === 'tokenAddress')) return { kind: 'no-scope' }
+  let asset: string | undefined
+  if (scope === 'native') asset = 'native'
+  else if (scope === 'ztp20' && typeof tokenValue === 'string' && tokenValue.trim() !== '') {
+    // A malformed address is already a blocker; do not read the chain for one.
+    if (!deps.isValidAddress || deps.isValidAddress(tokenValue)) asset = tokenValue.trim()
+  }
+  if (asset === undefined) return { kind: 'no-scope' }
+  if (asset === 'native') return { kind: 'known', symbol: 'ZTX', decimals: ZTX_DECIMALS }
+  if (!deps.describeUnit) return { kind: 'unreadable' }
+  try {
+    const unit = await deps.describeUnit(asset)
+    // Validated again here, whoever supplied it: these decimals scale a value that is WRITTEN, so anything but
+    // a bounded whole number is unreadable rather than a scale.
+    const sound =
+      unit !== null &&
+      typeof unit.symbol === 'string' &&
+      Number.isInteger(unit.decimals) &&
+      unit.decimals >= 0 &&
+      unit.decimals <= MAX_TOKEN_DECIMALS
+    return sound ? { kind: 'known', symbol: unit.symbol, decimals: unit.decimals } : { kind: 'unreadable' }
+  } catch {
+    return { kind: 'unreadable' }
+  }
+}
+
+const WHOLE_AMOUNT = /^\d{1,40}(\.\d{1,40})?$/
+/** The most digits a 256-bit number has. No amount is larger, and a value past it is a mistake. */
+const MAX_RAW_DIGITS = 77
+const RAW_AMOUNT = /^\d{1,77}$/
+/**
+ * Why there is no magnitude ceiling on a converted amount. The service parses a NUMBER attribute with
+ * `OnChainNumberParser`, which accepts a whole number of up to 200 digits (a BigInteger — nothing wraps at 64
+ * bits). A whole part of at most 40 digits scaled by at most MAX_TOKEN_DECIMALS (36) is at most 76 digits, so
+ * the bounds above already keep every converted value well inside it; a test pins that.
+ */
+
+/**
+ * Amounts are written in RAW base units, and a user says "1 JMYR". A real policy went on chain with
+ * `perTransactionMax: 1` and `cumulativeMax: 100` for a 6-decimal token — a million times tighter than
+ * meant — because nothing made the difference visible before the payment. Two answers:
+ *
+ *  - `amountUnit: "whole"`: the caller gives whole-token amounts ("1", "0.5") and the WALLET converts
+ *    them by the token's decimals. The converted raw values are returned in `convertedAmounts` and
+ *    stated in `interpretation`, so what is paid for is what the user saw. Conversion needs known
+ *    decimals; it never guesses a scale.
+ *  - otherwise the values are raw, and a non-zero cap smaller than ONE WHOLE TOKEN is refused unless
+ *    the caller says `amountUnit: "base"` — the explicit "yes, I mean that tiny a value". A guard that
+ *    could be satisfied by silence would not be one.
+ *
+ * Only the amount caps are touched (see AMOUNT_CAPS); a count is not denominated in base units.
+ */
+function applyAmountUnit(
+  attributes: DraftPolicyAttribute[],
+  amountUnit: unknown,
+  state: UnitState,
+): { attributes: DraftPolicyAttribute[]; converted?: Record<string, string>; blockers: string[]; interpretation: string[] } {
+  const blockers: string[] = []
+  const interpretation: string[] = []
+  // null is how a loosely typed channel says "omitted" — not a third unit.
+  const mode: unknown = amountUnit === null ? undefined : amountUnit
+  if (mode !== undefined && mode !== 'whole' && mode !== 'base') {
+    blockers.push(
+      `amountUnit is "${echoSafe(mode)}", which is not one of "whole" or "base". Omit it for raw base ` +
+        `units, give "whole" to have the wallet convert whole-token amounts, or "base" to confirm raw values.`,
+    )
+    return { attributes, blockers, interpretation }
+  }
+  const caps = attributes.filter((a) => isAmountCap(a.attributeName) && typeof a.value === 'string')
+
+  if (mode === 'whole') {
+    if (caps.length === 0) return { attributes, blockers, interpretation }
+    if (state.kind !== 'known') {
+      blockers.push(
+        state.kind === 'no-scope'
+          ? `amountUnit "whole" needs to know which asset the amounts are in — set "assetScope" to "native", or ` +
+            `to "ztp20" with a valid "tokenAddress". Or give raw values and leave amountUnit out.`
+          : `amountUnit "whole" needs the token's decimals, which could not be read, so nothing was converted. ` +
+            `Retry, or give raw base-unit values with amountUnit "base".`,
+      )
+      return { attributes, blockers, interpretation }
+    }
+    const scale = 10n ** BigInt(state.decimals)
+
+    // Converting an already-converted value. `convertedAmounts` is for SHOWING the user; an agent that copies it
+    // back into write_policy with amountUnit "whole" would convert it a second time — 1 JMYR becomes
+    // 1,000,000 JMYR, a cap a million times LOOSER, written irreversibly. When EVERY amount is already
+    // 10^decimals whole tokens or more it looks raw, so it is refused instead of converted. Decimals of 0
+    // have no such ambiguity (one unit IS one token).
+    if (state.decimals > 0 && caps.every((c) => WHOLE_AMOUNT.test(c.value as string))) {
+      if (caps.every((c) => BigInt((c.value as string).split('.')[0]) >= scale)) {
+        // The two readings need DIFFERENT routes, and picking the wrong one is the original incident or its
+        // reverse: a copied raw value must go back unchanged with "base"; a genuine large cap must be sent as
+        // N x 10^decimals with "base". So both are spelled out, with the second worked through for the first
+        // amount, rather than one remedy that is wrong for the other reading.
+        const first = caps[0]
+        const [w, f = ''] = (first.value as string).split('.')
+        const asRaw = (BigInt(w) * scale + BigInt(f.padEnd(state.decimals, '0').slice(0, state.decimals) || '0')).toString()
+        blockers.push(
+          `With amountUnit "whole", every amount here is ${scale.toString()} or more whole ${echoSafe(state.symbol)}, ` +
+            `which is what a RAW value looks like, so nothing was converted. If they are already raw (for example ` +
+            `copied from convertedAmounts) resend them UNCHANGED with amountUnit "base". If you really mean that ` +
+            `many whole tokens, resend with amountUnit "base" and each value times ${scale.toString()} — ` +
+            `"${echoSafe(first.attributeName)}" ${echoSafe(first.value)} becomes ${asRaw}. Guessing wrong makes a ` +
+            `cap ${scale.toString()} times looser or tighter.`,
+        )
+        return { attributes, blockers, interpretation }
+      }
+    }
+
+    const converted: Record<string, string> = {}
+    const next = attributes.map((a) => {
+      if (!isAmountCap(a.attributeName) || typeof a.value !== 'string') return a
+      const name = echoSafe(a.attributeName)
+      if (!WHOLE_AMOUNT.test(a.value)) {
+        blockers.push(
+          `"${name}" is "${echoSafe(a.value)}", which is not a plain amount such as 1 or 0.5. With amountUnit ` +
+            `"whole" it must be a number of whole ${echoSafe(state.symbol)}, without units, signs or exponents.`,
+        )
+        return a
+      }
+      const [whole, frac = ''] = a.value.split('.')
+      if (frac.length > state.decimals) {
+        blockers.push(
+          `"${name}" is "${echoSafe(a.value)}", which has more decimal places than ${echoSafe(state.symbol)} supports ` +
+            `(${state.decimals}). Nothing was rounded.`,
+        )
+        return a
+      }
+      const raw = (BigInt(whole) * scale + BigInt(frac.padEnd(state.decimals, '0') || '0')).toString()
+      converted[a.attributeName] = raw
+      interpretation.push(
+        `"${name}": ${echoSafe(a.value)} ${echoSafe(state.symbol)} is written as ${raw} — the raw base-unit value the ` +
+          `service stores.`,
+      )
+      return { ...a, value: raw }
+    })
+    return Object.keys(converted).length > 0
+      ? { attributes: next, converted, blockers, interpretation }
+      : { attributes, blockers, interpretation }
+  }
+
+  // Raw values (omitted or "base"): bounded in length, because nothing bigger than 256 bits exists and the
+  // interpretation below only describes values it can format.
+  for (const a of caps) {
+    if (/^\d+$/.test(a.value) && a.value.length > MAX_RAW_DIGITS) {
+      blockers.push(
+        `"${echoSafe(a.attributeName)}" has ${a.value.length} digits — more than any amount that fits in 256 bits ` +
+          `(${MAX_RAW_DIGITS} at most). Check the value.`,
+      )
+    }
+  }
+
+  // Raw values. The guard fires only on SILENCE: an explicit "base" is the acknowledgement.
+  if (mode === undefined && state.kind === 'known' && state.decimals > 0) {
+    const scale = 10n ** BigInt(state.decimals)
+    for (const a of caps) {
+      if (!RAW_AMOUNT.test(a.value) || BigInt(a.value) === 0n || BigInt(a.value) >= scale) continue
+      const value = BigInt(a.value)
+      const human = formatHumanAmount(a.value, state.decimals)
+      blockers.push(
+        `"${echoSafe(a.attributeName)}" is ${a.value}, which is only ${human} ${echoSafe(state.symbol)} — amounts are raw ` +
+          `base units, and this is less than one whole token. If you meant ${a.value} ${echoSafe(state.symbol)}, write ` +
+          `${(value * scale).toString()} (or pass amountUnit "whole" and give ${a.value}). If ${human} ` +
+          `${echoSafe(state.symbol)} really is what you want, pass amountUnit "base" to confirm.`,
+      )
+    }
+  }
+  return { attributes, blockers, interpretation }
+}
+
+/**
+ * `valueHuman`: a human amount for ONE amount attribute, converted with the asset's own decimals.
+ *
+ * Runs BEFORE the `amountUnit` pass, and takes its attributes out of it: a value converted here is final, so letting
+ * `amountUnit: "whole"` see it again would convert it a second time — 100 JMYR becoming 100,000,000 JMYR, a cap a
+ * million times looser, written irreversibly.
+ *
+ * What is an amount comes from the SERVICE when it can be read (`unit: SMALLEST_UNIT`), and from the built-in amount list
+ * when it cannot, never the other way round for a refusal: an attribute the service calls a count or a duration is never
+ * scaled, whatever the built-in list believes. A conversion needs known decimals and a plain decimal number, and it never
+ * rounds; anything it cannot convert exactly is refused with nothing converted.
+ */
+function applyValueHuman(
+  attributes: DraftPolicyAttribute[],
+  state: UnitState,
+  served: PolicyVocabulary | null,
+): {
+  attributes: DraftPolicyAttribute[]
+  /** Names that carried a valueHuman: finished here, so the `amountUnit` pass leaves them alone. */
+  handled: Set<string>
+  converted?: Record<string, string>
+  blockers: string[]
+  interpretation: string[]
+} {
+  const blockers: string[] = []
+  const interpretation: string[] = []
+  const handled = new Set<string>()
+  const converted: Record<string, string> = {}
+
+  const next = attributes.map((a) => {
+    if (a.valueHuman === undefined) return a
+    handled.add(a.attributeName)
+    const { valueHuman, ...rest } = a
+    const name = echoSafe(a.attributeName)
+    // A raw value beside it has to be text. Anything else (a number, an object) would slip past the agreement check below and be
+    // replaced by the conversion without ever being compared.
+    const givenValue = (a as { value?: unknown }).value
+    if (givenValue !== undefined && givenValue !== null && typeof givenValue !== 'string') {
+      blockers.push(`"${name}" has a value that is not text: give value as text such as "1000000", or drop it and give valueHuman alone.`)
+      return rest
+    }
+
+    // The text of what the caller said. A finite number is as good as a string: a model may send either.
+    // A number is accepted only when it is a safe whole number: JSON has already rounded anything larger or fractional (a decimal
+    // such as 0.1 + 0.2 arrives as 0.30000000000000004), so the text echoed back would not be what the user said. Write it as text.
+    const text =
+      typeof valueHuman === 'string' ? valueHuman : typeof valueHuman === 'number' && Number.isSafeInteger(valueHuman) && valueHuman >= 0 ? String(valueHuman) : undefined
+    if (text === undefined) {
+      blockers.push(
+        typeof valueHuman === 'number'
+          ? `"${name}" has a valueHuman given as a number that is not a whole number, or is too large to be exact: write it as text, ` +
+              `for example "0.5" or "100", in whole tokens.`
+          : `"${name}" has a valueHuman that is not an amount: give a plain number such as 100 or 0.5, in whole tokens.`,
+      )
+      return rest
+    }
+
+    // Is this an amount at all? The service's word first; the built-in list only when the service is silent.
+    const unit = served?.attributes.find((x) => x.name === a.attributeName)?.unit ?? null
+    if (unit === 'COUNT') {
+      blockers.push(`"${name}" is a count, not an amount, so valueHuman does not apply to it: give it as value (for example "5"). A count is never scaled.`)
+      return rest
+    }
+    if (unit === 'DURATION') {
+      blockers.push(`"${name}" is a duration, not an amount, so valueHuman does not apply to it: give it as value, for example "7d". A duration is never scaled.`)
+      return rest
+    }
+    // The service listed it, but not as an amount in the smallest unit (no unit, or one this wallet does not know): the built-in list
+    // must not override that and scale it anyway. Only the service's own SMALLEST_UNIT, or the built-in list when the service is
+    // silent, makes an attribute an amount.
+    if (served?.attributes.some((x) => x.name === a.attributeName) === true && unit !== 'SMALLEST_UNIT') {
+      blockers.push(
+        `"${name}" is listed by the service as ${unit === null ? 'having no unit' : `a ${echoSafe(unit)}`}, not as an amount in the smallest unit, so valueHuman ` +
+          `does not apply to it: give it as value.`,
+      )
+      return rest
+    }
+    if (unit !== 'SMALLEST_UNIT' && !isAmountCap(a.attributeName)) {
+      blockers.push(`"${name}" is not an amount attribute, so valueHuman does not apply to it: give it as value.`)
+      return rest
+    }
+
+    if (state.kind === 'no-scope') {
+      blockers.push(
+        `"${name}" has a valueHuman, which needs to know which asset the amount is in — set "assetScope" to "native", or to ` +
+          `"ztp20" with a valid "tokenAddress". Or give the raw value instead.`,
+      )
+      return rest
+    }
+    if (state.kind === 'unreadable') {
+      blockers.push(
+        `"${name}" has a valueHuman, which needs the token's decimals, and they could not be read, so nothing was converted. ` +
+          `Retry, or give the raw base-unit value.`,
+      )
+      return rest
+    }
+
+    if (!WHOLE_AMOUNT.test(text)) {
+      blockers.push(
+        `"${name}" has a valueHuman of "${echoSafe(text)}", which is not a plain amount such as 100 or 0.5. It must be a number of ` +
+          `whole ${echoSafe(state.symbol)}, without units, signs, separators or exponents.`,
+      )
+      return rest
+    }
+    const [whole, frac = ''] = text.split('.')
+    if (frac.length > state.decimals) {
+      blockers.push(
+        `"${name}" has a valueHuman of "${echoSafe(text)}", which has more decimal places than ${echoSafe(state.symbol)} supports ` +
+          `(${state.decimals}). Nothing was rounded.`,
+      )
+      return rest
+    }
+    const scale = 10n ** BigInt(state.decimals)
+    const raw = (BigInt(whole) * scale + BigInt(frac.padEnd(state.decimals, '0') || '0')).toString()
+
+    // A raw value alongside it has to say the same thing — the same rule as transfer_token's amount and amountHuman.
+    if (typeof rest.value === 'string' && rest.value !== '' && rest.value !== raw) {
+      blockers.push(
+        `"${name}" has a value of "${echoSafe(rest.value)}" and a valueHuman of "${echoSafe(text)}" ${echoSafe(state.symbol)}, which is ` +
+          `${raw} in raw base units: they do not agree. Give one of them, or make them say the same thing.`,
+      )
+      return rest
+    }
+
+    converted[a.attributeName] = raw
+    interpretation.push(
+      `"${name}": ${echoSafe(text)} ${echoSafe(state.symbol)} is written as ${raw} — the raw base-unit value the service stores.`,
+    )
+    return { ...rest, value: raw }
+  })
+
+  return {
+    attributes: next,
+    handled,
+    ...(Object.keys(converted).length > 0 ? { converted } : {}),
+    blockers,
+    interpretation,
+  }
+}
+
+/**
+ * What an amount MEANS in whole tokens, stated alongside the raw value. States the conversion and
+ * nothing else — it does not guess which the user intended. When the decimals cannot be read it says
+ * so rather than assuming a scale.
+ */
+function describeAmountUnits(attributes: DraftPolicyAttribute[], state: UnitState): { interpretation: string[]; notChecked: string[] } {
+  const interpretation: string[] = []
+  const notChecked: string[] = []
+  const amounts = attributes.filter((a) => isAmountCap(a.attributeName) && typeof a.value === 'string' && RAW_AMOUNT.test(a.value))
+  if (amounts.length === 0 || state.kind === 'no-scope') return { interpretation, notChecked }
+
+  if (state.kind === 'unreadable') {
+    notChecked.push(
+      `What the amounts mean in whole tokens could not be worked out — the token's decimals could not be ` +
+        `read. Amounts are in BASE units; do not assume a scale.`,
+    )
+    return { interpretation, notChecked }
+  }
+
+  const symbol = echoSafe(state.symbol)
+  for (const attribute of amounts) {
+    const raw = String(attribute.value)
+    if (state.decimals <= 0) {
+      interpretation.push(`"${echoSafe(attribute.attributeName)}" is ${raw} ${symbol} — this token has no decimals, so base units are whole tokens.`)
+      continue
+    }
+    const whole = 10n ** BigInt(state.decimals)
+    const human = formatHumanAmount(raw, state.decimals)
+    interpretation.push(
+      `"${echoSafe(attribute.attributeName)}" is ${raw} in BASE units: ${raw} = ${human} ${symbol}. ` +
+        `If you meant 1 ${symbol}, the value is ${whole.toString()}.`,
+    )
+  }
+  return { interpretation, notChecked }
+}
+
+/** What a RECOGNISED scope means. Never called for one that is not. */
+function scopeMeaning(scope: 'native' | 'ztp20'): string {
+  return scope === 'native'
+    ? '"assetScope" is "native": this policy governs native ZTX only and does not limit any token.'
+    : '"assetScope" is "ztp20": this policy governs payments in ONE ZTP20 token — the one named by ' +
+        '"tokenAddress" — and nothing else.'
+}
+
 export async function policyPreflight(
   deps: PolicyPreflightDeps,
   draft: DraftPolicy,
@@ -664,6 +1271,48 @@ export async function policyPreflight(
 
   const blockers: string[] = []
   const interpretation: string[] = []
+
+  // The unit is only read when there is an amount to read it for — no chain call otherwise. A valueHuman is an amount to
+  // read it for too.
+  const unitState: UnitState = draft.attributes.some((a) => isAmountCap(a.attributeName) || a.valueHuman !== undefined)
+    ? await resolveUnit(draft.attributes, deps)
+    : { kind: 'no-scope' }
+
+  // The service's own vocabulary is read BEFORE the amount passes: valueHuman asks it what is an amount.
+  // The reader is documented never to throw, but this is the last check before a paid write: a reader that does is
+  // reported as unavailable, like any other read that could not be completed, and never takes preflight down.
+  let vocabularyRead: VocabularyRead | undefined
+  if (deps.readVocabulary) {
+    try {
+      vocabularyRead = await deps.readVocabulary()
+    } catch (e) {
+      vocabularyRead = { available: false, cause: 'unreachable', detail: `the vocabulary reader failed — ${echoSafe((e as Error)?.message ?? e, 120)}` }
+    }
+  }
+
+  // valueHuman first. What it converts is final, so the amountUnit pass is given only the attributes it did not.
+  const humanPass = applyValueHuman(draft.attributes, unitState, vocabularyRead?.available ? vocabularyRead.vocabulary : null)
+  const plain = humanPass.attributes.filter((x) => !humanPass.handled.has(x.attributeName))
+  const plainPass = applyAmountUnit(plain, draft.amountUnit, unitState)
+  let plainIndex = 0
+  const amountPass = {
+    attributes: humanPass.attributes.map((x) => (humanPass.handled.has(x.attributeName) ? x : plainPass.attributes[plainIndex++])),
+    blockers: [...humanPass.blockers, ...plainPass.blockers],
+    interpretation: [...humanPass.interpretation, ...plainPass.interpretation],
+    ...(humanPass.converted || plainPass.converted ? { converted: { ...humanPass.converted, ...plainPass.converted } } : {}),
+  }
+  // Everything below judges the attributes AS THEY WILL BE WRITTEN, so a converted amount is checked
+  // like any other NUMBER rather than rejected for being "1.5".
+  const attributes = amountPass.attributes
+
+  // An attribute with neither `value` nor `valueHuman` has nothing to write. NUMBER, list, window and scope attributes were refused
+  // for it already, but only incidentally; a STRING attribute (unknownAttributePolicy, settlementChannel) was not, and went on the
+  // wire with no value. Refused here for every type, and skipped by the per-attribute checks below since it is already said.
+  for (const a of attributes) {
+    if (typeof a.value !== 'string') {
+      blockers.push(`"${echoSafe(a.attributeName)}" has no value: give "value" (the exact text to store) or, for an amount, "valueHuman".`)
+    }
+  }
 
   const template = await deps.readTemplate(draft)
 
@@ -690,7 +1339,7 @@ export async function policyPreflight(
     )
   }
 
-  if (draft.attributes.length === 0) {
+  if (attributes.length === 0) {
     blockers.push('This policy has no attributes — it would deploy successfully and restrict nothing.')
   }
 
@@ -699,21 +1348,45 @@ export async function policyPreflight(
   // them — 100 undeclared attributes plus an inverted block range lost the "would never be in
   // force" blocker, which is the one that matters most.
   blockers.push(...checkBlockRange(draft))
+  // Draft-level, like the block range: the service refuses these at its free pre-check, so
+  // preflight must too. Before the per-attribute loop so a flood of attribute faults cannot
+  // push them out of the capped list.
+  blockers.push(...checkScopeRules(attributes, vocabulary, deps.knownTokens))
+  const windows = checkWindowFormats(attributes)
+  blockers.push(...windows.blockers)
+  interpretation.push(...windows.interpretation)
+  blockers.push(...amountPass.blockers)
+  interpretation.push(...amountPass.interpretation)
 
-  const present = new Set(draft.attributes.map((attribute) => attribute.attributeName))
-  for (const attribute of draft.attributes) {
-    const found = checkAttribute(attribute, vocabulary, present, deps.isValidAddress)
+  const present = new Set(attributes.map((attribute) => attribute.attributeName))
+  for (const attribute of attributes) {
+    if (typeof attribute.value !== 'string') continue // already refused above
+    const found = checkAttribute(attribute, vocabulary, present, deps.isValidAddress, deps.knownTokens)
     blockers.push(...found.blockers)
     interpretation.push(...found.interpretation)
     notChecked.push(...found.notChecked)
   }
 
+  const fromService = checkAgainstVocabulary(attributes, vocabulary ? new Set(vocabulary.keys()) : null, vocabularyRead)
+  blockers.push(...fromService.blockers)
+  interpretation.push(...fromService.interpretation)
+  notChecked.push(...fromService.notChecked)
+
+  notChecked.push(...windows.notes)
+  const units = describeAmountUnits(attributes, unitState)
+  interpretation.push(...units.interpretation)
+  notChecked.push(...units.notChecked)
+
   // A policy built only from qualifiers enforces nothing and is refused fail-closed.
-  const enforceable = draft.attributes.filter(
+  const enforceable = attributes.filter(
     (attribute) =>
-      !QUALIFIER_ATTRIBUTES.has(attribute.attributeName) && !INFORMATIONAL_ATTRIBUTES.has(attribute.attributeName),
+      isEnforceableAttribute(
+        attribute.attributeName,
+        vocabularyRead?.available ? vocabularyRead.vocabulary : null,
+        attributes.some((a) => a.attributeName === 'unknownAttributePolicy' && a.value === 'ignore'),
+      ),
   )
-  if (draft.attributes.length > 0 && enforceable.length === 0) {
+  if (attributes.length > 0 && enforceable.length === 0) {
     blockers.push(
       `This policy has no enforceable constraint — only qualifiers and informational values. It ` +
         `answers NO_ENFORCEABLE_CONSTRAINTS, which is a DENY, so the agent could spend nothing at all.`,
@@ -724,6 +1397,7 @@ export async function policyPreflight(
     policyKey: draft.policyKey,
     ready: blockers.length === 0,
     ...(declared ? { declared } : {}),
+    ...(amountPass.converted ? { convertedAmounts: amountPass.converted } : {}),
     blockers,
     interpretation,
     notChecked,

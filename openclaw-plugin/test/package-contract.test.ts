@@ -26,13 +26,14 @@ const walletToolNames = (() => {
 })()
 
 describe('the wallet tool list is readable', () => {
-  it('finds exactly the eighteen tools', () => {
+  it('finds exactly the twenty-one tools', () => {
     expect(walletToolNames.sort()).toEqual([
       'check_ai_birthcert_verification',
       'check_policy_decision',
       'check_policy_write',
       'clear_stuck_payment_receipt',
       'create_holder_account',
+      'create_verification_qr',
       'credential_preflight',
       'get_my_policy',
       'get_policy_template_schema',
@@ -41,9 +42,11 @@ describe('the wallet tool list is readable', () => {
       'policy_preflight',
       'prove_identity',
       'query_contract',
+      'remove_policy',
       'request_ai_birthcert_verification',
       'subscribe_and_issue',
       'transfer_token',
+      'update_policy',
       'wallet_status',
       'write_policy',
     ])
@@ -62,6 +65,31 @@ describe('the wallet tool list is readable', () => {
 })
 
 describe('manifest', () => {
+  it('declares myidVerifyLinkTemplate as an https link that holds the placeholder outside the host', () => {
+    const prop = manifest.configSchema.properties.myidVerifyLinkTemplate
+    expect(prop?.type).toBe('string')
+    const pattern = new RegExp(prop.pattern)
+    expect(pattern.test('https://link.myid.test/v?referenceId={referenceId}')).toBe(true)
+    expect(pattern.test('https://link.myid.test/v/{referenceId}')).toBe(true)
+    for (const bad of [
+      'http://link.myid.test/v?referenceId={referenceId}',
+      'myid://v?referenceId={referenceId}',
+      'https://{referenceId}.link.myid.test/v',
+      'https://{referenceId}.link.myid.test/v?referenceId={referenceId}',
+      'https://\\{referenceId}.evil.com/p',
+      'https://link.myid.test\\v?referenceId={referenceId}',
+      'https://link\t{referenceId}.evil.com/p',
+      'HTTPS://link.myid.test/v?referenceId={referenceId}',
+      // these two were accepted by the pattern before the backslash was excluded from it
+      'https://link\\.myid.test/v?referenceId={referenceId}',
+      'https://link.myid.test/v\\w?referenceId={referenceId}',
+      'https://user@link.myid.test/v?referenceId={referenceId}',
+      'https://link.myid.test/v',
+    ]) {
+      expect(pattern.test(bad), bad).toBe(false)
+    }
+  })
+
   it('declares the required id and configSchema', () => {
     expect(manifest.id).toBe('zetrix-agentic-wallet')
     expect(manifest.configSchema?.type).toBe('object')

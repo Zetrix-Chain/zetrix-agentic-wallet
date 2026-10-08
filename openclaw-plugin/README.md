@@ -38,6 +38,7 @@ Set by the subscriber, through the gateway's plugin config UI or `plugins.entrie
 | `network` | `zetrix:testnet` | Mainnet spends real funds |
 | `maxPaymentAmount` | *(unset)* | Per-asset ceiling in raw units. Unset means the wallet's own default: the 1 JMYR credential fee, nothing else |
 | `zetrixAddress` | *(unset)* | Pin an existing holder account instead of creating one |
+| `myidVerifyLinkTemplate` | *(unset)* | MyID's link for `create_verification_qr`, with `{referenceId}` in it (https, placeholder in the path or query). On testnet it defaults to the UAT link, so leave it unset there. On mainnet there is no default until MyID's production side is verified, and until it is set the tool answers `created: false` rather than invent a link |
 
 These defaults apply with no action from the subscriber, so a fresh install can obtain its first
 credential and nothing more. A bare `{"*":"0"}` — the refuse-all value plugin ≤0.3.2 planted, in config

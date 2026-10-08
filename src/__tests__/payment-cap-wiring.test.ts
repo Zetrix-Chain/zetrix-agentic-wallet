@@ -27,11 +27,17 @@ describe('buildPayers', () => {
       return async () => (caps === maxPaymentAmount ? 'built-from-maxPaymentAmount' : 'built-from-credentialIssuanceCaps')
     }
 
-    const { pay, payForCredential, payForPolicyWrite, preflightCaps } = buildPayers({ maxPaymentAmount, credentialIssuanceCaps }, fakeMakePay)
+    const { pay, payForCredential, payForPolicyWrite, preflightCaps, policyWriteCaps } = buildPayers({ maxPaymentAmount, credentialIssuanceCaps }, fakeMakePay)
+
+    // The read-only affordability check must evaluate the cap the POLICY payer carries. Exposed from
+    // here, beside the payer, so the two cannot be paired differently: the credential map would
+    // answer a different question and tell a user their write is fine when it would be refused.
+    expect(policyWriteCaps).toBe(maxPaymentAmount)
+    expect(policyWriteCaps).not.toBe(credentialIssuanceCaps)
 
     // Three consumers now. payForPolicyWrite takes the GENERAL cap, not the credential one: the
     // credential allowance is granted so a wallet may buy credentials, and a policy write drawing
-    // on it would spend an allowance meant for something else (BT-2793).
+    // on it would spend an allowance meant for something else.
     expect(received).toEqual([maxPaymentAmount, credentialIssuanceCaps, maxPaymentAmount])
     expect(preflightCaps).toBe(credentialIssuanceCaps)
     return Promise.all([
@@ -46,8 +52,9 @@ describe('buildPayers', () => {
   // accepted via `payForCredential`. Uses the real makePay-shaped guard (assertWithinPaymentCap)
   // rather than a fake, so a swap anywhere in buildPayers — not just at its return statement —
   // would surface here too.
-  it('on mainnet: `pay` refuses the credential fee, `payForCredential` accepts it, via a real cap guard', async () => {
-    const cfg = loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet' } as never)
+  it('with DIFFERENT maps: `pay` refuses the credential fee, `payForCredential` accepts it, via a real cap guard', async () => {
+    // Hand-built maps: now the real mainnet defaults are the same for both, so they can no longer tell a swap apart.
+    const cfg = { maxPaymentAmount: { '*': '0' }, credentialIssuanceCaps: { [JMYR_MAINNET]: '1000000', '*': '0' } }
     const fee = { asset: JMYR_MAINNET, maxAmountRequired: '1000000' }
     const makePayFromGuard = (caps: Record<string, string>) => async (accept: typeof fee) => {
       assertWithinPaymentCap(accept, caps)

@@ -19,7 +19,7 @@ import { ZTP20_V1 } from './fixtures/real-policy-templates'
  * collaborators — which is the right thing for an orchestrator test and exactly why it cannot see
  * a production wiring swap.
  *
- * Same defect class and same remedy as `payment-cap-wiring.test.ts` (MR !80 rounds 2-3): the
+ * Same defect class and same remedy as `payment-cap-wiring.test.ts`: the
  * pairing is moved out of `main()` into a function, so this file is the only place it exists.
  *
  * The validator is a DEFAULT PARAMETER rather than something `main()` passes. That matters for what
@@ -163,10 +163,10 @@ describe('the wired deps behave correctly end to end through the orchestrator', 
 
 // NOT "shared": policy_preflight reads ToolDeps.isValidAddress and transfer_token reads
 // TransferDeps.isValidAddress, two separate objects with identical bodies. The whole point of
-// round 4's APP-M02 was that calling them one gate is false (BT-3000 round 5, APP-L03).
+// round 4's APP-M02 was that calling them one gate is false.
 describe('buildAddressValidator — policy_preflight\'s checksum gate', () => {
   /**
-   * BT-3000 APP-M04. policy_preflight's ADDRESS gate was wired at the mcp-tools call site as
+   * APP-M04. policy_preflight's ADDRESS gate was wired at the mcp-tools call site as
    * `deps.transferDeps?.isValidAddress`. Replacing that with `undefined` or `() => true` disabled
    * the entire gate and left 1204/1204 green, because every test supplied its own validator.
    *
@@ -213,7 +213,12 @@ describe('buildAddressValidator — policy_preflight\'s checksum gate', () => {
 
     const good = await tools.policy_preflight({
       policyKey: 'ztp20-v1', templateId: 'a'.repeat(64),
-      attributes: [{ attributeName: 'tokenAddress', attributeType: 'ADDRESS', value: VALID }],
+      // tokenAddress alone is a qualifier and would answer NO_ENFORCEABLE_CONSTRAINTS, so a cap rides with it.
+      attributes: [
+        { attributeName: 'assetScope', attributeType: 'STRING', value: 'ztp20' },
+        { attributeName: 'tokenAddress', attributeType: 'ADDRESS', value: VALID },
+        { attributeName: 'perTransactionMax', attributeType: 'NUMBER', value: '1000000' },
+      ],
       validFromBlock: '0', validToBlock: '0',
     })
     expect(good.ready).toBe(true)

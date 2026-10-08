@@ -5,11 +5,11 @@
  * `ZTX3WfTbuZwsLQDWe4f7mzrfULiNdDU84BLJ5` (Zetrix testnet), via
  * `listTemplateKeys` → `["native-v1","ztp20-v1"]` then `getTemplate` for each.
  *
- * WHY THIS FILE EXISTS. BT-2792 shipped `policy_preflight` before any template existed on chain, so
+ * WHY THIS FILE EXISTS. An earlier change shipped `policy_preflight` before any template existed on chain, so
  * its vocabulary was invented from a field guide and then pinned by fixtures using the same invented
  * values — `uint`, `bool`, `RECIPIENT_LIST`. The tests were thorough, self-consistent, and validated
  * against nothing real. Measured against these templates, the type check and the empty-list blocker
- * both turned out to do nothing at all (BT-3000).
+ * both turned out to do nothing at all.
  *
  * So: fixtures here are COPIED FROM CHAIN, not written by hand. A fixture that could not exist on
  * chain is the defect, not a convenience. If these need updating, re-read them rather than editing
@@ -124,14 +124,14 @@ export const GET_POLICY_ENVELOPE = {
  * above `INFORMATIONAL_ATTRIBUTES`; an earlier version of this header quietly restated the
  * discarded reasoning instead, and got the arithmetic wrong doing it — 11 + 3 = 14, not 13 — which
  * reads as a missing row and invites someone to add `approvalPolicy` to `ZTP20_V1`, silently
- * changing what `policy_preflight` treats as declared for every ZTP20 draft (BT-3000 round 5,
+ * changing what `policy_preflight` treats as declared for every ZTP20 draft
  * APP-M02).
  *
  * WHY THIS EXISTS AS A FIXTURE rather than a literal in a test. `payToAllowlist` is in the
  * vocabulary and in neither template, so a test deriving the expected attribute set from the
  * templates alone rejects it. The response to that, once, was to delete the derived test and
  * hand-author the expected list inside the test file — which restated the thing it was checking and
- * let an invented `memoDenylist` row pass (BT-3000 round 4, APP-M01). Keeping the vocabulary here,
+ * let an invented `memoDenylist` row pass. Keeping the vocabulary here,
  * with its provenance, means adding a polarity row still costs evidence.
  *
  * UNVERIFIED FROM THIS REPO. ms-zetrix is not vendored here, so nothing in this project can prove
