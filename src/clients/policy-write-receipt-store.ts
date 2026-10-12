@@ -71,6 +71,11 @@ export interface PolicyWriteReceipt {
   operation?: PolicyWriteOperation
   /** See {@link PolicyWriteVerify}. Absent on a receipt saved before this existed, or paid elsewhere: nothing can be verified. */
   verify?: PolicyWriteVerify
+  /**
+   * Set once the service said this write FAILED. The receipt is kept (support needs the id) but it can never write anything, so a
+   * self-paid write for the same key is not held up by it.
+   */
+  failed?: true
 }
 
 /** The write a receipt pays for. A receipt with no operation is a CREATE: that is all there was before updates. */

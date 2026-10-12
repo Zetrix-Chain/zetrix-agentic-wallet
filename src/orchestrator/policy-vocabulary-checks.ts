@@ -29,6 +29,8 @@ export interface VocabularyFindings {
   blockers: string[]
   interpretation: string[]
   notChecked: string[]
+  /** True when a vocabulary source exists but could not be read, so the checks that depend on it did not run. */
+  unread?: true
 }
 
 interface DraftAttributeLike {
@@ -116,6 +118,7 @@ export function checkAgainstVocabulary(
   const found: VocabularyFindings = { blockers: [], interpretation: [], notChecked: [] }
   if (!read) return found
   if (!read.available) {
+    found.unread = true
     found.notChecked.push(
       `${describeUnavailable(read)} Checks that depend on it did not run: attributes the service does not ` +
         `recognise, and attributes used outside the scope they apply to.`,

@@ -33,6 +33,10 @@ import { isVerifyShape, operationOf, type PolicyWriteOperation, type PolicyWrite
 import type { PolicyRead, PolicyReadResult } from '../clients/policy-read-client.js'
 import type { PolicyPreflightResult } from './policy-preflight.js'
 import type { Affordability } from './policy-affordability.js'
+import { assessSelfPay, parseGasPayer, type GasPayer, type SelfPayAssessment, type SelfPayDeps } from './policy-gas-choice.js'
+import { comparable, comparableTyped, typeAttributes, type SelfPayCall, type TxLookup } from './policy-self-pay.js'
+import { isSponsored } from '../accept-selection.js'
+import type { PayRequirement } from '../clients/mbi-client.js'
 import { describePolicyRefusal, policyRefusalFlags, toPaymentPolicyError } from '../policy-refusal.js'
 
 /** The x402 `accepts[]` entry shape, as the wallet's existing quote selection understands it. */
@@ -103,6 +107,16 @@ export interface WritePolicyDeps {
   readPolicy?: (policyKey: string) => Promise<PolicyRead<PolicyReadResult>>
   /** Bound on one chain read made to verify a paid write. Defaults to 10 s; a test shortens it. */
   readTimeoutMs?: number
+  /**
+   * True when the attribute vocabulary can be read at all (a source is wired). A self-paid write is refused without it: it has no
+   * service to catch what the vocabulary would have, so "no source" is treated like "could not be read".
+   */
+  hasVocabularySource?: boolean
+  /**
+   * Present only when this wallet can carry out a self-paid write (the wallet builds the contract call, signs it through Wallet BE and
+   * pays the gas in ZTX with no service fee). Its presence is what makes the tools offer the choice; without it they behave as before.
+   */
+  selfPay?: SelfPayDeps
 }
 
 export interface WritePolicyResult {
@@ -138,6 +152,11 @@ export interface WritePolicyResult {
     | 'modified'
     /** update_policy: the template the policy references no longer exists. Free; nothing was paid. */
     | 'template_unavailable'
+    /**
+     * Self-pay is on offer and the caller named no `gasPayer`: nothing was paid or written. `gasOptions` lays out both ways to pay so the
+     * user can choose; call again with `gasPayer` set to their answer.
+     */
+    | 'needs_choice'
   /** What to tell the user, in one sentence. */
   message: string
   /** Present whenever a payment HAS been made and the write is not finished. Keep it. */
@@ -205,6 +224,11 @@ export interface WritePolicyResult {
    * determined — a failed read is never reported as affordable.
    */
   affordability?: Affordability
+  /** Present on `needs_choice`: the two ways to pay and whether this wallet can afford each right now. */
+  gasOptions?: {
+    sponsored?: { feeAsset: string; feeAmount: string; feeHuman?: string; gas: 'paid by the service'; affordability?: Affordability }
+    self?: SelfPayAssessment & { fee: 'none' }
+  }
 }
 
 /**
@@ -425,14 +449,29 @@ async function dropVerify(deps: WritePolicyDeps, receipt: PolicyWriteReceipt): P
   }
 }
 
+/** The service said this write FAILED: keep the receipt (support needs it), stop verifying it, and say it can never write. */
+async function markFailed(deps: WritePolicyDeps, receipt: PolicyWriteReceipt): Promise<void> {
+  const { verify: _dropped, ...rest } = receipt
+  try {
+    await deps.receipts.set({ ...rest, failed: true })
+  } catch {
+    // Keeping the bookmark matters more than this note on it.
+  }
+}
+
+/** A paid write for this key whose collect can still write something: the one that holds a self-paid write back. */
+async function pendingWaiting(deps: WritePolicyDeps, policyKey: string): Promise<PolicyWriteReceipt | undefined> {
+  return (await deps.receipts.list()).find((r) => r.policyKey === policyKey && r.failed !== true)
+}
+
 const READ_TIMEOUT_MS = 10_000
 
-/** One chain read, bounded: a read that never answers must not hold the tool call. */
-async function readBounded(deps: WritePolicyDeps, policyKey: string) {
+/** One call, bounded: a read that never answers must not hold the tool call. */
+async function bounded<T>(deps: WritePolicyDeps, call: () => Promise<T>): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
     return await Promise.race([
-      deps.readPolicy!(policyKey),
+      call(),
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => reject(new Error('chain read timed out')), deps.readTimeoutMs ?? READ_TIMEOUT_MS)
       }),
@@ -440,6 +479,11 @@ async function readBounded(deps: WritePolicyDeps, policyKey: string) {
   } finally {
     if (timer !== undefined) clearTimeout(timer)
   }
+}
+
+/** One chain read, bounded. */
+function readBounded(deps: WritePolicyDeps, policyKey: string) {
+  return bounded(deps, () => deps.readPolicy!(policyKey))
 }
 
 type ChainShows =
@@ -563,7 +607,7 @@ async function pollCollect(
     }
     if (last.state === 'write_failed') {
       // The service's verdict. Whatever lands on chain for this key later is not this receipt's doing.
-      await dropVerify(deps, receipt)
+      await markFailed(deps, receipt)
       return last
     }
 
@@ -649,6 +693,11 @@ export interface WritePolicyInput {
    * `transfer_token`'s `confirm`, it is an instruction to the agent, never to be passed on its own judgement.
    */
   confirm?: boolean
+  /**
+   * Who pays the gas: `"sponsored"` (the fee in JMYR, gas covered) or `"self"` (no fee, ZTX for gas). The wallet has no default: when
+   * self-pay is on offer and this is absent, the tool returns `needs_choice` and the user decides.
+   */
+  gasPayer?: string
 }
 
 /**
@@ -665,7 +714,11 @@ function isDryRun(value: unknown): boolean {
 }
 
 export async function writePolicy(deps: WritePolicyDeps, input: WritePolicyInput): Promise<WritePolicyResult> {
-  if (!deps.client) {
+  const gas = parseGasPayer(input?.gasPayer)
+  if (!gas.ok) return refusedGasPayer(input?.policyKey)
+  // The service is needed to quote and collect a SPONSORED write; a self-paid one never contacts it.
+  // With no choice named and self-pay on offer, the user can still be asked: self is the one option on the table.
+  if (!deps.client && gas.gasPayer !== 'self' && !(gas.gasPayer === undefined && deps.selfPay)) {
     return unavailable(
       `No policy write service is configured for ${deps.network ?? 'this network'}, so nothing was ` +
         `attempted and nothing was paid.`,
@@ -761,6 +814,36 @@ export async function writePolicy(deps: WritePolicyDeps, input: WritePolicyInput
   // cap. Both need a person's yes: `confirm` exactly `true`, and not a dry run.
   const confirmed = input.confirm === true
   const canWrite = confirmed && !dryRun
+  const selfCall: SelfPayCall = {
+    operation: 'CREATE',
+    policyKey: input.policyKey,
+    attributes: wire,
+    validFromBlock: input.validFromBlock ?? '0',
+    validToBlock: input.validToBlock ?? '0',
+    templateContractAddress: deps.templateContract,
+    templateId: input.templateId,
+  }
+  const selfUnavailable = selfBlocker(deps, checked)
+  if (gas.gasPayer === 'self') {
+    return runSelfPay(deps, {
+      call: selfCall,
+      interpretation,
+      dryRun,
+      confirmed,
+      canWrite,
+      pollBudgetMs: input.pollBudgetMs ?? DEFAULT_BUDGET_MS,
+      tool: 'write_policy',
+      verb: 'write',
+      ...(selfUnavailable ? { unavailable: selfUnavailable } : {}),
+    })
+  }
+  if (!deps.client) {
+    // No service to quote the sponsored side, so the choice is put with self-pay alone.
+    if (gas.gasPayer === undefined && deps.selfPay) {
+      return offerGasChoice(deps, { selfCall, ...(selfUnavailable ? { selfUnavailable } : {}), policyKey: input.policyKey, interpretation, tool: 'write_policy', verb: 'write' }, undefined)
+    }
+    return unavailable('No policy write service is configured, so nothing was attempted and nothing was paid.')
+  }
   const pre = await deps.client.precheck(request)
 
   if (pre.kind === 'already_exists') {
@@ -815,6 +898,9 @@ export async function writePolicy(deps: WritePolicyDeps, input: WritePolicyInput
     pollBudgetMs: input.pollBudgetMs ?? DEFAULT_BUDGET_MS,
     tool: 'write_policy',
     verb: 'write',
+    selfCall,
+    ...(selfUnavailable ? { selfUnavailable } : {}),
+    ...(gas.gasPayer ? { gasPayer: gas.gasPayer } : {}),
   })
 }
 
@@ -937,6 +1023,448 @@ async function recoverInFlight(
   }
 }
 
+/** What the service asked for, the friendly form of it, and whether this wallet could pay it: shared by the quote and the choice. */
+async function describeQuote(deps: WritePolicyDeps, accept: Accept) {
+  const asset = clip(String(accept.asset ?? ''), 100)
+  const amount = clip(String(accept.maxAmountRequired ?? ''), 40)
+  const extra = (accept.extra ?? {}) as Record<string, unknown>
+  let amountHuman: string | undefined
+  if (deps.describeAmount && amount !== '') {
+    // A failed lookup costs the friendly form and nothing else — the quote stands without it.
+    amountHuman = await deps.describeAmount(asset, amount).then(
+      (text) => clip(text, 120),
+      () => undefined,
+    )
+  }
+  // A failed check is an UNKNOWN, stated as such — never silence, which reads as "fine".
+  let affordability: Affordability | undefined
+  if (deps.checkAffordability) {
+    affordability = await deps.checkAffordability(accept).catch(
+      (): Affordability => ({
+        verdict: 'unknown',
+        fee: { status: 'unknown', required: amount },
+        gas: { status: 'unknown' },
+        // No `cap`: an invented one reads, to a structured consumer, as "no cap key matches this asset".
+        feeNotEstimated: false,
+        problems: ['Whether this wallet can afford it could not be checked.'],
+        notChecked: ['The affordability check itself failed, so nothing about balances or the cap is known.'],
+      }),
+    )
+  }
+  return { asset, amount, extra, amountHuman, affordability }
+}
+
+/** A `gasPayer` that is neither `self` nor `sponsored` is refused rather than read as one of them: the two spend different assets. */
+function refusedGasPayer(policyKey: unknown): WritePolicyResult {
+  return {
+    state: 'refused',
+    ...(typeof policyKey === 'string' ? { policyKey } : {}),
+    message:
+      'gasPayer must be exactly "sponsored" (pay the fee in JMYR, the gas is covered) or "self" (no fee, pay the gas in ZTX), or be left ' +
+      'out so the user can be asked. NOTHING WAS PAID. Ask the user which they want and call again.',
+  }
+}
+
+const VOCAB_UNREAD_REASON =
+  "the service's attribute vocabulary could not be read just now, and a self-paid write has no service to catch what it would have " +
+  '(this may pass if you ask again shortly)'
+const NO_VOCAB_SOURCE_REASON =
+  'this wallet has no attribute vocabulary configured to check a self-paid write against, and a self-paid write has no service to ' +
+  'catch what it would have'
+const WAITING_REASON = (blobId: string) =>
+  'a paid write for this key is still waiting to be finished (receipt ' + blobId + '); finish it first with check_policy_write'
+
+/**
+ * Why a self-paid write is not on offer for this draft, if it is not: a vocabulary to check it against (a permanent condition, then a
+ * transient one). A self-paid write has no service to catch what the vocabulary would have.
+ */
+function selfBlocker(deps: WritePolicyDeps, preflight: { vocabularyUnread?: true }): string | undefined {
+  if (deps.hasVocabularySource !== true) return NO_VOCAB_SOURCE_REASON
+  if (preflight.vocabularyUnread) return VOCAB_UNREAD_REASON
+  return undefined
+}
+
+const NO_WINDOW_REASON =
+  'the policy holds no validFromBlock / validToBlock to keep and none was given, and a self-paid update replaces the whole policy, ' +
+  'so it would store none (name both, "0" for no limit)'
+
+/** The wallet is asked to pay the gas itself but cannot (this build wires no self-pay). Free: nothing was paid. */
+function selfPayNotAvailable(a: { policyKey: string; interpretation: string[] }): WritePolicyResult {
+  return {
+    state: 'refused',
+    paid: false,
+    policyKey: a.policyKey,
+    interpretation: a.interpretation,
+    message:
+      `Paying the gas yourself is not available in this wallet, so NOTHING WAS PAID and nothing was sent. Use gasPayer "sponsored" ` +
+      `(the fee is paid in JMYR and the gas is covered), or leave gasPayer out.`,
+  }
+}
+
+function selfPayWords(self: SelfPayAssessment): string {
+  const gas = self.gas
+  if (self.status === 'enough') {
+    return `Costs no fee, only about ${gas.estimatedHuman} of network gas (the wallet asks to hold ${gas.requiredHuman}); it holds ${self.balance?.human}, enough.`
+  }
+  return `Costs no fee, only network gas in ZTX${gas.estimatedHuman ? ` (about ${gas.estimatedHuman})` : ''}. ${self.status === 'short' ? 'The wallet could NOT pay it right now' : 'Whether the wallet can pay it is not known'}: ${clip(self.problems.join(' '), 400)}`
+}
+
+/**
+ * Self-pay is on offer and the caller has not said who pays: stop, with the options and what each would cost, so the user chooses.
+ * Nothing is paid, signed or written, whatever `confirm` says. An option that is not available is named as such, never dropped silently.
+ */
+async function offerGasChoice(
+  deps: WritePolicyDeps,
+  a: { selfCall?: SelfPayCall; selfUnavailable?: string; policyKey: string; interpretation: string[]; tool: 'write_policy' | 'update_policy'; verb: 'write' | 'update' },
+  accept: Accept | undefined,
+): Promise<WritePolicyResult> {
+  const quote = accept ? await describeQuote(deps, accept) : undefined
+  // No call to price means a self-paid write cannot be built for this one. The user is still asked: choosing is theirs, never a default.
+  const waiting = a.selfCall !== undefined && a.selfUnavailable === undefined ? await pendingWaiting(deps, a.policyKey) : undefined
+  const selfReason = a.selfUnavailable ?? (waiting ? WAITING_REASON(waiting.blobId) : a.selfCall === undefined ? NO_WINDOW_REASON : undefined)
+  const offerSelf = selfReason === undefined
+  const self = offerSelf ? await assessSelfPay(deps.selfPay!, a.selfCall as SelfPayCall) : undefined
+  if (!quote && !self) {
+    return unavailable(
+      `Neither way of paying is available to ${a.verb} this policy right now. NOTHING WAS PAID. Sponsored: not offered by the service (or no service is configured). ` +
+        `Self: ${selfReason}.`,
+    )
+  }
+  const sponsoredText = quote
+    ? `SPONSORED: ${quote.amountHuman ?? `${quote.amount} of ${quote.asset}`}, and the network gas is covered, so no ZTX is needed. ${
+        quote.affordability ? affordabilityWords(quote.affordability) : 'Whether the wallet can afford it was not checked.'
+      }`
+    : 'SPONSORED: not offered by the service right now.'
+  const selfText = self ? `SELF: ${selfPayWords(self)}` : `SELF: not available for this write: ${selfReason}.`
+  const both = quote !== undefined && self !== undefined
+  const only = quote ? '"sponsored"' : '"self"'
+  return {
+    state: 'needs_choice',
+    paid: false,
+    policyKey: a.policyKey,
+    interpretation: a.interpretation,
+    ...(quote && accept
+      ? {
+          quote: {
+            asset: quote.asset,
+            amount: quote.amount,
+            ...(quote.amountHuman ? { amountHuman: quote.amountHuman } : {}),
+            ...(typeof accept.payTo === 'string' ? { payTo: clip(accept.payTo, 100) } : {}),
+            ...(typeof quote.extra.gasModel === 'string' ? { gasModel: clip(quote.extra.gasModel, 40) } : {}),
+          },
+        }
+      : {}),
+    gasOptions: {
+      ...(quote
+        ? {
+            sponsored: {
+              feeAsset: quote.asset,
+              feeAmount: quote.amount,
+              ...(quote.amountHuman ? { feeHuman: quote.amountHuman } : {}),
+              gas: 'paid by the service' as const,
+              ...(quote.affordability ? { affordability: quote.affordability } : {}),
+            },
+          }
+        : {}),
+      ...(self ? { self: { fee: 'none' as const, ...self } } : {}),
+    },
+    message:
+      `CHOICE NEEDED — nothing was paid and nothing was written. ` +
+      (both
+        ? `There are two ways to pay to ${a.verb} this policy; ask the user which they want. `
+        : `Only ${quote ? 'sponsored' : 'self'} is available to ${a.verb} this policy right now; tell the user that and ask whether to go ahead that way. `) +
+      `${sponsoredText} ${selfText} Say plainly what the wallet can pay right now. After the user has seen what the policy means (interpretation) and chosen, ` +
+      `call ${a.tool} again with gasPayer ${both ? '"sponsored" or "self"' : only} and confirm: true. Never choose for the user and never pass confirm on your own judgement.`,
+  }
+}
+
+/** Does the policy the chain holds match what a self-paid write sent? Strict: the same attributes (name, type, value), template and bounds. */
+function chainMatchesCall(record: Record<string, unknown>, call: SelfPayCall): boolean {
+  const typed = typeAttributes(call.attributes)
+  if (!typed.ok) return false
+  const onChain = Array.isArray(record.attributes) ? (record.attributes as Array<Record<string, unknown>>) : []
+  if (onChain.length !== typed.attributes.length) return false
+  const held = new Map<string, Record<string, unknown>>()
+  for (const a of onChain) {
+    if (!a || typeof a.attributeName !== 'string' || held.has(a.attributeName)) return false
+    held.set(a.attributeName, a)
+  }
+  for (const want of typed.attributes) {
+    const have = held.get(want.attributeName)
+    if (!have || have.attributeType !== want.attributeType || comparable(have.value) !== comparableTyped(want.value)) return false
+  }
+  if (record.templateId !== call.templateId) return false
+  if (typeof record.templateContractAddress === 'string' && record.templateContractAddress !== call.templateContractAddress) return false
+  if (blockString(record.validFromBlock) !== call.validFromBlock || blockString(record.validToBlock) !== call.validToBlock) return false
+  if (call.operation === 'UPDATE') {
+    const at = blockString(record.updatedAtBlock)
+    if (at === undefined || at === call.expectedUpdatedAtBlock) return false
+  }
+  return true
+}
+
+type SelfConfirm = { kind: 'landed' } | { kind: 'failed'; errorCode: number; errorDesc?: string } | { kind: 'not_yet'; txSucceeded: boolean }
+
+/**
+ * Read the chain, for a bounded time, until it shows the self-paid write, looking the transaction itself up as it goes: a transaction
+ * that was included and then rejected by the contract still costs the gas, and waiting out the budget for it would be the wrong answer.
+ * Free reads; never submits anything.
+ */
+async function confirmSelfWrite(deps: WritePolicyDeps, call: SelfPayCall, budgetMs: number, txHash: string): Promise<SelfConfirm> {
+  const wait = 3_000
+  const started = (deps.now?.() ?? new Date()).getTime()
+  const budget = Math.min(Number.isFinite(budgetMs) && budgetMs > 0 ? budgetMs : DEFAULT_BUDGET_MS, VERIFY_BUDGET_MS)
+  let polls = 0
+  let waited = 0
+  let txSucceeded = false
+  for (;;) {
+    let read
+    try {
+      read = await readBounded(deps, call.policyKey)
+    } catch {
+      read = undefined
+    }
+    if (read && !('error' in read) && read.found !== false && chainMatchesCall(read.value.policy as unknown as Record<string, unknown>, call)) {
+      return { kind: 'landed' }
+    }
+    if (deps.selfPay?.lookupTransaction) {
+      let tx: TxLookup | undefined
+      try {
+        const lookup = deps.selfPay.lookupTransaction
+        tx = await bounded(deps, () => lookup(txHash))
+      } catch {
+        tx = undefined
+      }
+      if (tx?.status === 'failed') {
+        return { kind: 'failed', errorCode: tx.errorCode, ...(tx.errorDesc ? { errorDesc: clip(String(tx.errorDesc), 200) } : {}) }
+      }
+      if (tx?.status === 'success') txSucceeded = true
+    }
+    // The clock alone is not a bound (a sleep that returns at once leaves it at zero), so the count and the time already waited bound it too.
+    const elapsed = Math.max((deps.now?.() ?? new Date()).getTime() - started, waited)
+    if (++polls >= 20 || elapsed + wait >= budget) return { kind: 'not_yet', txSucceeded }
+    await deps.sleep(wait)
+    waited += wait
+  }
+}
+
+/**
+ * The self-paid path of write_policy and update_policy: no service fee and no call to ms-zetrix. The wallet builds the contract call,
+ * signs it through Wallet BE and submits it, paying only the network gas in ZTX. Free until the user has confirmed; and once it has,
+ * the policy is read fresh from the chain right before signing, because the contract replaces a policy wholesale and checks nothing
+ * about what was there.
+ */
+async function runSelfPay(
+  deps: WritePolicyDeps,
+  a: {
+    call: SelfPayCall
+    interpretation: string[]
+    dryRun: boolean
+    confirmed: boolean
+    canWrite: boolean
+    pollBudgetMs: number
+    tool: 'write_policy' | 'update_policy'
+    verb: 'write' | 'update'
+    /** Why a self-paid write is not available for this one, when it is not. */
+    unavailable?: string
+  },
+): Promise<WritePolicyResult> {
+  const { call, interpretation } = a
+  const policyKey = call.policyKey
+  const done = a.verb === 'write' ? 'written' : 'updated'
+  if (!deps.selfPay) return selfPayNotAvailable({ policyKey, interpretation })
+  if (a.unavailable) {
+    return {
+      state: 'refused',
+      paid: false,
+      policyKey,
+      interpretation,
+      message:
+        `Paying the gas yourself is not available for this write: ${a.unavailable}. NOTHING WAS SENT. ` +
+        (deps.client ? 'Use gasPayer "sponsored", or fix that and ask again.' : 'Sponsored is not available either (no policy service is configured).'),
+    }
+  }
+  if (!deps.readPolicy) {
+    return unavailable('This wallet cannot read the chain, so it cannot check a self-paid write before sending it or confirm it after. Nothing was sent.')
+  }
+
+  // A paid write for this key that has not been finished is still in play on the service's side: a self-paid write now could be
+  // overwritten by its collect, or overwrite it. The sponsored path has the service's own "in progress" answer; this is that guard.
+  const waiting = await pendingWaiting(deps, policyKey)
+  if (waiting) {
+    return {
+      state: 'refused',
+      paid: false,
+      policyKey,
+      interpretation,
+      paymentReceipt: waiting.blobId,
+      message:
+        `A paid write for "${policyKey}" is still waiting to be finished (receipt ${waiting.blobId}), and a self-paid write now could be overwritten by its collect, ` +
+        `or overwrite it. Finish it first with check_policy_write, then ask again. NOTHING WAS SENT.`,
+    }
+  }
+
+  // ── Free checks against the chain itself (the service is not consulted). ─────────────────────────────────
+  let current: PolicyRead<PolicyReadResult>
+  try {
+    current = await readBounded(deps, policyKey)
+  } catch {
+    current = { error: 'query_failed', detail: 'the read did not answer' } as PolicyRead<PolicyReadResult>
+  }
+  if ('error' in current) {
+    return unavailable(`The policy could not be read (${clip(String(current.detail))}), so it was not ${done}. Nothing was sent.`)
+  }
+  if (call.operation === 'CREATE' && current.found !== false) {
+    return {
+      state: 'already_exists',
+      policyKey,
+      interpretation,
+      message: `A policy "${policyKey}" already exists for this wallet. Nothing was sent. To change it use update_policy.`,
+    }
+  }
+  if (call.operation === 'UPDATE') {
+    if (current.found === false) {
+      return { state: 'not_found', policyKey, interpretation, message: `There is no policy "${policyKey}" for this wallet to update. Nothing was sent.` }
+    }
+    const onChainBlock = blockString(current.value.policy.updatedAtBlock)
+    if (onChainBlock !== call.expectedUpdatedAtBlock) {
+      return {
+        state: 'modified',
+        policyKey,
+        interpretation,
+        message:
+          `The policy "${policyKey}" has changed since it was read: it was last updated at block ${onChainBlock ?? 'unknown'}, and you passed ` +
+          `${call.expectedUpdatedAtBlock}. Read it again with get_my_policy, show the user what it holds now, and update from that. Nothing was sent.`,
+      }
+    }
+  }
+
+  const assessment = await assessSelfPay(deps.selfPay, call)
+  const self = { fee: 'none' as const, ...assessment }
+
+  // ── Quote: no confirmation, or a dry run. ───────────────────────────────────────────────────────────────
+  if (!a.canWrite) {
+    return {
+      state: 'quoted',
+      paid: false,
+      ...(!a.dryRun && !a.confirmed ? { needsConfirmation: true as const } : {}),
+      policyKey,
+      interpretation,
+      gasOptions: { self },
+      message:
+        `QUOTE ONLY — nothing was sent and nothing was written. Paying the gas yourself: ${selfPayWords(assessment)} ` +
+        (!a.dryRun && !a.confirmed
+          ? `A policy is a spending limit, so a person must agree to it first: show the user what it means (interpretation) and the cost, and only after they say yes call ${a.tool} again with gasPayer "self" and confirm: true. Never pass confirm on your own judgement.`
+          : assessment.status === 'enough'
+            ? `Ask again without dryRun to ${a.verb} it.`
+            : 'Fix that, then ask again without dryRun.'),
+    }
+  }
+  // Unknown is not a yes: a balance or an estimate that could not be read does not get a transaction signed.
+  if (assessment.status !== 'enough') {
+    return {
+      state: 'refused',
+      paid: false,
+      policyKey,
+      interpretation,
+      gasOptions: { self },
+      message:
+        `NOTHING WAS SENT: the wallet cannot confirm it can pay the gas. ${clip(assessment.problems.join(' '), 500)} ` +
+        (assessment.status === 'short'
+          ? 'Top up ZTX or use gasPayer "sponsored".'
+          : 'Fix the cause above and ask again, or use gasPayer "sponsored".'),
+    }
+  }
+
+  // The ceiling the balance was just checked against: a fresh estimate above it is refused with nothing signed.
+  const sent = await deps.selfPay.execute(call, { maxFeeRaw: assessment.gas.requiredRaw as string })
+  switch (sent.kind) {
+    case 'rejected':
+      return { state: 'refused', paid: false, policyKey, interpretation, message: `NOTHING WAS SENT and no gas was spent: ${sent.reason}. Fix the cause and ask again.` }
+    case 'refused': {
+      // An older Wallet BE refuses any contract call that is not a plain transfer from a wallet that has a policy contract. That
+      // says nothing about the policy's limits and retrying cannot help, so it is not worded as "review your policy". It is a decision
+      // (kind "denied") and names UNSUPPORTED_OPERATION; both must hold.
+      if (sent.refusal.kind === 'denied' && /UNSUPPORTED_OPERATION/.test(sent.refusal.reason)) {
+        return {
+          state: 'refused',
+          policyKey,
+          paid: false,
+          interpretation,
+          ...policyRefusalFlags(sent.refusal),
+          message:
+            `No policy was ${done}, nothing was signed and no gas was spent. This Wallet BE refuses to sign this kind of transaction (a contract call that is not a ` +
+            `plain token transfer) for a wallet that already has a policy contract (an older Wallet BE does): ${sent.refusal.reason}. That is not about this ` +
+            `policy's limits and retrying will not help. ` +
+            (deps.client ? 'Use gasPayer "sponsored" instead.' : 'Sponsored is not available either (no policy service is configured).'),
+        }
+      }
+      return {
+        state: sent.refusal.kind === 'denied' ? 'refused' : 'unavailable',
+        policyKey,
+        paid: false,
+        interpretation,
+        ...policyRefusalFlags(sent.refusal),
+        message: describePolicyRefusal(sent.refusal, `No policy was ${done}.`),
+      }
+    }
+    case 'sign_failed':
+      return { state: 'unavailable', paid: false, policyKey, interpretation, message: `Signing failed, so NOTHING WAS SENT and no gas was spent: ${sent.reason}. Trying again shortly is fine.` }
+    case 'unknown':
+      return {
+        state: 'unknown',
+        policyKey,
+        interpretation,
+        message:
+          `The transaction was sent but the node's answer never arrived (${sent.reason}), so it MAY be on chain and the gas MAY be spent. Do NOT send it again. ` +
+          `Read the policy with get_my_policy to see whether it took effect (sent with nonce ${sent.nonce}).`,
+      }
+    case 'submitted': {
+      const landed = await confirmSelfWrite(deps, call, a.pollBudgetMs, sent.txHash)
+      if (landed.kind === 'failed') {
+        return {
+          state: 'write_failed',
+          paid: true,
+          policyKey,
+          txHash: sent.txHash,
+          interpretation,
+          message:
+            `FAILED ON CHAIN: transaction ${sent.txHash} was included and the contract rejected it (error ${landed.errorCode}${landed.errorDesc ? `: ${landed.errorDesc}` : ''}). ` +
+            `The network gas was spent and NOTHING was ${done}: the policy is as it was. Do not just send it again: read the policy with get_my_policy, ` +
+            `find the cause, and quote the transaction hash to support if it is not clear.`,
+        }
+      }
+      if (landed.kind === 'landed') {
+        return {
+          state: 'written',
+          paid: true,
+          policyKey,
+          txHash: sent.txHash,
+          interpretation,
+          message:
+            `The policy "${policyKey}" ${call.operation === 'UPDATE' ? 'was updated' : 'is on chain'}. You paid the network gas only (no service fee); ` +
+            `this wallet read the chain and it holds exactly the attributes that were submitted. Nothing more is needed.`,
+        }
+      }
+      return {
+        state: 'submitted',
+        paid: true,
+        policyKey,
+        txHash: sent.txHash,
+        interpretation,
+        message:
+          (landed.txSucceeded
+            ? `SUBMITTED, AND THE TRANSACTION SUCCEEDED ON CHAIN: transaction ${sent.txHash} succeeded, but the read does not show the ` +
+              `${call.operation === 'UPDATE' ? 'update' : 'policy'} yet (the read may lag, or the policy was changed since). `
+            : `SUBMITTED, NOT CONFIRMED EITHER WAY: the node accepted transaction ${sent.txHash}, but the chain does not show the ` +
+              `${call.operation === 'UPDATE' ? 'update' : 'policy'} yet and the transaction's own result could not be read. It may still be included, or it may ` +
+              `have failed on chain (a failed transaction still costs the gas). `) +
+          `Do NOT send it again. Check with get_my_policy shortly, and if it never appears quote the transaction hash to support.`,
+      }
+    }
+  }
+}
+
 /**
  * Phases 2 and 3, shared by write_policy and update_policy: pick the quote, stop at the price unless a person has agreed,
  * pay through the wallet's own capped payer, bookmark the receipt, and poll the collect. Nothing here knows which write it
@@ -958,15 +1486,33 @@ async function runPaidFlow(
     pollBudgetMs: number
     tool: 'write_policy' | 'update_policy'
     verb: 'write' | 'update'
+    gasPayer?: GasPayer
+    /** What a self-paid write would send. Absent when it cannot be built (an update of a policy that holds no validity window). */
+    selfCall?: SelfPayCall
+    /** Why a self-paid write is not on offer for this one, when it is not (an unreadable vocabulary, a policy with no window). */
+    selfUnavailable?: string
   },
 ): Promise<WritePolicyResult> {
   const { policyKey, interpretation, dryRun, confirmed, canWrite } = a
+  // ── Who pays the gas is the user's choice, never the wallet's: nothing below runs until it is made. A self-paid write never
+  //    reaches here (it does not contact the service); only "sponsored", or no choice yet, does.
   // ── Phase 2. The wallet's own capped payer builds the header; nothing here signs. ───────────
   const accepts = (a.challenge.accepts ?? []) as Accept[]
-  const accept = deps.chooseAccept(accepts)
+  // "Sponsored" means a quote that really covers the gas, whatever GAS_PREFERENCE orders first: a user who chose it, or who is
+  // being offered it, must not end up paying the gas themselves under that name.
+  const offersChoice = a.gasPayer === undefined && deps.selfPay !== undefined
+  const sponsoredOnly = a.gasPayer === 'sponsored' || offersChoice
+  const pool = sponsoredOnly ? accepts.filter((x) => isSponsored(x as unknown as PayRequirement)) : accepts
+  const accept = deps.chooseAccept(pool)
   if (!accept) {
-    return unavailable('The service quoted a price but offered no payment option this wallet can use.')
+    if (offersChoice) return offerGasChoice(deps, a, undefined)
+    return unavailable(
+      sponsoredOnly
+        ? 'The service offered no sponsored payment (one that covers the network gas), so gasPayer "sponsored" is not available for this write. NOTHING WAS PAID.'
+        : 'The service quoted a price but offered no payment option this wallet can use.',
+    )
   }
+  if (offersChoice) return offerGasChoice(deps, a, accept)
 
   // Without `confirm: true` the call stops at the price, exactly like a dry run. Paying writes a spending limit, which can lift
   // the wallet's own default cap, so it needs a person's yes, not just the agent's call.
@@ -975,32 +1521,7 @@ async function runPaidFlow(
     // this line pays, and nothing pays without going through `deps.pay`. The price comes from the
     // 402 itself — the one authoritative figure, since an admin pricing row can override the
     // service's compiled-in fallback.
-    const asset = clip(String(accept.asset ?? ''), 100)
-    const amount = clip(String(accept.maxAmountRequired ?? ''), 40)
-    const extra = (accept.extra ?? {}) as Record<string, unknown>
-    let amountHuman: string | undefined
-    if (deps.describeAmount && amount !== '') {
-      // A failed lookup costs the friendly form and nothing else — the quote stands without it.
-      amountHuman = await deps.describeAmount(asset, amount).then(
-        (text) => clip(text, 120),
-        () => undefined,
-      )
-    }
-    // A failed check is an UNKNOWN, stated as such — never silence, which reads as "fine".
-    let affordability: Affordability | undefined
-    if (deps.checkAffordability) {
-      affordability = await deps.checkAffordability(accept).catch(
-        (): Affordability => ({
-          verdict: 'unknown',
-          fee: { status: 'unknown', required: amount },
-          gas: { status: 'unknown' },
-          // No `cap`: an invented one reads, to a structured consumer, as "no cap key matches this asset".
-          feeNotEstimated: false,
-          problems: ['Whether this wallet can afford it could not be checked.'],
-          notChecked: ['The affordability check itself failed, so nothing about balances or the cap is known.'],
-        }),
-      )
-    }
+    const { asset, amount, extra, amountHuman, affordability } = await describeQuote(deps, accept)
     const worded = affordability ? affordabilityWords(affordability) : undefined
     return {
       state: 'quoted',
@@ -1206,6 +1727,8 @@ export interface UpdatePolicyInput {
   dryRun?: boolean
   /** See {@link WritePolicyInput.confirm}. Must be exactly `true` to pay. */
   confirm?: boolean
+  /** See {@link WritePolicyInput.gasPayer}. */
+  gasPayer?: string
 }
 
 /**
@@ -1227,8 +1750,11 @@ function blockString(value: unknown): string | undefined {
 }
 
 export async function updatePolicy(deps: WritePolicyDeps, input: UpdatePolicyInput): Promise<WritePolicyResult> {
+  const gas = parseGasPayer(input?.gasPayer)
+  if (!gas.ok) return refusedGasPayer(input?.policyKey)
   const client = deps.client
-  if (!client) {
+  // The service is needed to quote and collect a SPONSORED update; a self-paid one never contacts it.
+  if (!client && gas.gasPayer !== 'self' && !(gas.gasPayer === undefined && deps.selfPay)) {
     return unavailable(
       `No policy write service is configured for ${deps.network ?? 'this network'}, so nothing was ` +
         `attempted and nothing was paid.`,
@@ -1378,6 +1904,54 @@ export async function updatePolicy(deps: WritePolicyDeps, input: UpdatePolicyInp
   const dryRun = isDryRun(input.dryRun)
   const confirmed = input.confirm === true
   const canWrite = confirmed && !dryRun
+  // The chain takes the whole policy on an update, so the bounds are sent, never left to be defaulted: a missing one would be stored
+  // as none. They were carried from the policy above unless named, so a missing one here means the policy itself held none.
+  const selfCall: SelfPayCall | undefined =
+    validFromBlock !== undefined && validToBlock !== undefined
+      ? {
+          operation: 'UPDATE',
+          policyKey: input.policyKey,
+          attributes,
+          validFromBlock,
+          validToBlock,
+          templateContractAddress: contract !== undefined && contract !== '' ? contract : deps.templateContract,
+          templateId,
+          expectedUpdatedAtBlock: expected,
+        }
+      : undefined
+  const blocker = selfBlocker(deps, checked)
+  if (gas.gasPayer === 'self') {
+    if (!selfCall) {
+      return {
+        state: 'refused',
+        paid: false,
+        policyKey: input.policyKey,
+        interpretation,
+        message:
+          `The policy holds no validFromBlock / validToBlock to keep and none was given, and a self-paid update replaces the whole ` +
+          `policy, so it would store none. NOTHING WAS PAID. Name both (use "0" for no limit) and ask again.`,
+      }
+    }
+    return runSelfPay(deps, {
+      call: selfCall,
+      interpretation,
+      dryRun,
+      confirmed,
+      canWrite,
+      pollBudgetMs: input.pollBudgetMs ?? DEFAULT_BUDGET_MS,
+      tool: 'update_policy',
+      verb: 'update',
+      ...(blocker ? { unavailable: blocker } : {}),
+    })
+  }
+  const selfUnavailable = blocker ?? (!selfCall ? NO_WINDOW_REASON : undefined)
+  if (!client) {
+    // No service to quote the sponsored side, so the choice is put with self-pay alone.
+    if (gas.gasPayer === undefined && deps.selfPay) {
+      return offerGasChoice(deps, { ...(selfCall ? { selfCall } : {}), ...(selfUnavailable ? { selfUnavailable } : {}), policyKey: input.policyKey, interpretation, tool: 'update_policy', verb: 'update' }, undefined)
+    }
+    return unavailable('No policy write service is configured, so nothing was attempted and nothing was paid.')
+  }
   const pre = await client.precheckUpdate(request)
 
   switch (pre.kind) {
@@ -1446,6 +2020,9 @@ export async function updatePolicy(deps: WritePolicyDeps, input: UpdatePolicyInp
         pollBudgetMs: input.pollBudgetMs ?? DEFAULT_BUDGET_MS,
         tool: 'update_policy',
         verb: 'update',
+        ...(selfCall ? { selfCall } : {}),
+        ...(selfUnavailable ? { selfUnavailable } : {}),
+        ...(gas.gasPayer ? { gasPayer: gas.gasPayer } : {}),
       })
   }
 }

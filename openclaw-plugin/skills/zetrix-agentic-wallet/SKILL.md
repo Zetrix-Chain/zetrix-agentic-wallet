@@ -286,7 +286,7 @@ cannot catch a raw value that is already one whole token or more, and it does no
 token's decimals cannot be read, so always show interpretation and notChecked. A window is a duration
 such as 7d, 12h or 30m — never "week" and never a bare number.
 
-**A policy write that is `settling` or `submitted` has ALREADY BEEN PAID FOR.** No policy exists
+**On the sponsored path, a policy write that is `settling` or `submitted` has ALREADY BEEN PAID FOR.** No policy exists
 yet, and that is the normal window rather than a failure. Never call `write_policy` again for it —
 pass its `paymentReceipt` to `check_policy_write`, which never pays. `submitted` carries a
 `txHash` and still is not a written policy: the block has not confirmed it, so do not tell the user
@@ -299,8 +299,10 @@ update is refused for free (`modified`) and nothing is paid — read it again an
 FULL replacement set, not a patch, so start from the current attributes and change only what the user asked. Do not pass a
 templateId (the policy keeps its own), and the validity window is kept unless the user names a new one. An update pays a fee, so the
 same rules as `write_policy` apply: preflight it, show the interpretation and the price, and pass `confirm: true` only after the user
-has said yes. `settling` and `submitted` mean a payment has been made — pass the `paymentReceipt` to `check_policy_write`, never call
+has said yes. On the sponsored path `settling` and `submitted` mean a payment has been made — pass the `paymentReceipt` to `check_policy_write`, never call
 `update_policy` again for it, and do not say the policy is updated until the state is `written`.
+
+**Who pays the gas is the user's choice (`gasPayer`).** `"sponsored"` pays the fee in JMYR and the gas is covered; `"self"` costs no fee and only the network gas in ZTX. When `write_policy` or `update_policy` returns `needs_choice`, show the user both options and what each costs, let them pick, and call again with `gasPayer` and `confirm: true`; never choose for them. A self-paid write has **no `paymentReceipt`, and `check_policy_write` does not apply to it**: `submitted` means the network gas is spent, so do NOT send it again — check `get_my_policy` and quote the `txHash`; `unknown` means it may be on chain — do NOT send it again, check `get_my_policy` and quote the nonce; `write_failed` means the transaction was included and rejected — the gas is spent and nothing was written. Self-paid gas is spent even when the write fails on chain.
 
 **`remove_policy` removes every limit the policy set.** Once it is gone Wallet BE signs spends of that asset without any limit, so show
 the user what the policy currently limits (the unconfirmed call returns it as `currentAttributes`) and what removing it means, and call

@@ -67,6 +67,7 @@ import { PolicyWriteClient } from './clients/policy-write-client.js'
 import { createVocabularyReader, type VocabularyRead } from './clients/policy-vocabulary-client.js'
 import { createFsPolicyWriteReceiptStore } from './clients/policy-write-receipt-store.js'
 import type { WritePolicyDeps } from './orchestrator/write-policy.js'
+import { createSelfPay, type SelfPayChainDeps, type TxLookup } from './orchestrator/policy-self-pay.js'
 import { policyPreflight, type DraftPolicy, type PolicyPreflightDeps } from './orchestrator/policy-preflight.js'
 import { checkAffordability } from './orchestrator/policy-affordability.js'
 import { getTemplateById, readOwnerPolicy } from './clients/policy-read-client.js'
@@ -336,7 +337,7 @@ export function buildToolList() {
         'payment that writes NOTHING, and a collect that finishes the write once the payment ' +
         'settles. Between the payment and the settlement A PAYMENT HAS BEEN MADE and no policy ' +
         'exists — that window is normal, not a failure. ' +
-        'If `state` is "settling" or "submitted", A PAYMENT HAS BEEN MADE: never call this tool ' +
+        'On the sponsored path, if `state` is "settling" or "submitted", A PAYMENT HAS BEEN MADE: never call this tool ' +
         'again for the same policy, never tell the user it failed, and pass `paymentReceipt` to ' +
         'check_policy_write instead. "submitted" means the transaction is on chain but the block ' +
         'has not confirmed it — do NOT report the policy as created, even though a txHash is ' +
@@ -353,11 +354,18 @@ export function buildToolList() {
         'were not charged, and never tell them they were. ' +
         '"receipt_void" is the one state where paying again is correct — the settlement failed and ' +
         'the receipt bought nothing; `payFresh` is set to say so. ' +
-        '"write_failed" and "unknown" both mean money moved and paying again would NOT help: quote ' +
+        'On the sponsored path, "write_failed" and "unknown" both mean money moved and paying again would NOT help: quote ' +
         '`paymentReceipt` to support rather than retrying. ' +
         'To find a templateId, call get_policy_template_schema with no arguments — it lists the ' +
         'templates with their ids. Never invent one. The template contract address is never the ' +
         "user's to supply, so leave it out rather than asking. " +
+        'Who pays the gas is the USER\'s choice: if this returns "needs_choice", show the user both options (sponsored: a JMYR fee; self: ZTX for network gas, no fee), let them pick, and call again with gasPayer and confirm: true. ' +
+        'Never choose for them. ' +
+        'With gasPayer "self" there is no paymentReceipt and check_policy_write does not apply. ' +
+        'A self-paid "submitted" means the network gas is spent: do NOT send it again, check get_my_policy, and quote the txHash to support. ' +
+        'A self-paid "unknown" means it may be on chain: do NOT send it again, check get_my_policy, and quote the nonce. ' +
+        'A self-paid "write_failed" means the transaction was included and rejected: the gas is spent and nothing was written. ' +
+        'Self-paid gas is spent even when the write fails on chain. ' +
         'To learn the price BEFORE paying, pass dryRun: it runs every free check and returns the ' +
         'service\'s quote, paying nothing and writing no policy. "quoted" means that — no payment was ' +
         'made. It also reports `affordability`: whether this wallet currently holds the quoted amount of ' +
@@ -455,6 +463,15 @@ export function buildToolList() {
               'paid for it only keeps a local bookmark so check_policy_write can finish it. ' +
               'Use it first so the user knows the cost before anything is paid.',
           },
+          gasPayer: {
+            type: 'string',
+            enum: ['sponsored', 'self'],
+            description:
+              'Who pays the gas to write. "sponsored": the fee is paid in JMYR and the network gas is covered, so no ZTX is needed. ' +
+              '"self": no fee, only the network gas in ZTX. Leave it out unless the user has chosen: when the wallet can pay the gas ' +
+              'itself, a call without it returns state "needs_choice" with both options and what each would cost, and the user ' +
+              'decides. Never choose for the user.',
+          },
         },
         required: ['policyKey', 'attributes', 'templateId'],
       },
@@ -481,7 +498,7 @@ export function buildToolList() {
         'The flow is the same three steps as write_policy: a free pre-check, a payment that changes NOTHING, and a collect ' +
         'that applies the update once the payment settles. Between the payment and the settlement A PAYMENT HAS BEEN MADE ' +
         'and the policy is still unchanged — that window is normal, not a failure. ' +
-        'If `state` is "settling" or "submitted", A PAYMENT HAS BEEN MADE: never call this tool again for the same policy, ' +
+        'On the sponsored path, if `state` is "settling" or "submitted", A PAYMENT HAS BEEN MADE: never call this tool again for the same policy, ' +
         'never tell the user it failed, and pass `paymentReceipt` to check_policy_write instead. "submitted" means the ' +
         'transaction is on chain but the block has not confirmed it — do NOT report the policy as updated, even though a ' +
         'txHash is present. ' +
@@ -494,9 +511,16 @@ export function buildToolList() {
         'way about whether the fee was taken — never tell the user they were not charged, and never tell them they were. ' +
         '"receipt_void" is the one state where paying again is correct — the settlement failed and the receipt bought ' +
         'nothing; `payFresh` is set to say so. ' +
-        '"write_failed" means the update was NOT applied and the policy is unchanged, but a payment may have been taken: ' +
-        'paying again would not help, so quote `paymentReceipt` to support rather than retrying. "unknown" also means money ' +
+        'On the sponsored path, "write_failed" means the update was NOT applied and the policy is unchanged, but a payment may have been taken: ' +
+        'paying again would not help, so quote `paymentReceipt` to support rather than retrying. On the sponsored path "unknown" also means money ' +
         'moved without a verdict: do the same. ' +
+        'Who pays the gas is the USER\'s choice: if this returns "needs_choice", show the user both options (sponsored: a JMYR fee; self: ZTX for network gas, no fee), let them pick, and call again with gasPayer and confirm: true. ' +
+        'Never choose for them. ' +
+        'With gasPayer "self" there is no paymentReceipt and check_policy_write does not apply. ' +
+        'A self-paid "submitted" means the network gas is spent: do NOT send it again, check get_my_policy, and quote the txHash to support. ' +
+        'A self-paid "unknown" means it may be on chain: do NOT send it again, check get_my_policy, and quote the nonce. ' +
+        'A self-paid "write_failed" means the transaction was included and rejected: the gas is spent and nothing was written. ' +
+        'Self-paid gas is spent even when the write fails on chain. ' +
         'To learn the price BEFORE paying, pass dryRun: it runs every free check and returns the service\'s quote, paying ' +
         'nothing and changing no policy. Tell the user what it says before they decide to pay. ' +
         'To lift a policy\'s limits entirely, that is remove_policy, not an update with no attributes. ' +
@@ -558,6 +582,15 @@ export function buildToolList() {
             description:
               'Return the price instead of updating, with whether this wallet can afford it. Pays nothing and changes no ' +
               'policy. Use it first so the user knows the cost before anything is paid.',
+          },
+          gasPayer: {
+            type: 'string',
+            enum: ['sponsored', 'self'],
+            description:
+              'Who pays the gas to update. "sponsored": the fee is paid in JMYR and the network gas is covered, so no ZTX is needed. ' +
+              '"self": no fee, only the network gas in ZTX. Leave it out unless the user has chosen: when the wallet can pay the gas ' +
+              'itself, a call without it returns state "needs_choice" with both options and what each would cost, and the user ' +
+              'decides. Never choose for the user.',
           },
           pollBudgetMs: {
             type: 'number',
@@ -1291,6 +1324,40 @@ type Payer = (accept: PayRequirement) => Promise<string>
  * existed to close, so this extends the pattern rather than adding a seam beside it.
  */
 /**
+ * Look one transaction up by its hash. `error_code` 0 is success and any other whole number is the contract's own rejection (the gas
+ * is spent and nothing was written). The SDK hands every NESTED number back as a string, so the code is read as either; anything else,
+ * a missing transaction, a hash that is not the one asked for, a throw, is "unknown", which says nothing either way.
+ */
+export function buildTransactionLookup(
+  getInfo: (hash: string) => Promise<{
+    errorCode: number
+    result?: { transactions?: Array<{ error_code?: string | number; error_desc?: string; hash?: string }> }
+  }>,
+): (txHash: string) => Promise<TxLookup> {
+  return async (txHash) => {
+    try {
+      const res = await getInfo(txHash)
+      const tx = res?.errorCode === 0 ? res.result?.transactions?.[0] : undefined
+      if (!tx) return { status: 'unknown' }
+      // When the node names the transaction, it must be the one asked about.
+      if (typeof tx.hash === 'string' && tx.hash.toLowerCase() !== String(txHash).toLowerCase()) return { status: 'unknown' }
+      const raw = tx.error_code
+      const code =
+        typeof raw === 'number' && Number.isSafeInteger(raw) && raw >= 0
+          ? raw
+          : typeof raw === 'string' && /^\d{1,9}$/.test(raw)
+            ? Number(raw)
+            : undefined
+      if (code === undefined) return { status: 'unknown' }
+      if (code === 0) return { status: 'success' }
+      return { status: 'failed', errorCode: code, ...(typeof tx.error_desc === 'string' && tx.error_desc !== '' ? { errorDesc: tx.error_desc } : {}) }
+    } catch {
+      return { status: 'unknown' }
+    }
+  }
+}
+
+/**
  * Everything the two policy-write tools need, or nothing.
  *
  * Returned as a spread, like buildAddressValidator. Be precise about what that buys, because the
@@ -1346,14 +1413,25 @@ export function buildPolicyWriteDeps(input: {
    * the policy contracts are not deployed: an update then refuses rather than paying for something it cannot check.
    */
   policyRegistryAddress?: string
+  /**
+   * What a self-paid write needs to build, sign and submit its own transaction. Together with `policyRegistryAddress` it is what
+   * makes the tools offer the choice of who pays the gas; without either, nothing changes and only the sponsored path exists.
+   */
+  selfPayChain?: Omit<SelfPayChainDeps, 'registryAddress' | 'ownerAddress'>
 }): { policyWriteDeps?: WritePolicyDeps } {
   // Both, not either. Without a template contract there is nothing to type a draft against, and
   // a write that cannot be checked for free is one this wallet will not pay for.
-  if (!input.policyWriteUrl || !input.policyTemplateAddress) return {}
+  // The service is needed for the sponsored path, and for the attribute vocabulary a self-paid write is checked against (it has no
+  // service to catch what the vocabulary would have), so without a service URL nothing here can write. Where one is set the tools
+  // exist, and a sponsored call with no client says so rather than failing against a guessed host.
+  const canSelfPay = Boolean(input.policyRegistryAddress && input.selfPayChain && input.readVocabulary)
+  if (!input.policyTemplateAddress || (!input.policyWriteUrl && !canSelfPay)) return {}
   const templateContract = input.policyTemplateAddress
   return {
     policyWriteDeps: {
-      client: new PolicyWriteClient(input.policyWriteUrl, (url, init) => fetch(url, init)),
+      ...(input.policyWriteUrl ? { client: new PolicyWriteClient(input.policyWriteUrl, (url, init) => fetch(url, init)) } : {}),
+      // A self-paid write has no service to catch what the attribute vocabulary would have, so it needs a vocabulary to check against.
+      hasVocabularySource: Boolean(input.readVocabulary),
       receipts: createFsPolicyWriteReceiptStore(join(input.stateDir, 'policy-write-receipts')),
       // The one narrowing left, and it is here rather than at the call site so the call site
       // cannot pass something else entirely. The orchestrator describes an accept as an opaque
@@ -1372,6 +1450,15 @@ export function buildPolicyWriteDeps(input: {
         ? {
             readPolicy: (policyKey: string) =>
               readOwnerPolicy(input.ownerAddress, input.policyRegistryAddress as string, policyKey, input.chainQuery),
+          }
+        : {}),
+      ...(input.policyRegistryAddress && input.selfPayChain
+        ? {
+            selfPay: createSelfPay({
+              registryAddress: input.policyRegistryAddress,
+              ownerAddress: input.ownerAddress,
+              ...input.selfPayChain,
+            }),
           }
         : {}),
       checkAffordability: (accept) =>
@@ -1591,7 +1678,7 @@ export function buildPayers(
     // it tempting to file beside credential issuance — but the credential allowance exists to let
     // a wallet buy CREDENTIALS, and a policy write drawing on it would spend an allowance granted
     // for something else. maxPaymentAmount is the map a user raises when they mean "this wallet
-    // may spend", and it defaults to 1 JMYR per call on both networks (it was refuse-all on mainnet), a limit for a
+    // may spend", and it defaults to 1 JMYR per call on both networks (now; it was refuse-all on mainnet), a limit for a
     // path that puts a spending policy on chain.
     payForPolicyWrite: makePay(config.maxPaymentAmount),
     preflightCaps: config.credentialIssuanceCaps,
@@ -2049,6 +2136,24 @@ async function main(): Promise<void> {
       readVocabulary: readPolicyVocabulary,
       policyGoverns,
       policyRegistryAddress: config.policyRegistryAddress,
+      selfPayChain: {
+        fetchNonce: (address) => PaymentEngine.fetchNonce(address, node),
+        estimateFee: (p) => PaymentEngine.estimateFee(p, node),
+        buildBlob: (p) => {
+          const built = sdk.transaction.buildBlob(p)
+          if (built.errorCode !== 0 || !built.result) {
+            throw new Error(`buildBlob failed: ${built.errorDesc ?? 'unknown'} (errorCode ${built.errorCode})`)
+          }
+          return { blob: built.result.transactionBlob }
+        },
+        sign: walletBeSignerFn,
+        // The same submit wrapper transfer_token uses, so a node refusal is told apart from an answer that never came.
+        submit: transferDeps.submit,
+        queryNativeBalance: () => queryTokenBalance('ZTX'),
+        // What became of a submitted transaction, so one that was included and then rejected by the contract (the gas is still spent)
+        // is reported as that.
+        getTransaction: buildTransactionLookup((hash) => sdk.transaction.getInfo(hash)),
+      },
     }),
     ...(readPolicyVocabulary ? { readPolicyVocabulary } : {}),
     chainQuery: contractQuery,

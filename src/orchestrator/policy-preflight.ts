@@ -95,6 +95,11 @@ export interface PolicyPreflightResult {
    * will be written. `write_policy` applies it, so the value paid for is the value shown here.
    */
   convertedAmounts?: Record<string, string>
+  /**
+   * Set when the service's attribute vocabulary exists but could not be read, so the checks that depend on it did not run. The
+   * sponsored write has the service as a backstop for what they would have caught; a self-paid one has none, and refuses.
+   */
+  vocabularyUnread?: true
 }
 
 export interface PolicyPreflightDeps {
@@ -1398,6 +1403,7 @@ export async function policyPreflight(
     ready: blockers.length === 0,
     ...(declared ? { declared } : {}),
     ...(amountPass.converted ? { convertedAmounts: amountPass.converted } : {}),
+    ...(fromService.unread ? { vocabularyUnread: true as const } : {}),
     blockers,
     interpretation,
     notChecked,

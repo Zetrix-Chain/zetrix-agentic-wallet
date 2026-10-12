@@ -1,5 +1,5 @@
 /**
- * The confirm gate also covers COLLECTING a write that was paid for elsewhere.
+ * the confirm gate also covers COLLECTING a write that was paid for elsewhere.
  *
  * Without this a prompt-injected agent could pay the policy-write fee through `pay_and_fetch` (the service takes the payment and
  * answers with a receipt, writing nothing), then call `write_policy` with no `confirm`: the pre-check answers 409

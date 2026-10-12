@@ -206,7 +206,7 @@ export const UNVERIFIED_MAINNET_MYID_VERIFY_LINK_TEMPLATE = 'https://myid-verifi
 /**
  * MyID's universal link for create_verification_qr, per network.
  *
- * TESTNET (UAT): read from the MyID app's own registration, not from a description of it. ssivc-api-uat.myegdev.com publishes
+ * TESTNET (UAT): read from the MyID app's own registration, not from a description of it. ssivc-api-uat.myegdev2.com publishes
  * an apple-app-site-association that claims exactly `/api/agentic-verify` with a `referenceId` query (and an assetlinks.json
  * for com.zetrix.myid.uat), and serves a "open this on your phone" page at that address. The first link the wallet was given,
  * `/v1/agent-verification/{referenceId}`, is claimed by neither: the phone opened the browser and the server answered 404.
@@ -219,7 +219,7 @@ export const UNVERIFIED_MAINNET_MYID_VERIFY_LINK_TEMPLATE = 'https://myid-verifi
  * phone" page. MYID_VERIFY_LINK_TEMPLATE is the way to opt in before then.
  */
 function deriveMyidVerifyLinkTemplate(network: string): string | undefined {
-  return network.includes('testnet') ? 'https://ssivc-api-uat.myegdev.com/api/agentic-verify?referenceId={referenceId}' : undefined
+  return network.includes('testnet') ? 'https://ssivc-api-uat.myegdev2.com/api/agentic-verify?referenceId={referenceId}' : undefined
 }
 
 function deriveMbiBaseUrl(network: string): string {
@@ -304,7 +304,7 @@ export const UNVERIFIED_MAINNET_SSIVC_BASE_URL = 'https://verifyid-api.zetrix.co
  * that host is confirmed reachable.
  */
 function deriveSsivcBaseUrl(network: string): string | undefined {
-  return network.includes('testnet') ? 'https://ssivc-api-uat.myegdev.com/api' : undefined
+  return network.includes('testnet') ? 'https://ssivc-api-uat.myegdev2.com/api' : undefined
 }
 
 /**
@@ -334,7 +334,8 @@ const TOKEN_REGISTRY: Record<string, { testnet: string; mainnet: string }> = {
  * **Mainnet now carries the same default as testnet: 1 JMYR per call, everything else refused.** This was
  * refuse-all on mainnet, deliberately, because `pay_and_fetch` is the confused-deputy surface: a prompt-injected or
  * misled agent can point it at a hostile endpoint, and a permissive default auto-pays real value with nobody having
- * configured anything. Giving mainnet the same default is a deliberate decision; what it
+ * configured anything. Giving mainnet the same default is a deliberate decision;
+ * what it
  * costs is that an unconfigured mainnet wallet can now be made to pay up to 1 JMYR per call to an arbitrary URL, with no
  * running total. An explicit `MAX_PAYMENT_AMOUNT` replaces it, and a spending policy for JMYR stands it aside.
  *

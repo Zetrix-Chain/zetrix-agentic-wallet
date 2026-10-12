@@ -4081,14 +4081,14 @@ describe('checkAiBirthcertVerification', () => {
       sessionId: 's-1',
       agentName: 'Procurement Assistant',
       createdAt: '2026-08-13T09:00:00.000Z',
-      verificationUrl: 'https://ssivc-api-uat.myegdev.com/verify/s-1',
+      verificationUrl: 'https://ssivc-api-uat.myegdev2.com/verify/s-1',
     })
 
     const out = await checkAiBirthcertVerification(deps as never)
 
     expect(out).toMatchObject({
       status: 'pending',
-      verificationUrl: 'https://ssivc-api-uat.myegdev.com/verify/s-1',
+      verificationUrl: 'https://ssivc-api-uat.myegdev2.com/verify/s-1',
       // The expiry comes from SSIVC on every call, not from the store — the agent needs to say how
       // long the link is good for, and a locally cached value would go stale.
       expiresAt: '2026-08-13T09:30:00+00:00',
@@ -4106,7 +4106,7 @@ describe('checkAiBirthcertVerification', () => {
       sessionId: 's-1',
       agentName: 'Procurement Assistant',
       createdAt: '2026-08-13T09:00:00.000Z',
-      verificationUrl: 'https://ssivc-api-uat.myegdev.com/verify/s-1',
+      verificationUrl: 'https://ssivc-api-uat.myegdev2.com/verify/s-1',
     })
     getSession.mockResolvedValue({ sessionId: 's-1', status: 'issued', expiresAt: '2026-08-13T09:30:00+00:00', vcId: 'did:zid:vc-1' })
 
@@ -4124,7 +4124,7 @@ describe('checkAiBirthcertVerification', () => {
       sessionId: 's-1',
       agentName: 'Procurement Assistant',
       createdAt: '2026-08-13T09:00:00.000Z',
-      verificationUrl: 'https://ssivc-api-uat.myegdev.com/verify/s-1',
+      verificationUrl: 'https://ssivc-api-uat.myegdev2.com/verify/s-1',
     })
     getSession.mockResolvedValue({ sessionId: 's-1', status: 'expired', expiresAt: '2026-08-13T09:30:00+00:00' })
 

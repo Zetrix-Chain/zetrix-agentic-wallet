@@ -1,5 +1,5 @@
 /**
- * When the owner's spending policy governs an asset, the DEFAULT wallet cap for that asset stands aside.
+ * when the owner's spending policy governs an asset, the DEFAULT wallet cap for that asset stands aside.
  *
  * The rule bypasses a safety limit, so the tests are mostly about when it must NOT: an explicit cap, a policy for another
  * asset, a policy with no per-transaction cap, a bounded policy, a failed read.

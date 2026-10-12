@@ -30,7 +30,7 @@ describe('loadConfig', () => {
       zidResolverBaseUrl: 'https://zid-resolver-sandbox.zetrix.com',
       policyRegistryAddress: 'ZTX3Z2Fgsssx5fVq5v8EnhTBh6mqxJ8FQFqnk',
       policyTemplateAddress: 'ZTX3WfTbuZwsLQDWe4f7mzrfULiNdDU84BLJ5',
-      myidVerifyLinkTemplate: 'https://ssivc-api-uat.myegdev.com/api/agentic-verify?referenceId={referenceId}',
+      myidVerifyLinkTemplate: 'https://ssivc-api-uat.myegdev2.com/api/agentic-verify?referenceId={referenceId}',
       // Derived like the other policy addresses; undefined on mainnet, where there is no policy
       // system to have a publisher for (see derivePolicyTemplatePublisher).
       policyTemplatePublisher: 'ZTX3QFo5oc3Ep8rdJZKgfPDFNN29qjxn5ofED',
@@ -42,7 +42,7 @@ describe('loadConfig', () => {
       credentialIssuanceCaps: { ZTX3WeinXtt28YMyr4vUZ14ddTgEMGeuc1e6b: '1000000', '*': '0' },
       paymentCapsExplicit: false,
       stateDir: join(homedir(), '.agentic-wallet-mcp'),
-      ssivcBaseUrl: 'https://ssivc-api-uat.myegdev.com/api',
+      ssivcBaseUrl: 'https://ssivc-api-uat.myegdev2.com/api',
       aiBirthcertVerifiedTemplateId: 'did:zid:9641ee92552e9bcec672f300b071ff86d340ac78c83c225e95971cab8108fb80',
       gasPreference: 'sponsored',
       maxSettlementAttempts: 20,
@@ -133,7 +133,7 @@ describe('loadConfig', () => {
   })
 
   it('auto-derives the testnet SSIVC base URL, and honors an SSIVC_BASE_URL override (stripping a trailing slash)', () => {
-    expect(loadConfig(base).ssivcBaseUrl).toBe('https://ssivc-api-uat.myegdev.com/api')
+    expect(loadConfig(base).ssivcBaseUrl).toBe('https://ssivc-api-uat.myegdev2.com/api')
     const cfg = loadConfig({ ...base, SSIVC_BASE_URL: 'https://ssivc-custom.example.com/api/' } as NodeJS.ProcessEnv)
     expect(cfg.ssivcBaseUrl).toBe('https://ssivc-custom.example.com/api')
   })
@@ -408,10 +408,10 @@ describe('policy contract addresses', () => {
 })
 
 describe('MYID_VERIFY_LINK_TEMPLATE', () => {
-  // UAT's link is the one the MyID app is registered for: ssivc-api-uat.myegdev.com publishes an apple-app-site-association that
+  // UAT's link is the one the MyID app is registered for: ssivc-api-uat.myegdev2.com publishes an apple-app-site-association that
   // claims exactly /api/agentic-verify with a referenceId query. The first link the wallet was given, /v1/agent-verification/{id},
   // matched none of it: the phone opened the browser and the server answered 404.
-  const UAT_LINK = 'https://ssivc-api-uat.myegdev.com/api/agentic-verify?referenceId={referenceId}'
+  const UAT_LINK = 'https://ssivc-api-uat.myegdev2.com/api/agentic-verify?referenceId={referenceId}'
 
   it('defaults to the UAT universal link on testnet, so nobody has to set it', () => {
     expect(loadConfig(base).myidVerifyLinkTemplate).toBe(UAT_LINK)
@@ -466,7 +466,7 @@ describe('MYID_VERIFY_LINK_TEMPLATE', () => {
     const link = buildVerificationLink(loadConfig(base).myidVerifyLinkTemplate, 'v2-e61eab66-45e2-4716-a7a2-37798be7ebf4')
     const url = new URL(link)
 
-    expect(url.origin).toBe('https://ssivc-api-uat.myegdev.com')
+    expect(url.origin).toBe('https://ssivc-api-uat.myegdev2.com')
     expect(url.pathname).toBe('/api/agentic-verify')
     expect(url.searchParams.get('referenceId')).toBe('v2-e61eab66-45e2-4716-a7a2-37798be7ebf4')
   })

@@ -32,7 +32,31 @@ declare module 'zetrix-sdk-nodejs' {
     errorDesc?: string
     result?: { hash?: string }
   }
+  interface BuildBlobResult {
+    errorCode: number
+    errorDesc?: string
+    result?: { transactionBlob: string }
+  }
+  interface TransactionInfoResult {
+    errorCode: number
+    errorDesc?: string
+    /**
+     * `transactions[0].error_code` is the transaction's own outcome: 0 when it succeeded. The SDK turns every NESTED number into a string
+     * (only the top-level `errorCode` stays a number), so the code arrives as `"0"` or `"151"`.
+     */
+    result?: { transactions?: Array<{ error_code?: string | number; error_desc?: string; hash?: string }> }
+  }
   interface ZetrixTransaction {
+    /** Look one transaction up by its hash. */
+    getInfo(hash: string): Promise<TransactionInfoResult>
+    /** Serialise a transaction locally (no network call). Operations are the SDK's own spec objects. */
+    buildBlob(args: {
+      sourceAddress: string
+      nonce: string
+      gasPrice: string
+      feeLimit: string
+      operations: Array<{ type: string; data: Record<string, unknown> }>
+    }): BuildBlobResult
     /** Broadcast an already-signed blob. `signature` is [{ signData, publicKey }]. */
     submit(args: { blob: string; signature: Array<{ signData: string; publicKey: string }> }): Promise<SubmitResult>
   }

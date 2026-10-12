@@ -292,7 +292,7 @@ describe('SKILL.md', () => {
       // Result/error codes and commands the skill legitimately names, which are not tools.
       (n) =>
         !walletToolNames.includes(n) &&
-        !['not_activated', 'resource_payment', 'export_credentials', 'query_failed', 'unknown_token'].includes(n),
+        !['not_activated', 'resource_payment', 'export_credentials', 'query_failed', 'unknown_token', 'needs_choice', 'write_failed'].includes(n),
     )
     expect(unknown).toEqual([])
   })
