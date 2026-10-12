@@ -77,7 +77,7 @@ function selfPayDeps(over: Partial<SelfPayDeps> = {}): SelfPayDeps {
   return {
     estimateGas: vi.fn(async () => ({ gasRaw: '1000000' })),
     queryNativeBalance: vi.fn(async () => ztx('5000000')),
-    execute: vi.fn(async () => ({ kind: 'submitted' as const, txHash: 'tx-1', nonce: '7', feeLimit: '1000000' })),
+    execute: vi.fn(async () => ({ kind: 'submitted' as const, txHash: 'tx-1', nonce: '7', feeLimit: '1000000', ceilLedgerSeq: '1060' })),
     ...over,
   }
 }

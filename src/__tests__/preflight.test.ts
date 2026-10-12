@@ -87,9 +87,11 @@ describe('credentialPreflight — know before you pay (R1)', () => {
     expect(paid.notChecked.join(' ')).not.toMatch(/still free at apply time/)
   })
 
-  // Gas is not the fee. A free credential on a self-pay gas model still needs ZTX, so suppressing
-  // the fee blocker must not suppress this one — that would trade one wrong answer for another.
-  it('still blocks on missing ZTX gas even when issuance is free', async () => {
+  // Free means no payment is made, so no transaction is sent and no gas is spent. A wallet with no ZTX
+  // used to be told it was blocked on a credential that costs nothing (QA chat: "No ZTX for network
+  // gas" on a free Basic AI Birthcert). Gas is still a different thing from the fee, so it is carried
+  // as a note for the case where issuance stops being free, not as a blocker.
+  it('does NOT block on missing ZTX gas when issuance is free, and says when it would matter', async () => {
     const d = deps({
       quoteTemplate: vi.fn().mockResolvedValue({
         quote: { asset: JMYR, maxAmountRequired: '1000000', payTo: 'ZTX3Payee', gasModel: 'self', paymentRequired: false },
@@ -100,10 +102,57 @@ describe('credentialPreflight — know before you pay (R1)', () => {
 
     const out = await credentialPreflight(d as never, { credential: 'did:zid:t-free' })
 
+    expect(out.ready).toBe(true)
+    expect(out.blockers).toEqual([])
+    const notes = out.notChecked.join(' ')
+    expect(notes).toMatch(/ZTX/)
+    expect(notes).toMatch(/free/i)
+  })
+
+  it('does not block on a missing gas model either (an absent model reads as self-pay) when issuance is free', async () => {
+    const d = deps({
+      quoteTemplate: vi.fn().mockResolvedValue({
+        quote: { asset: JMYR, maxAmountRequired: '1000000', payTo: 'ZTX3Payee', paymentRequired: false },
+        schema: { required: ['agentUsername'], optional: [] },
+      }),
+      queryTokenBalance: balances({ [JMYR]: '0', ZTX: '0' }),
+    })
+
+    const out = await credentialPreflight(d as never, { credential: 'did:zid:t-free' })
+
+    expect(out.ready).toBe(true)
+    expect(out.blockers).toEqual([])
+  })
+
+  it('says nothing about ZTX on a free credential when the wallet holds some', async () => {
+    const d = deps({
+      quoteTemplate: vi.fn().mockResolvedValue({
+        quote: { asset: JMYR, maxAmountRequired: '1000000', payTo: 'ZTX3Payee', gasModel: 'self', paymentRequired: false },
+        schema: { required: ['agentUsername'], optional: [] },
+      }),
+      queryTokenBalance: balances({ [JMYR]: '0', ZTX: '2000000' }),
+    })
+
+    const out = await credentialPreflight(d as never, { credential: 'did:zid:t-free' })
+
+    expect(out.ready).toBe(true)
+    expect(out.notChecked.join(' ')).not.toMatch(/No ZTX/)
+  })
+
+  // The other side of the same rule: a CHARGEABLE credential on a self-pay model still needs the gas.
+  it('still blocks on missing ZTX gas when issuance is chargeable and the wallet self-pays', async () => {
+    const d = deps({
+      quoteTemplate: vi.fn().mockResolvedValue({
+        quote: { asset: JMYR, maxAmountRequired: '1000000', payTo: 'ZTX3Payee', gasModel: 'self', paymentRequired: true },
+        schema: { required: ['agentUsername'], optional: [] },
+      }),
+      queryTokenBalance: balances({ [JMYR]: '5000000', ZTX: '0' }),
+    })
+
+    const out = await credentialPreflight(d as never, { credential: 'did:zid:t-paid' })
+
     expect(out.ready).toBe(false)
-    expect(out.blockers.join(' ')).toMatch(/ZTX/)
-    // …but not about the fee itself.
-    expect(out.blockers.join(' ')).not.toMatch(/Not enough JMYR/)
+    expect(out.blockers.join(' ')).toMatch(/No ZTX for network gas/)
   })
 
   // Absent is unknown, not free — the same three-state rule established for dryRun.

@@ -39,8 +39,8 @@ export interface PreflightFee {
    * Whether MBI will actually charge `maxAmountRequired`.
    *
    * `false` means issuance is currently free: the amount above is indicative — what it WOULD cost
-   * if payment were switched back on — and neither the balance nor the cap gates it. Gas still
-   * does, when this wallet self-pays it: gas is not the fee.
+   * if payment were switched back on — and none of the balance, the cap or gas gates it: no payment is
+   * made, so no transaction is sent. A missing ZTX balance is then only a note in `notChecked`.
    *
    * ABSENT means unknown (an older MBI deployment without this field) and is treated exactly like
    * chargeable. Reading silence as "free" would under-report a real cost.
@@ -216,12 +216,24 @@ export async function credentialPreflight(deps: PreflightDeps, input: PreflightI
     blockers.push(`Not enough ${feeBalance.token}: the fee is ${renderAmount(requiredRaw, feeBalance)}, the balance is ${feeBalance.display}.`)
   }
 
+  // Gas is separate from the fee, but it is only spent when a transaction is sent, and a free issuance
+  // sends none. So it blocks only a chargeable credential; on a free one it is a note, for the case where
+  // payment is switched back on before the apply (see `uncheckable`).
+  const gasNotes: string[] = []
   if (selfPaysGas && asset !== NATIVE) {
     const gas = balances[1]
     if (gas && 'error' in gas) {
-      blockers.push(`Could not read the ZTX balance (${gas.error}) — ZTX pays network gas and is separate from the fee.`)
+      const msg = `Could not read the ZTX balance (${gas.error}) — ZTX pays network gas and is separate from the fee.`
+      if (isFree) gasNotes.push(`${msg} Issuance is free right now, so none is needed unless it becomes chargeable.`)
+      else blockers.push(msg)
     } else if (gas && BigInt(gas.balance) === 0n) {
-      blockers.push(`No ZTX for network gas. ZTX is separate from the ${feeBalance.token ?? asset} fee and is needed for every transaction.`)
+      if (isFree) {
+        gasNotes.push(
+          'This wallet holds no ZTX. Issuance is free right now, so no payment is made and no gas is needed; if it becomes chargeable and this wallet pays its own gas, it will need ZTX.',
+        )
+      } else {
+        blockers.push(`No ZTX for network gas. ZTX is separate from the ${feeBalance.token ?? asset} fee and is needed for every transaction.`)
+      }
     }
   }
 
@@ -249,7 +261,7 @@ export async function credentialPreflight(deps: PreflightDeps, input: PreflightI
     ...(alreadyHeld ? { alreadyHeld } : {}),
     ...(schema ? { schema } : {}),
     blockers,
-    notChecked: [...notChecked, ...uncheckable(isVerified, isFree)],
+    notChecked: [...notChecked, ...gasNotes, ...uncheckable(isVerified, isFree)],
   }
 }
 

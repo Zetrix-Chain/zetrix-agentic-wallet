@@ -27,6 +27,7 @@
  *   transfer_token                      — send native ZTX or any ZTP20 token to an address
  */
 
+import { access } from 'node:fs/promises'
 import type { X401Wallet } from 'x401-zetrix-client'
 import type { VcPresentInput } from './clients/mbi-vp-adapter.js'
 import { proveIdentity } from './orchestrator/prove.js'
@@ -298,6 +299,9 @@ export function createTools(deps: ToolDeps) {
       let vc = input.vc
       let credentialUsed = 'the credential you supplied'
       let kind: VerifiableCredentialKind | undefined
+      // The pass-design image(s) saved when the credential was issued, if the wallet holds it: the QR is not the only
+      // picture a person may want in the chat.
+      let savedPassImages: string[] | undefined
       // Nothing named and no revealAll: the wallet's standard minimal set applies (see default-reveal.ts).
       const wantsDefault = (input.revealAttribute === undefined || input.revealAttribute.length === 0) && input.revealAll !== true
       const verifiedId = deps.config.aiBirthcertVerifiedTemplateId
@@ -319,6 +323,7 @@ export function createTools(deps: ToolDeps) {
           }
         }
         vc = chosen.vc
+        savedPassImages = chosen.vcPassImagePaths
         credentialUsed = verified ? 'Verified AI Birthcert' : 'Basic AI Birthcert'
         kind = verified ? 'verified' : 'basic'
       } else if (wantsDefault && typeof vc === 'object' && vc !== null && !Array.isArray(vc)) {
@@ -326,6 +331,7 @@ export function createTools(deps: ToolDeps) {
         // other the wallet has no standard set, so the caller has to say what to reveal.
         const id = (vc as { id?: unknown }).id
         const match = typeof id === 'string' ? (await loadValidCachedCredentials(deps.cache)).find((e) => (e.vc as { id?: unknown } | null)?.id === id) : undefined
+        savedPassImages = match?.vcPassImagePaths
         if (match && verifiedId && match.templateId === verifiedId) kind = 'verified'
         else if (match && basicId && match.templateId === basicId) kind = 'basic'
       }
@@ -370,17 +376,26 @@ export function createTools(deps: ToolDeps) {
         expiryMinutes: input.expiryMinutes,
       })
       if (!result.created) return result
+      const passImages = savedPassImages ? await existingFiles(savedPassImages) : []
       // Say which credential was presented and what was revealed: the agent did not choose either, and the user
       // should be told. A Basic credential must not be passed off as an owner-verified one.
       const basicNote =
         kind === 'basic'
           ? " This is a Basic AI Birthcert: it shows the agent's registered username only and does not mean the owner was verified, so do not describe the agent as owner-verified."
           : ''
+      // The pass design is a picture of the credential, not of the QR code: say so, because an agent with both in hand
+      // has been seen captioning the wrong one.
+      const passNote =
+        passImages.length > 0
+          ? " The credential's pass design image is also returned (vcPassImagePaths): if the user wants to see it, send it as its own picture, captioned as the credential's pass design. It is not the QR code."
+          : ''
+      const extra = basicNote + passNote
       return {
         ...result,
         credentialUsed,
         ...(revealedByDefault ? { revealedByDefault: true } : {}),
-        ...(basicNote ? { message: result.message + basicNote } : {}),
+        ...(passImages.length > 0 ? { vcPassImagePaths: passImages } : {}),
+        ...(extra ? { message: result.message + extra } : {}),
       }
     },
 
@@ -858,3 +873,17 @@ async function priceTemplate(
 }
 
 export type Tools = ReturnType<typeof createTools>
+
+/** The paths that still exist on disk: a saved pass image the wallet's state volume has lost must not be offered. */
+async function existingFiles(paths: string[]): Promise<string[]> {
+  const found: string[] = []
+  for (const path of paths) {
+    try {
+      await access(path)
+      found.push(path)
+    } catch {
+      /* gone: leave it out */
+    }
+  }
+  return found
+}

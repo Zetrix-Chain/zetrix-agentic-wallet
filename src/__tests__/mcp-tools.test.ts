@@ -1,3 +1,8 @@
+import { createVerificationLink as realCreateVerificationLink } from '../orchestrator/verification-qr'
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { buildToolContent } from '../tool-result'
 import { describe, it, expect, vi } from 'vitest'
 import { createTools } from '../mcp-tools'
 
@@ -979,5 +984,253 @@ describe('create_verification_qr', () => {
 
     expect(out).toMatchObject({ created: false })
     expect((out as { reason: string }).reason).toMatch(/not configured/)
+  })
+
+  // QA video (WhatsApp): the user wants the credential's pass design AND the QR code in the chat. The pass design was
+  // already saved when the credential was issued; the QR tool now carries it, so the agent can send both and label each.
+  describe('the credential\'s pass design, alongside the QR code', () => {
+    const passFile = (name: string) => {
+      const dir = mkdtempSync(join(tmpdir(), 'pass-'))
+      const path = join(dir, name)
+      writeFileSync(path, Buffer.from([0x89, 0x50, 0x4e, 0x47]))
+      return path
+    }
+
+    it('returns the saved pass design of the credential it presented, and says it is not the QR code', async () => {
+      const { deps } = makeDeps()
+      const pass = passFile('verified-0.png')
+      const createVerificationLink = vi.fn().mockResolvedValue({ ...link, qrCodePath: '/state/verification-qr/qr.png' })
+
+      const out = await createTools({
+        ...holding(deps, { templateId: VERIFIED, vc: { id: 'verified-vc' }, vcPassImagePaths: [pass] } as never),
+        createVerificationLink,
+      }).create_verification_qr({})
+
+      expect(out).toMatchObject({ created: true, vcPassImagePaths: [pass] })
+      const message = (out as { message: string }).message
+      expect(message).toMatch(/pass design/i)
+      expect(message).toMatch(/not the QR code/i)
+      expect(message).toContain('vcPassImagePaths')
+      // "attached" would nudge the agent to attach the pass design where it attaches the QR file.
+      expect(message).toMatch(/also returned/i)
+      expect(message).not.toMatch(/attached too/i)
+    })
+
+    it('sends both pictures: the QR image and the pass design, as two image blocks', async () => {
+      const { deps } = makeDeps()
+      const pass = passFile('verified-0.png')
+      const createVerificationLink = vi.fn().mockResolvedValue({ ...link, qrCodePngBase64: 'UVI=' })
+
+      const out = await createTools({
+        ...holding(deps, { templateId: VERIFIED, vc: { id: 'verified-vc' }, vcPassImagePaths: [pass] } as never),
+        createVerificationLink,
+      }).create_verification_qr({})
+      const blocks = await buildToolContent(out, async (p) => readFileSync(p))
+
+      expect(blocks.filter((b) => b.type === 'image')).toHaveLength(2)
+    })
+
+    it('leaves a pass design out when the file is gone, rather than pointing at nothing', async () => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+
+      const out = await createTools({
+        ...holding(deps, { templateId: VERIFIED, vc: { id: 'verified-vc' }, vcPassImagePaths: ['/no/such/pass-0.png'] } as never),
+        createVerificationLink,
+      }).create_verification_qr({})
+
+      expect(out).not.toHaveProperty('vcPassImagePaths')
+      expect(out).toEqual({ ...link, credentialUsed: 'Verified AI Birthcert', revealedByDefault: true })
+    })
+
+    it('returns only the pages that still exist', async () => {
+      const { deps } = makeDeps()
+      const pass = passFile('verified-1.png')
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+
+      const out = await createTools({
+        ...holding(deps, { templateId: VERIFIED, vc: { id: 'verified-vc' }, vcPassImagePaths: ['/no/such/pass-0.png', pass] } as never),
+        createVerificationLink,
+      }).create_verification_qr({})
+
+      expect(out).toMatchObject({ vcPassImagePaths: [pass] })
+    })
+
+    it('adds nothing when the credential has no saved pass design', async () => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+
+      const out = await createTools({ ...holding(deps, { templateId: VERIFIED, vc: { id: 'verified-vc' } }), createVerificationLink }).create_verification_qr({})
+
+      expect(out).toEqual({ ...link, credentialUsed: 'Verified AI Birthcert', revealedByDefault: true })
+    })
+
+    it('returns the pass design of the credential it presented, not of another one the wallet holds', async () => {
+      const { deps } = makeDeps()
+      const verifiedPass = passFile('verified-0.png')
+      const otherPass = passFile('other-0.png')
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+
+      const out = await createTools({
+        ...holding(
+          deps,
+          { templateId: OTHER, vc: { id: 'other-vc' }, vcPassImagePaths: [otherPass] } as never,
+          { templateId: VERIFIED, vc: { id: 'verified-vc' }, vcPassImagePaths: [verifiedPass] } as never,
+        ),
+        createVerificationLink,
+      }).create_verification_qr({})
+
+      expect(out).toMatchObject({ vcPassImagePaths: [verifiedPass] })
+    })
+
+    it('finds the pass design of a credential passed in by the caller, when the wallet holds it', async () => {
+      const { deps } = makeDeps()
+      const pass = passFile('verified-0.png')
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+
+      const out = await createTools({
+        ...holding(deps, { templateId: VERIFIED, vc: { id: 'verified-vc' }, vcPassImagePaths: [pass] } as never),
+        createVerificationLink,
+      }).create_verification_qr({ vc: { id: 'verified-vc' } })
+
+      expect(out).toMatchObject({ vcPassImagePaths: [pass] })
+    })
+
+    it('adds none for a credential the wallet does not hold', async () => {
+      const { deps } = makeDeps()
+      const pass = passFile('verified-0.png')
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+
+      const out = await createTools({
+        ...holding(deps, { templateId: VERIFIED, vc: { id: 'verified-vc' }, vcPassImagePaths: [pass] } as never),
+        createVerificationLink,
+      }).create_verification_qr({ vc: { id: 'someone-elses' } })
+
+      expect(out).not.toHaveProperty('vcPassImagePaths')
+    })
+
+    // By design: a credential the caller names together with what to reveal never reads the wallet's cache (another
+    // test pins that), so it has no pass design to offer. Pinned here so it is a decision, not an accident.
+    it('offers no pass design for a held credential passed with explicit revealAttribute (that path does not read the cache)', async () => {
+      const { deps } = makeDeps()
+      const pass = passFile('verified-0.png')
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+
+      const out = await createTools({
+        ...holding(deps, { templateId: VERIFIED, vc: { id: 'verified-vc' }, vcPassImagePaths: [pass] } as never),
+        createVerificationLink,
+      }).create_verification_qr({ vc: { id: 'verified-vc' }, revealAttribute: ['a.b'] })
+
+      expect(out).not.toHaveProperty('vcPassImagePaths')
+    })
+
+    it('keeps the Basic-credential note as well as the pass-design note', async () => {
+      const { deps } = makeDeps()
+      const pass = passFile('basic-0.png')
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+
+      const out = await createTools({
+        ...holding(deps, { templateId: BASIC_TESTNET, vc: { id: 'basic-vc' }, vcPassImagePaths: [pass] } as never),
+        createVerificationLink,
+      }).create_verification_qr({})
+
+      const message = (out as { message: string }).message
+      expect(message).toMatch(/does not mean the owner was verified/)
+      expect(message).toMatch(/pass design/i)
+    })
+
+    // Review R1-M1, through the tool, with the orchestrator's real text rather than a mocked result.
+    describe('with the real result text, when the QR is missing or only an image', () => {
+      // The real orchestrator checks that the credential has what it is asked to reveal.
+      const realVc = { id: 'verified-vc', credentialSubject: { verifiedAiBirthcert: { agentName: 'a', evidenceProvider: 'p', ownerVerified: 'true' } } }
+      const realLink = (renderQr: () => Promise<Buffer>, saveQr?: () => Promise<string>) => (input: Parameters<typeof realCreateVerificationLink>[0]) =>
+        realCreateVerificationLink(input, {
+          mbi: {
+            createVp: vi.fn().mockResolvedValue({ blobId: 'blob-1', blob: 'beef' }),
+            submitVp: vi.fn().mockResolvedValue({ id: 'v2-1' }),
+          },
+          signHexBlob: vi.fn().mockResolvedValue({ signBlob: 'sb', publicKey: 'pk' }),
+          signMessage: vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' }),
+          linkTemplate: 'https://link.myid.test/agentic-verify?referenceId={referenceId}',
+          renderQr,
+          ...(saveQr ? { saveQr } : {}),
+        })
+
+      it('when rendering fails, the only image is the pass design and the text does not call it the QR code', async () => {
+        const { deps } = makeDeps()
+        const pass = passFile('verified-0.png')
+
+        const out = await createTools({
+          ...holding(deps, { templateId: VERIFIED, vc: realVc, vcPassImagePaths: [pass] } as never),
+          createVerificationLink: realLink(async () => {
+            throw new Error('render failed')
+          }),
+        }).create_verification_qr({})
+        const blocks = await buildToolContent(out, async (p) => readFileSync(p))
+
+        expect(blocks.filter((b) => b.type === 'image')).toHaveLength(1)
+        const message = (out as { message: string }).message
+        expect(message).not.toMatch(/that image is the QR code/i)
+        expect(message).toMatch(/no QR code could be made/i)
+        expect(message).toMatch(/pass design/i)
+      })
+
+      it('when the file was written, there are still two images (QR first, then the pass design) and the text says which is the QR', async () => {
+        const { deps } = makeDeps()
+        const pass = passFile('verified-0.png')
+
+        const out = await createTools({
+          ...holding(deps, { templateId: VERIFIED, vc: realVc, vcPassImagePaths: [pass] } as never),
+          createVerificationLink: realLink(async () => Buffer.from('qr-png'), async () => '/state/verification-qr/qr.png'),
+        }).create_verification_qr({})
+        const blocks = await buildToolContent(out, async (p) => readFileSync(p))
+
+        const images = blocks.filter((b) => b.type === 'image') as Array<{ data: string }>
+        expect(images).toHaveLength(2)
+        expect(Buffer.from(images[0].data, 'base64').toString()).toBe('qr-png')
+        const message = (out as { message: string }).message
+        expect(message).toContain('attaching the file at /state/verification-qr/qr.png')
+        expect(message).toMatch(/as its first image/i)
+        expect(message).toMatch(/any other image is not the QR code/i)
+        expect(message).not.toMatch(/that image is the QR code/i)
+      })
+
+      it('when only the file fails, the QR image comes first, then the pass design, and the text says which is which', async () => {
+        const { deps } = makeDeps()
+        const pass = passFile('verified-0.png')
+
+        const out = await createTools({
+          ...holding(deps, { templateId: VERIFIED, vc: realVc, vcPassImagePaths: [pass] } as never),
+          createVerificationLink: realLink(
+            async () => Buffer.from('qr-png'),
+            async () => {
+              throw new Error('ENOSPC')
+            },
+          ),
+        }).create_verification_qr({})
+        const blocks = await buildToolContent(out, async (p) => readFileSync(p))
+
+        const images = blocks.filter((b) => b.type === 'image') as Array<{ data: string }>
+        expect(images).toHaveLength(2)
+        expect(Buffer.from(images[0].data, 'base64').toString()).toBe('qr-png')
+        const message = (out as { message: string }).message
+        expect(message).not.toMatch(/that image is the QR code/i)
+        expect(message).toMatch(/QR code is the first image/i)
+        expect(message).toMatch(/pass design/i)
+      })
+    })
+
+    it('does not add a pass design when no link was made', async () => {
+      const { deps } = makeDeps()
+      const pass = passFile('verified-0.png')
+      const createVerificationLink = vi.fn().mockResolvedValue({ created: false, reason: 'MBI said no' })
+
+      const out = await createTools({
+        ...holding(deps, { templateId: VERIFIED, vc: { id: 'verified-vc' }, vcPassImagePaths: [pass] } as never),
+        createVerificationLink,
+      }).create_verification_qr({})
+
+      expect(out).toEqual({ created: false, reason: 'MBI said no' })
+    })
   })
 })

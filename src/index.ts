@@ -43,6 +43,7 @@ import { createTools, type ToolDeps } from './mcp-tools.js'
 import { createHeldCredentialFinder } from './held-credential.js'
 import { createVerificationLink } from './orchestrator/verification-qr.js'
 import { renderQrPng } from './qr-png.js'
+import { createFsQrFileStore } from './qr-file-store.js'
 import type { TransferDeps } from './orchestrator/transfer.js'
 import { createPayer, policyWriteUrlRefusal, type PayFetch } from './orchestrator/pay.js'
 import { PaymentCapError, formatCapRefusal } from './payment-guard.js'
@@ -68,6 +69,7 @@ import { createVocabularyReader, type VocabularyRead } from './clients/policy-vo
 import { createFsPolicyWriteReceiptStore } from './clients/policy-write-receipt-store.js'
 import type { WritePolicyDeps } from './orchestrator/write-policy.js'
 import { createSelfPay, type SelfPayChainDeps, type TxLookup } from './orchestrator/policy-self-pay.js'
+import { createFsSelfPayMarkerStore } from './clients/self-pay-marker-store.js'
 import { policyPreflight, type DraftPolicy, type PolicyPreflightDeps } from './orchestrator/policy-preflight.js'
 import { checkAffordability } from './orchestrator/policy-affordability.js'
 import { getTemplateById, readOwnerPolicy } from './clients/policy-read-client.js'
@@ -75,6 +77,9 @@ import { getTemplateById, readOwnerPolicy } from './clients/policy-read-client.j
 // esbuild resolves this JSON import at build time and inlines it into the bundle, so the
 // reported version always matches whatever package.json said when this bundle was built.
 const packageVersion = packageJson.version
+
+/** Longest a single request to the policy write service may take. A hung one must not hold a policy key for ever. */
+const POLICY_HTTP_TIMEOUT_MS = 60_000
 
 export function buildToolList() {
   return [
@@ -122,8 +127,10 @@ export function buildToolList() {
         'With no vc, it presents the Verified AI Birthcert if it holds one, otherwise the Basic AI Birthcert, and if it holds neither it returns created: false and says to create one first. ' +
         'By default it reveals only a standard minimal set (for the Verified AI Birthcert: agentName, evidenceProvider and ownerVerified; for the Basic AI Birthcert: agentUsername); pass revealAttribute to reveal other specific attributes the user asks for, and revealAll: true only when the user explicitly asks to reveal everything. ' +
         'A Basic AI Birthcert does not mean the owner was verified, so say so if that is what was presented. ' +
-        'The wallet presents the credential to MBI and returns the link, the QR code image and the time the link stops working (5 minutes by default); the link holds only a reference id, and that reference id grants access to the revealed attributes until it expires. ' +
+        'The wallet presents the credential to MBI and returns the link, the QR code (as an image and as a PNG file at qrCodePath) and the time the link stops working (5 minutes by default); the link holds only a reference id, and that reference id grants access to the revealed attributes until it expires. ' +
         'Show the link and QR code only to the human user, never pass them to another service, and tell the user to open the link in MyID (they need the app installed). ' +
+        "In a chat channel such as WhatsApp, send the QR code by attaching the file at qrCodePath; never send any other image as the QR code, because the credential's pass design is not one, and if you cannot attach an image, give the link and say plainly that you could not send the QR code. " +
+        "When the credential has a saved pass design, the result also carries vcPassImagePaths: if the user wants to see the credential itself, send that image too, as its own picture captioned as the credential's pass design and never as the QR code. " +
         'If it returns created: false, relay the reason and do not invent a link.',
       inputSchema: {
         type: 'object',
@@ -363,8 +370,9 @@ export function buildToolList() {
         'Never choose for them. ' +
         'With gasPayer "self" there is no paymentReceipt and check_policy_write does not apply. ' +
         'A self-paid "submitted" means the network gas is spent: do NOT send it again, check get_my_policy, and quote the txHash to support. ' +
-        'A self-paid "unknown" means it may be on chain: do NOT send it again, check get_my_policy, and quote the nonce. ' +
+        'A self-paid "unknown" means it may be on chain: do NOT send it again, check get_my_policy, and quote the nonce. The wallet remembers it and refuses another send, a sponsored write, a collect and a removal for that key until it has landed or can no longer land, and says when. ' +
         'A self-paid "write_failed" means the transaction was included and rejected: the gas is spent and nothing was written. ' +
+        'To send a self-paid write pass maxGasRaw: the requiredRaw of the self option you showed the user. It is the most gas they agreed to, and the wallet refuses, free, if the gas now costs more, so show the user any new figure and ask again. ' +
         'Self-paid gas is spent even when the write fails on chain. ' +
         'To learn the price BEFORE paying, pass dryRun: it runs every free check and returns the ' +
         'service\'s quote, paying nothing and writing no policy. "quoted" means that — no payment was ' +
@@ -472,6 +480,13 @@ export function buildToolList() {
               'itself, a call without it returns state "needs_choice" with both options and what each would cost, and the user ' +
               'decides. Never choose for the user.',
           },
+          maxGasRaw: {
+            type: 'string',
+            description:
+              'Self-pay only. The most gas, in raw units (micro-ZTX), the user agreed to pay to write: the "requiredRaw" of the self option ' +
+              '(gasOptions.self.gas.requiredRaw) that you showed them. A self-paid send needs it and is refused, free, without it or when the ' +
+              'gas now costs more than this, so it can never cost more than the user was shown.',
+          },
         },
         required: ['policyKey', 'attributes', 'templateId'],
       },
@@ -518,8 +533,9 @@ export function buildToolList() {
         'Never choose for them. ' +
         'With gasPayer "self" there is no paymentReceipt and check_policy_write does not apply. ' +
         'A self-paid "submitted" means the network gas is spent: do NOT send it again, check get_my_policy, and quote the txHash to support. ' +
-        'A self-paid "unknown" means it may be on chain: do NOT send it again, check get_my_policy, and quote the nonce. ' +
+        'A self-paid "unknown" means it may be on chain: do NOT send it again, check get_my_policy, and quote the nonce. The wallet remembers it and refuses another send, a sponsored write, a collect and a removal for that key until it has landed or can no longer land, and says when. ' +
         'A self-paid "write_failed" means the transaction was included and rejected: the gas is spent and nothing was written. ' +
+        'To send a self-paid write pass maxGasRaw: the requiredRaw of the self option you showed the user. It is the most gas they agreed to, and the wallet refuses, free, if the gas now costs more, so show the user any new figure and ask again. ' +
         'Self-paid gas is spent even when the write fails on chain. ' +
         'To learn the price BEFORE paying, pass dryRun: it runs every free check and returns the service\'s quote, paying ' +
         'nothing and changing no policy. Tell the user what it says before they decide to pay. ' +
@@ -592,6 +608,13 @@ export function buildToolList() {
               'itself, a call without it returns state "needs_choice" with both options and what each would cost, and the user ' +
               'decides. Never choose for the user.',
           },
+          maxGasRaw: {
+            type: 'string',
+            description:
+              'Self-pay only. The most gas, in raw units (micro-ZTX), the user agreed to pay to update: the "requiredRaw" of the self option ' +
+              '(gasOptions.self.gas.requiredRaw) that you showed them. A self-paid send needs it and is refused, free, without it or when the ' +
+              'gas now costs more than this, so it can never cost more than the user was shown.',
+          },
           pollBudgetMs: {
             type: 'number',
             description:
@@ -617,6 +640,9 @@ export function buildToolList() {
         '"not_found" means there was nothing to remove, or it is already gone — confirm with get_my_policy before saying which. ' +
         '"in_progress" means a paid write for this policy is still being completed: if this wallet holds its receipt, ' +
         'check_policy_write finishes it, otherwise wait and ask again later. ' +
+        '"refused" naming a self-paid transaction means an earlier self-paid update may still land and would bring the old policy back: ' +
+        'NOTHING WAS REMOVED; wait until the ledger it names, or read the policy with get_my_policy, then ask again. ' +
+        '"refused" saying another write is in progress in this wallet, or "unavailable" saying a record could not be read, also means NOTHING WAS REMOVED: ask again shortly. ' +
         'To change a policy rather than remove it, use update_policy. ' +
         'Never ask the user for their HSM password — this tool does not take one.',
       inputSchema: {
@@ -653,6 +679,8 @@ export function buildToolList() {
         'could not be determined — none of which is a reason to pay again. ' +
         'A paid update_policy is finished the same way: its receipt is collected on the update route, and "written" ' +
         'then means the policy was updated. ' +
+        '"refused" or "unavailable" saying NOTHING WAS COLLECTED means a self-paid write for this policy may still land, or another write for it ' +
+        'is in progress in this wallet: the payment is not lost, so do not pay again; ask again shortly. ' +
         'If this wallet holds no record of the receipt, that does NOT mean the write failed: the ' +
         'service completes a paid write on its own, and asking to write the same policyKey again ' +
         'will report the truth for free before any payment.',
@@ -1093,7 +1121,8 @@ export function buildToolList() {
         'Report `fee.display` and each balance\'s `display` to the user, never the raw base-unit numbers. ' +
         '`fee.paymentRequired: false` means issuance is currently FREE — `fee.display` is then only what it ' +
         'WOULD cost if payment were switched back on, so do not ask the user to fund it and do not present ' +
-        'that amount as a charge. Gas is separate and can still block a free credential. When the field is ' +
+        'that amount as a charge. ' +
+        'A free credential sends no transaction, so no gas is spent and a missing ZTX balance is not a blocker on it: never ask the user to fund ZTX for a free credential, and if notChecked mentions ZTX, pass it on as a note only. When the field is ' +
         'ABSENT the cost is unknown (an older MBI), and it is treated as chargeable — never report absent as free. ' +
         'If the result has `alreadyHeld`, this wallet already holds a valid copy of that credential: tell the user so, name it, ' +
         'and stop — do not ask for an agent name or any other detail, and do not begin an issuance. A new one would replace it. ' +
@@ -1417,7 +1446,7 @@ export function buildPolicyWriteDeps(input: {
    * What a self-paid write needs to build, sign and submit its own transaction. Together with `policyRegistryAddress` it is what
    * makes the tools offer the choice of who pays the gas; without either, nothing changes and only the sponsored path exists.
    */
-  selfPayChain?: Omit<SelfPayChainDeps, 'registryAddress' | 'ownerAddress'>
+  selfPayChain?: Omit<SelfPayChainDeps, 'registryAddress' | 'ownerAddress' | 'markers'>
 }): { policyWriteDeps?: WritePolicyDeps } {
   // Both, not either. Without a template contract there is nothing to type a draft against, and
   // a write that cannot be checked for free is one this wallet will not pay for.
@@ -1429,7 +1458,7 @@ export function buildPolicyWriteDeps(input: {
   const templateContract = input.policyTemplateAddress
   return {
     policyWriteDeps: {
-      ...(input.policyWriteUrl ? { client: new PolicyWriteClient(input.policyWriteUrl, (url, init) => fetch(url, init)) } : {}),
+      ...(input.policyWriteUrl ? { client: new PolicyWriteClient(input.policyWriteUrl, (url, init) => fetch(url, { ...init, signal: AbortSignal.timeout(POLICY_HTTP_TIMEOUT_MS) })) } : {}),
       // A self-paid write has no service to catch what the attribute vocabulary would have, so it needs a vocabulary to check against.
       hasVocabularySource: Boolean(input.readVocabulary),
       receipts: createFsPolicyWriteReceiptStore(join(input.stateDir, 'policy-write-receipts')),
@@ -1458,6 +1487,9 @@ export function buildPolicyWriteDeps(input: {
               registryAddress: input.policyRegistryAddress,
               ownerAddress: input.ownerAddress,
               ...input.selfPayChain,
+              // One note per (owner, policy key), written before a send and kept until its outcome is settled.
+              // Scoped by network: the same key gives the same address on testnet and mainnet, and a testnet note must not block a mainnet write.
+              markers: createFsSelfPayMarkerStore(join(input.stateDir, 'self-pay-markers', input.network.replace(/[^A-Za-z0-9_-]/g, '-'))),
             }),
           }
         : {}),
@@ -1975,6 +2007,10 @@ async function main(): Promise<void> {
   // never overwrite an earlier, still-needed preserved credential.
   const downloadQuarantine = createFsDownloadQuarantineStore(join(config.stateDir, 'ssivc-download-quarantine'))
   const passImagesDir = join(config.stateDir, 'vc-pass-images')
+  // The verification QR as a file. A file is removed when the wallet starts and again the next time a QR is made, once
+  // the link it opens has expired; a file for a link still open stays until then.
+  const verificationQrFiles = createFsQrFileStore(join(config.stateDir, 'verification-qr'))
+  void verificationQrFiles.sweep().catch(() => undefined)
 
   // AI Birthcert verification session (myid SSIVC) — persisted so check_ai_birthcert_verification
   // survives a restart. As of 2026-08-17 the session-create call needs no bearer token — it's
@@ -2150,6 +2186,16 @@ async function main(): Promise<void> {
         // The same submit wrapper transfer_token uses, so a node refusal is told apart from an answer that never came.
         submit: transferDeps.submit,
         queryNativeBalance: () => queryTokenBalance('ZTX'),
+        // The current ledger, so a self-paid transaction can carry an expiry. `undefined` when it cannot be read.
+        currentLedger: async () => {
+          try {
+            const r = await sdk.block.getNumber()
+            const n = r.errorCode === 0 ? r.result?.header?.blockNumber : undefined
+            return n === undefined ? undefined : String(n)
+          } catch {
+            return undefined
+          }
+        },
         // What became of a submitted transaction, so one that was included and then rejected by the contract (the gas is still spent)
         // is reported as that.
         getTransaction: buildTransactionLookup((hash) => sdk.transaction.getInfo(hash)),
@@ -2179,6 +2225,8 @@ async function main(): Promise<void> {
         signMessage: messageSigner,
         linkTemplate: config.myidVerifyLinkTemplate,
         renderQr: renderQrPng,
+        // A chat channel (WhatsApp) sends files, not MCP image blocks: without a file the agent has no QR to attach.
+        saveQr: (png, referenceId, expiresAtMs) => verificationQrFiles.save(png, referenceId, expiresAtMs),
       }),
     verifyAiBirthcert,
     // So credential_preflight can say "you already have one" before the agent asks the user for anything.

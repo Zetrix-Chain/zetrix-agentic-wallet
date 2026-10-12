@@ -16,7 +16,9 @@
  * are all settled by the caller first. What it owns is building the call, and telling apart what happened to it, because the
  * advice differs: nothing was sent (safe to try again), or it may be on chain (never send twice).
  */
+import { createHash } from 'node:crypto'
 import { toPaymentPolicyError, boundedReason, type PaymentPolicyError } from '../policy-refusal.js'
+import type { SelfPayMarker, SelfPayMarkerStore } from '../clients/self-pay-marker-store.js'
 import type { TokenBalanceResult } from '../clients/token-balance-client.js'
 import type { SelfPayDeps } from './policy-gas-choice.js'
 
@@ -31,6 +33,13 @@ const SCALAR_OF: Record<string, 'STRING' | 'NUMBER' | 'ADDRESS'> = {
 }
 
 export type TypedValue = string | string[]
+
+/**
+ * How many ledgers past the current one a self-paid transaction may still be included in. It is set on the transaction itself
+ * (`ceilLedgerSeq`), so after that ledger the node can never accept it: an outcome that never arrived is then certain, in bounded time.
+ * Inclusion normally takes one or two ledgers; this leaves room for a slow node without leaving a send unresolved for long.
+ */
+export const SELF_PAY_CEIL_LEDGERS = 60
 
 /** The same bounds the receipt store holds a verify record to: a policy with more than this is not one this wallet will send. */
 export const MAX_ATTRIBUTES = 64
@@ -166,6 +175,8 @@ export interface SelfPayChainDeps {
     nonce: string
     gasPrice: string
     feeLimit: string
+    /** The last ledger the transaction can be included in. */
+    ceilLedgerSeq?: string
     operations: Array<{ type: string; data: Record<string, unknown> }>
   }) => { blob: string }
   sign: (blob: string) => Promise<{ signBlob: string; publicKey: string }>
@@ -174,11 +185,16 @@ export interface SelfPayChainDeps {
   queryNativeBalance: () => Promise<TokenBalanceResult>
   /** Looks one transaction up by its hash. Optional. */
   getTransaction?: (txHash: string) => Promise<TxLookup>
+  /** The current ledger number as digits, or `undefined` when it cannot be read. A send is refused when it is not known (no expiry can be set). */
+  currentLedger: () => Promise<string | undefined>
+  /** The note kept for every send until its outcome is settled. */
+  markers: SelfPayMarkerStore
+  now?: () => Date
 }
 
 export type SelfPayExecResult =
   /** The node accepted the transaction. It is NOT yet a written policy: that is read back from the chain. */
-  | { kind: 'submitted'; txHash: string; nonce: string; feeLimit: string }
+  | { kind: 'submitted'; txHash: string; nonce: string; feeLimit: string; ceilLedgerSeq: string }
   /** (the fee limit it was signed with is the ceiling the balance was checked against) */
   /** Nothing was sent: the call could not be built, or the node refused to simulate or accept it. Safe to try again once fixed. */
   | { kind: 'rejected'; reason: string }
@@ -187,7 +203,7 @@ export type SelfPayExecResult =
   /** Signing failed for another reason. Nothing was sent. */
   | { kind: 'sign_failed'; reason: string }
   /** The transaction was sent and the node's answer never arrived: it may be on chain. Never send again. */
-  | { kind: 'unknown'; reason: string; nonce: string }
+  | { kind: 'unknown'; reason: string; nonce: string; txHash: string; ceilLedgerSeq: string }
 
 function isSubmitRejection(e: unknown): boolean {
   return (e as { submitRejected?: unknown } | null)?.submitRejected === true
@@ -216,6 +232,9 @@ export function createSelfPay(chain: SelfPayChainDeps): SelfPayDeps {
     },
     queryNativeBalance: chain.queryNativeBalance,
     ...(chain.getTransaction ? { lookupTransaction: chain.getTransaction } : {}),
+    pendingSend: (policyKey) => chain.markers.get(chain.ownerAddress, policyKey),
+    clearSend: (policyKey, txHash) => chain.markers.remove(chain.ownerAddress, policyKey, txHash),
+    currentLedger: chain.currentLedger,
     async execute(call, limit): Promise<SelfPayExecResult> {
       const built = buildPolicyCall(call)
       if (!built.ok) return { kind: 'rejected', reason: built.reason }
@@ -247,10 +266,21 @@ export function createSelfPay(chain: SelfPayChainDeps): SelfPayDeps {
         }
       }
 
+      // The transaction gets an expiry: after this ledger the node never accepts it, so a send whose answer never arrives is settled in
+      // bounded time. Without a ledger number there is no expiry, and without one nothing is signed.
+      let ceil: string
+      try {
+        const ledger = await chain.currentLedger()
+        if (typeof ledger !== 'string' || !/^\d{1,18}$/.test(ledger)) throw new Error('the ledger number is not available')
+        ceil = (BigInt(ledger) + BigInt(SELF_PAY_CEIL_LEDGERS)).toString()
+      } catch (e) {
+        return { kind: 'rejected', reason: `the ledger number could not be read, so the transaction could not be given an expiry: ${boundedReason(e)}` }
+      }
+
       let blob: string
       try {
         // Signed with the CEILING, not the simulated figure: the balance was checked against it, so the margin allowed for is real.
-        blob = chain.buildBlob({ sourceAddress: chain.ownerAddress, nonce, gasPrice: fee.gasPrice, feeLimit: ceiling.toString(), operations: [operation] }).blob
+        blob = chain.buildBlob({ sourceAddress: chain.ownerAddress, nonce, gasPrice: fee.gasPrice, feeLimit: ceiling.toString(), ceilLedgerSeq: ceil, operations: [operation] }).blob
       } catch (e) {
         return { kind: 'rejected', reason: `the transaction could not be built: ${boundedReason(e)}` }
       }
@@ -264,13 +294,45 @@ export function createSelfPay(chain: SelfPayChainDeps): SelfPayDeps {
         return { kind: 'sign_failed', reason: boundedReason(e) }
       }
 
+      // The note is written BEFORE the submit: once the transaction may be on chain, a later call must be able to know that. If it cannot be
+      // written, nothing is sent.
+      const txHash = createHash('sha256').update(Buffer.from(blob, 'hex')).digest('hex')
+      const marker: SelfPayMarker = {
+        policyKey: call.policyKey,
+        ownerAddress: chain.ownerAddress,
+        operation: call.operation,
+        nonce,
+        txHash,
+        ceilLedgerSeq: ceil,
+        submittedAt: (chain.now?.() ?? new Date()).toISOString(),
+      }
+      try {
+        await chain.markers.set(marker)
+      } catch (e) {
+        // The write can fail after the file is already in place (a directory fsync error): nothing is sent, so that note must not stay.
+        try {
+          await chain.markers.remove(chain.ownerAddress, call.policyKey, txHash)
+        } catch {
+          // Left behind, it only holds the key until it expires.
+        }
+        return { kind: 'rejected', reason: `the send could not be recorded, so nothing was sent: ${boundedReason(e)}` }
+      }
+
       // Past this line the transaction may be on chain even if no answer comes back.
       try {
         const { hash } = await chain.submit({ blob, signBlob: signed.signBlob, publicKey: signed.publicKey })
-        return { kind: 'submitted', txHash: hash, nonce, feeLimit: ceiling.toString() }
+        return { kind: 'submitted', txHash: hash, nonce, feeLimit: ceiling.toString(), ceilLedgerSeq: ceil }
       } catch (e) {
-        if (isSubmitRejection(e)) return { kind: 'rejected', reason: `the node rejected the transaction: ${boundedReason(e)}` }
-        return { kind: 'unknown', reason: boundedReason(e), nonce }
+        if (isSubmitRejection(e)) {
+          // The node answered and refused: nothing is on chain, so there is nothing to remember.
+          try {
+            await chain.markers.remove(chain.ownerAddress, call.policyKey, txHash)
+          } catch {
+            // A note that stays only costs a lookup on the next call.
+          }
+          return { kind: 'rejected', reason: `the node rejected the transaction: ${boundedReason(e)}` }
+        }
+        return { kind: 'unknown', reason: boundedReason(e), nonce, txHash, ceilLedgerSeq: ceil }
       }
     },
   }

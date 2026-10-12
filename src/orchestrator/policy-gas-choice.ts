@@ -13,6 +13,7 @@
  */
 import { ZTX_DECIMALS, type TokenBalanceResult } from '../clients/token-balance-client.js'
 import type { SelfPayCall, SelfPayExecResult, TxLookup } from './policy-self-pay.js'
+import type { SelfPayMarker } from '../clients/self-pay-marker-store.js'
 
 export type GasPayer = 'self' | 'sponsored'
 
@@ -25,6 +26,20 @@ export type GasPayerParse = { ok: true; gasPayer?: GasPayer } | { ok: false }
 export function parseGasPayer(value: unknown): GasPayerParse {
   if (value === undefined || value === null || value === '') return { ok: true }
   if (value === 'self' || value === 'sponsored') return { ok: true, gasPayer: value }
+  return { ok: false }
+}
+
+export type MaxGasParse = { ok: true; maxGasRaw?: string } | { ok: false }
+
+/**
+ * The most gas, in raw units (micro-ZTX), the user agreed to for a self-paid write: the `requiredRaw` the wallet showed them. Absent,
+ * null or blank means "not given". Anything else must be a positive whole number written as digits (a safe-integer number is read as its
+ * digits), otherwise it is refused rather than guessed: it bounds what gets signed.
+ */
+export function parseMaxGasRaw(value: unknown): MaxGasParse {
+  if (value === undefined || value === null || value === '') return { ok: true }
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) return { ok: true, maxGasRaw: String(value) }
+  if (typeof value === 'string' && /^[1-9]\d{0,17}$/.test(value)) return { ok: true, maxGasRaw: value }
   return { ok: false }
 }
 
@@ -45,6 +60,19 @@ export interface SelfPayDeps {
   execute: (call: SelfPayCall, limit: { maxFeeRaw: string }) => Promise<SelfPayExecResult>
   /** What became of a submitted transaction. Optional: without it a transaction that never shows is only "not confirmed". */
   lookupTransaction?: (txHash: string) => Promise<TxLookup>
+  /**
+   * The note left by an earlier self-paid send for this key whose outcome is not settled, or `null` when there is none. THROWS when a note
+   * exists and cannot be trusted (unreadable, empty, malformed): the caller refuses to send then. Without these three nothing is
+   * remembered between calls.
+   */
+  pendingSend?: (policyKey: string) => Promise<SelfPayMarker | null>
+  /**
+   * Clears that note: the transaction landed, failed, or can no longer land. With `txHash` it clears ONLY the note for that transaction, so a
+   * call holding an older note can never delete a newer one.
+   */
+  clearSend?: (policyKey: string, txHash?: string) => Promise<void>
+  /** The current ledger number, as digits, or `undefined` when it cannot be read. */
+  currentLedger?: () => Promise<string | undefined>
 }
 
 export type SelfPayStatus = 'enough' | 'short' | 'unknown'

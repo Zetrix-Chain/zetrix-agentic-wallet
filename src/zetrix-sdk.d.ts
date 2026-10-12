@@ -55,16 +55,23 @@ declare module 'zetrix-sdk-nodejs' {
       nonce: string
       gasPrice: string
       feeLimit: string
+      /** The last ledger the transaction can be included in; after it the node never accepts it. */
+      ceilLedgerSeq?: string
       operations: Array<{ type: string; data: Record<string, unknown> }>
     }): BuildBlobResult
     /** Broadcast an already-signed blob. `signature` is [{ signData, publicKey }]. */
     submit(args: { blob: string; signature: Array<{ signData: string; publicKey: string }> }): Promise<SubmitResult>
+  }
+  interface ZetrixBlock {
+    /** The current ledger. The SDK hands the number back as a number or a string; read it as either. */
+    getNumber(): Promise<{ errorCode: number; result?: { header?: { blockNumber?: string | number } } }>
   }
   class ZtxChainSDK {
     constructor(options: { host: string; port?: string; secure?: boolean })
     contract: ZetrixContract
     account: ZetrixAccount
     transaction: ZetrixTransaction
+    block: ZetrixBlock
   }
   export = ZtxChainSDK
 }

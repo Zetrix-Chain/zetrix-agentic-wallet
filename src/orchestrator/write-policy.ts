@@ -33,9 +33,10 @@ import { isVerifyShape, operationOf, type PolicyWriteOperation, type PolicyWrite
 import type { PolicyRead, PolicyReadResult } from '../clients/policy-read-client.js'
 import type { PolicyPreflightResult } from './policy-preflight.js'
 import type { Affordability } from './policy-affordability.js'
-import { assessSelfPay, parseGasPayer, type GasPayer, type SelfPayAssessment, type SelfPayDeps } from './policy-gas-choice.js'
+import { assessSelfPay, parseGasPayer, parseMaxGasRaw, type GasPayer, type SelfPayAssessment, type SelfPayDeps } from './policy-gas-choice.js'
 import { comparable, comparableTyped, typeAttributes, type SelfPayCall, type TxLookup } from './policy-self-pay.js'
 import { isSponsored } from '../accept-selection.js'
+import type { SelfPayMarker } from '../clients/self-pay-marker-store.js'
 import type { PayRequirement } from '../clients/mbi-client.js'
 import { describePolicyRefusal, policyRefusalFlags, toPaymentPolicyError } from '../policy-refusal.js'
 
@@ -43,6 +44,8 @@ import { describePolicyRefusal, policyRefusalFlags, toPaymentPolicyError } from 
 type Accept = Record<string, unknown>
 
 export interface WritePolicyDeps {
+  /** How long a write, collect or removal waits for the key before giving up with nothing done. Default {@link SELF_PAY_LOCK_WAIT_MS}. */
+  lockWaitMs?: number
   client?: PolicyWriteClient
   receipts: PolicyWriteReceiptStore
   /** Self-pay one accept and return the `X-PAYMENT` header. The wallet's existing capped payer. */
@@ -698,6 +701,13 @@ export interface WritePolicyInput {
    * self-pay is on offer and this is absent, the tool returns `needs_choice` and the user decides.
    */
   gasPayer?: string
+  /**
+   * Self-pay only. The most gas, in raw units (micro-ZTX), the user agreed to: the `requiredRaw` of the self option the wallet showed
+   * (`gasOptions.self.gas.requiredRaw`). A self-paid send needs it, and the wallet signs only if its own figure at the time of signing is
+   * not above it, so the fee limit signed can never exceed what the user was shown. Without it the send is refused, free, with the
+   * current figure to show.
+   */
+  maxGasRaw?: string | number
 }
 
 /**
@@ -716,6 +726,8 @@ function isDryRun(value: unknown): boolean {
 export async function writePolicy(deps: WritePolicyDeps, input: WritePolicyInput): Promise<WritePolicyResult> {
   const gas = parseGasPayer(input?.gasPayer)
   if (!gas.ok) return refusedGasPayer(input?.policyKey)
+  const maxGas = parseMaxGasRaw(input?.maxGasRaw)
+  if (!maxGas.ok) return refusedMaxGas(input?.policyKey)
   // The service is needed to quote and collect a SPONSORED write; a self-paid one never contacts it.
   // With no choice named and self-pay on offer, the user can still be asked: self is the one option on the table.
   if (!deps.client && gas.gasPayer !== 'self' && !(gas.gasPayer === undefined && deps.selfPay)) {
@@ -835,6 +847,7 @@ export async function writePolicy(deps: WritePolicyDeps, input: WritePolicyInput
       tool: 'write_policy',
       verb: 'write',
       ...(selfUnavailable ? { unavailable: selfUnavailable } : {}),
+      ...(maxGas.maxGasRaw ? { maxGasRaw: maxGas.maxGasRaw } : {}),
     })
   }
   if (!deps.client) {
@@ -909,7 +922,7 @@ export async function writePolicy(deps: WritePolicyDeps, input: WritePolicyInput
  * update_policy: the receipt is collected rather than paying again, on the route its own operation names — which may not
  * be the write just asked for — and only with a person's yes unless this wallet already holds the receipt.
  */
-async function recoverInFlight(
+async function recoverInFlightLocked(
   deps: WritePolicyDeps,
   client: PolicyWriteClient,
   a: {
@@ -975,6 +988,10 @@ async function recoverInFlight(
         `check_policy_write to finish it. Do not pay again.`,
     }
   }
+  // A self-paid send that is not settled could overwrite what this collect writes, or be overwritten by it.
+  const heldCollect = await holdForSelfPaySend(deps, a.policyKey, COLLECT_HELD)
+  if (heldCollect) return { ...heldCollect, paid: true, paymentReceipt: pre.blobId, policyKey: a.policyKey, interpretation: a.interpretation }
+
   // ── About to collect. The route is the receipt's OWN operation. A receipt the wallet holds decides it (its record is
   // authoritative); the server's `operation` must agree or nothing is collected. One the wallet does not hold needs the
   // server's, and an UPDATE that cannot be told from a CREATE is refused rather than defaulted: collecting an update receipt
@@ -1054,6 +1071,17 @@ async function describeQuote(deps: WritePolicyDeps, accept: Accept) {
   return { asset, amount, extra, amountHuman, affordability }
 }
 
+/** A `maxGasRaw` that is not a positive whole number is refused rather than guessed: it bounds what gets signed. */
+function refusedMaxGas(policyKey: unknown): WritePolicyResult {
+  return {
+    state: 'refused',
+    ...(typeof policyKey === 'string' ? { policyKey } : {}),
+    message:
+      'maxGasRaw must be a positive whole number of raw units (micro-ZTX): the requiredRaw of the self option the user was shown, ' +
+      'or be left out. NOTHING WAS PAID.',
+  }
+}
+
 /** A `gasPayer` that is neither `self` nor `sponsored` is refused rather than read as one of them: the two spend different assets. */
 function refusedGasPayer(policyKey: unknown): WritePolicyResult {
   return {
@@ -1104,7 +1132,7 @@ function selfPayNotAvailable(a: { policyKey: string; interpretation: string[] })
 function selfPayWords(self: SelfPayAssessment): string {
   const gas = self.gas
   if (self.status === 'enough') {
-    return `Costs no fee, only about ${gas.estimatedHuman} of network gas (the wallet asks to hold ${gas.requiredHuman}); it holds ${self.balance?.human}, enough.`
+    return `Costs no fee, only about ${gas.estimatedHuman} of network gas (the wallet asks to hold ${gas.requiredHuman}, the estimate plus a fifth, and that is the figure to confirm); it holds ${self.balance?.human}, enough.`
   }
   return `Costs no fee, only network gas in ZTX${gas.estimatedHuman ? ` (about ${gas.estimatedHuman})` : ''}. ${self.status === 'short' ? 'The wallet could NOT pay it right now' : 'Whether the wallet can pay it is not known'}: ${clip(self.problems.join(' '), 400)}`
 }
@@ -1174,7 +1202,9 @@ async function offerGasChoice(
         ? `There are two ways to pay to ${a.verb} this policy; ask the user which they want. `
         : `Only ${quote ? 'sponsored' : 'self'} is available to ${a.verb} this policy right now; tell the user that and ask whether to go ahead that way. `) +
       `${sponsoredText} ${selfText} Say plainly what the wallet can pay right now. After the user has seen what the policy means (interpretation) and chosen, ` +
-      `call ${a.tool} again with gasPayer ${both ? '"sponsored" or "self"' : only} and confirm: true. Never choose for the user and never pass confirm on your own judgement.`,
+      `call ${a.tool} again with gasPayer ${both ? '"sponsored" or "self"' : only} and confirm: true${
+        self && self.gas.requiredRaw ? `; for "self" also pass maxGasRaw "${self.gas.requiredRaw}", the gas figure shown above, the most the user agrees to` : ''
+      }. Never choose for the user and never pass confirm on your own judgement.`,
   }
 }
 
@@ -1249,12 +1279,210 @@ async function confirmSelfWrite(deps: WritePolicyDeps, call: SelfPayCall, budget
 }
 
 /**
+ * One self-paid send at a time per (owner, policy key), in this process. The note is read, judged and cleared in several steps, and two calls
+ * interleaving there could each clear or overwrite the other's note. The lock is held from the first read of the note to the end of the call,
+ * including the send and its confirmation, so a second call simply waits and then sees what the first one left.
+ */
+const selfPayLocks = new Map<string, Promise<unknown>>()
+
+/** How long a call waits for the key before it gives up and does nothing. Well inside a client's own timeout. */
+export const SELF_PAY_LOCK_WAIT_MS = 15_000
+
+type Locked<T> = { kind: 'ran'; value: T } | { kind: 'busy' }
+
+/**
+ * The wait is BOUNDED. A call that cannot get the key within `waitMs` returns `busy` and never runs: the caller's client may already have given
+ * up on it, and a write, collect or removal that fires after that would be one nobody was told about. A call that gave up still takes its place
+ * in the queue until it is released, so the calls behind it keep waiting for the holder in front.
+ */
+async function withSelfPayLock<T>(key: string, waitMs: number, fn: () => Promise<T>): Promise<Locked<T>> {
+  const before = (selfPayLocks.get(key) ?? Promise.resolve()).catch(() => undefined)
+  let release!: () => void
+  const mine = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const tail = Promise.all([before, mine])
+  selfPayLocks.set(key, tail)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const acquired = await Promise.race([
+    before.then(() => true),
+    new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(false), waitMs)
+    }),
+  ])
+  clearTimeout(timer)
+  const done = () => {
+    release()
+    void tail.then(() => {
+      if (selfPayLocks.get(key) === tail) selfPayLocks.delete(key)
+    })
+  }
+  if (!acquired) {
+    done()
+    return { kind: 'busy' }
+  }
+  try {
+    return { kind: 'ran', value: await fn() }
+  } finally {
+    done()
+  }
+}
+
+const lockWaitMs = (deps: WritePolicyDeps): number => deps.lockWaitMs ?? SELF_PAY_LOCK_WAIT_MS
+
+/** What a call that could not get the key says: it did nothing, and it says so in the words of what it would have done. */
+const busyMessage = (policyKey: string, nothing: string): string =>
+  `Another write, collect or removal for "${policyKey}" is in progress in this wallet, so ${nothing}. Ask again shortly.`
+
+/**
+ * The note also guards the paths that do NOT send a self-paid transaction. A self-paid update that came back unknown can still land until
+ * its expiry ledger and replaces the whole policy, so a sponsored write, the collect of an already-paid write, or a removal started in the
+ * meantime could be silently overwritten by it. Returns the refusal to give, or undefined when the path may go on.
+ */
+async function holdForSelfPaySend(
+  deps: WritePolicyDeps,
+  policyKey: string,
+  nothing: string,
+): Promise<{ state: 'refused' | 'unavailable'; message: string; txHash?: string } | undefined> {
+  const inFlight = await resolveInFlight(deps, policyKey)
+  if (inFlight.kind === 'none') return undefined
+  if (inFlight.kind === 'unreadable') {
+    return {
+      state: 'unavailable',
+      message:
+        `Whether an earlier self-paid write for "${policyKey}" is still in flight could not be checked (${inFlight.detail ?? 'the record of it could not be read'}), ` +
+        `so ${nothing}. A transaction that is still in flight could overwrite this.`,
+    }
+  }
+  const m = inFlight.marker
+  return {
+    state: 'refused',
+    txHash: m.txHash,
+    message:
+      `A self-paid ${m.operation === 'UPDATE' ? 'update' : 'write'} for "${policyKey}" was sent at ${m.submittedAt} (transaction ${m.txHash}, nonce ${m.nonce}) and its outcome is not known yet. ` +
+      `It can still be included until ledger ${m.ceilLedgerSeq}${inFlight.ledger ? ` (the ledger is now ${inFlight.ledger})` : ''}, and it would replace the whole policy, so ${nothing}. ` +
+      `Read the policy with get_my_policy to see whether it landed, or ask again after ledger ${m.ceilLedgerSeq}, when it can no longer land.`,
+  }
+}
+
+type InFlight = { kind: 'none' } | { kind: 'blocked'; marker: SelfPayMarker; ledger?: string } | { kind: 'unreadable'; detail?: string }
+
+/**
+ * An earlier self-paid send for this key whose outcome was never settled. Free reads. Settled means: the transaction landed or
+ * failed (looked up by its hash), or the ledger has passed the one it carried as its expiry, so it can never land. Then the note is cleared and
+ * the call goes on (a landed write is found by the chain checks that follow). Otherwise it may still land, and sending another transaction on
+ * top of it is not safe.
+ */
+async function resolveInFlight(deps: WritePolicyDeps, policyKey: string, mayClear = true): Promise<InFlight> {
+  const sp = deps.selfPay
+  if (!sp?.pendingSend) return { kind: 'none' }
+  let marker: SelfPayMarker | null
+  try {
+    marker = await bounded(deps, () => sp.pendingSend!(policyKey))
+  } catch (e) {
+    return { kind: 'unreadable', detail: clip(e instanceof Error ? e.message : String(e), 1200) }
+  }
+  if (!marker) return { kind: 'none' }
+  const settled = marker
+  const clear = async () => {
+    // A quote or a dry run only looks: clearing is for a call that holds the key.
+    if (!mayClear) return
+    try {
+      // Only the note that was read: a newer note for the same key is never this call's to delete.
+      await sp.clearSend?.(policyKey, settled.txHash)
+    } catch {
+      // The note stays; the next call looks again.
+    }
+  }
+  if (sp.lookupTransaction) {
+    try {
+      const lookup = sp.lookupTransaction
+      const hash = marker.txHash
+      const tx = await bounded(deps, () => lookup(hash))
+      if (tx.status === 'success' || tx.status === 'failed') {
+        await clear()
+        return { kind: 'none' }
+      }
+    } catch {
+      // Cannot say: the ledger decides.
+    }
+  }
+  let ledger: string | undefined
+  if (sp.currentLedger) {
+    try {
+      const read = sp.currentLedger
+      ledger = await bounded(deps, () => read())
+    } catch {
+      ledger = undefined
+    }
+  }
+  if (typeof ledger === 'string' && /^\d{1,18}$/.test(ledger) && BigInt(ledger) > BigInt(marker.ceilLedgerSeq)) {
+    await clear()
+    return { kind: 'none' }
+  }
+  return { kind: 'blocked', marker, ...(typeof ledger === 'string' && /^\d{1,18}$/.test(ledger) ? { ledger } : {}) }
+}
+
+/**
  * The self-paid path of write_policy and update_policy: no service fee and no call to ms-zetrix. The wallet builds the contract call,
  * signs it through Wallet BE and submits it, paying only the network gas in ZTX. Free until the user has confirmed; and once it has,
  * the policy is read fresh from the chain right before signing, because the contract replaces a policy wholesale and checks nothing
  * about what was there.
  */
-async function runSelfPay(
+const selfPayLockKey = (deps: WritePolicyDeps, policyKey: string): string => `${deps.ownerAddress}\n${policyKey}`
+
+async function runSelfPay(deps: WritePolicyDeps, a: Parameters<typeof runSelfPayLocked>[1]): Promise<WritePolicyResult> {
+  if (!a.canWrite) return runSelfPayLocked(deps, a)
+  const r = await withSelfPayLock(selfPayLockKey(deps, a.call.policyKey), lockWaitMs(deps), () => runSelfPayLocked(deps, a))
+  if (r.kind === 'ran') return r.value
+  return { state: 'refused', paid: false, policyKey: a.call.policyKey, interpretation: a.interpretation, message: busyMessage(a.call.policyKey, 'NOTHING WAS SENT') }
+}
+
+/**
+ * The sponsored write, the collect of an already-paid write and the removal take the SAME lock as a self-paid send, from their guard to their
+ * end. Without it a self-paid send could be between "no note yet" and "note written" (the Wallet BE signature takes a while) while the guard of
+ * another path reads, finds nothing, and goes on: two whole-policy replacements, or a removal the self-paid update then undoes. Only a call that
+ * is about to spend or remove takes it; a quote or a dry run does not.
+ */
+async function recoverInFlight(deps: WritePolicyDeps, client: PolicyWriteClient, a: Parameters<typeof recoverInFlightLocked>[2]): Promise<WritePolicyResult> {
+  if (!a.canWrite) return recoverInFlightLocked(deps, client, a)
+  const r = await withSelfPayLock(selfPayLockKey(deps, a.policyKey), lockWaitMs(deps), () => recoverInFlightLocked(deps, client, a))
+  if (r.kind === 'ran') return r.value
+  return {
+    state: 'refused',
+    paid: true,
+    paymentReceipt: a.pre.blobId,
+    policyKey: a.policyKey,
+    interpretation: a.interpretation,
+    message: busyMessage(a.policyKey, COLLECT_HELD),
+  }
+}
+
+async function runPaidFlow(deps: WritePolicyDeps, client: PolicyWriteClient, a: Parameters<typeof runPaidFlowLocked>[2]): Promise<WritePolicyResult> {
+  // Asking the user to choose who pays (no gasPayer given while self-pay is on offer) never spends, so it does not wait or hold anyone up.
+  const choosing = a.gasPayer === undefined && deps.selfPay !== undefined
+  if (!a.canWrite || choosing) return runPaidFlowLocked(deps, client, a)
+  const r = await withSelfPayLock(selfPayLockKey(deps, a.policyKey), lockWaitMs(deps), () => runPaidFlowLocked(deps, client, a))
+  if (r.kind === 'ran') return r.value
+  return { state: 'refused', paid: false, policyKey: a.policyKey, interpretation: a.interpretation, message: busyMessage(a.policyKey, 'NOTHING WAS PAID') }
+}
+
+const COLLECT_HELD = 'NOTHING WAS COLLECTED (the earlier payment is not lost: do not pay again, ask again later)'
+
+/** check_policy_write's collect, held back the same way while a self-paid send may still land. A write already on chain needs no collect. */
+async function collectUnlessSelfPayHeld(deps: WritePolicyDeps, receipt: PolicyWriteReceipt, budgetMs: number): Promise<WritePolicyResult> {
+  const r = await withSelfPayLock(selfPayLockKey(deps, receipt.policyKey), lockWaitMs(deps), async (): Promise<WritePolicyResult> => {
+    const applied = await checkChainFirst(deps, receipt)
+    if (applied) return applied
+    const held = await holdForSelfPaySend(deps, receipt.policyKey, COLLECT_HELD)
+    if (held) return { ...held, paid: true, paymentReceipt: receipt.blobId, policyKey: receipt.policyKey }
+    return pollCollect(deps, deps.client!, receipt, budgetMs)
+  })
+  if (r.kind === 'ran') return r.value
+  return { state: 'refused', paid: true, paymentReceipt: receipt.blobId, policyKey: receipt.policyKey, message: busyMessage(receipt.policyKey, COLLECT_HELD) }
+}
+
+async function runSelfPayLocked(
   deps: WritePolicyDeps,
   a: {
     call: SelfPayCall
@@ -1267,6 +1495,8 @@ async function runSelfPay(
     verb: 'write' | 'update'
     /** Why a self-paid write is not available for this one, when it is not. */
     unavailable?: string
+    /** The most gas the user agreed to (raw): the figure they were shown. Needed to send. */
+    maxGasRaw?: string
   },
 ): Promise<WritePolicyResult> {
   const { call, interpretation } = a
@@ -1301,6 +1531,29 @@ async function runSelfPay(
       message:
         `A paid write for "${policyKey}" is still waiting to be finished (receipt ${waiting.blobId}), and a self-paid write now could be overwritten by its collect, ` +
         `or overwrite it. Finish it first with check_policy_write, then ask again. NOTHING WAS SENT.`,
+    }
+  }
+
+  // An earlier self-paid send for this key that is not settled blocks another.
+  const inFlight = await resolveInFlight(deps, policyKey, a.canWrite)
+  if (inFlight.kind === 'unreadable') {
+    return unavailable(
+      'Whether an earlier self-paid write for "' + policyKey + '" is still in flight could not be checked (' +
+        (inFlight.detail ?? 'the record of it could not be read') +
+        '), so NOTHING WAS SENT.',
+    )
+  }
+  if (inFlight.kind === 'blocked') {
+    const m = inFlight.marker
+    return {
+      state: 'unknown',
+      policyKey,
+      txHash: m.txHash,
+      interpretation,
+      message:
+        `A self-paid ${m.operation === 'UPDATE' ? 'update' : 'write'} for "${policyKey}" was sent at ${m.submittedAt} (transaction ${m.txHash}, nonce ${m.nonce}) and its outcome is not known yet. ` +
+        `It can still be included until ledger ${m.ceilLedgerSeq}${inFlight.ledger ? ` (the ledger is now ${inFlight.ledger})` : ''}, so NOTHING WAS SENT this time: a second transaction could land on top of it. ` +
+        `Read the policy with get_my_policy to see whether it landed, or ask again after ledger ${m.ceilLedgerSeq}, when it can no longer land.`,
     }
   }
 
@@ -1354,9 +1607,11 @@ async function runSelfPay(
       message:
         `QUOTE ONLY — nothing was sent and nothing was written. Paying the gas yourself: ${selfPayWords(assessment)} ` +
         (!a.dryRun && !a.confirmed
-          ? `A policy is a spending limit, so a person must agree to it first: show the user what it means (interpretation) and the cost, and only after they say yes call ${a.tool} again with gasPayer "self" and confirm: true. Never pass confirm on your own judgement.`
+          ? `A policy is a spending limit, so a person must agree to it first: show the user what it means (interpretation) and the cost, and only after they say yes call ${a.tool} again with gasPayer "self"${
+            assessment.gas.requiredRaw ? `, maxGasRaw "${assessment.gas.requiredRaw}" (the gas figure above)` : ''
+          } and confirm: true. Never pass confirm on your own judgement.`
           : assessment.status === 'enough'
-            ? `Ask again without dryRun to ${a.verb} it.`
+            ? `Ask again without dryRun to ${a.verb} it, with gasPayer "self" and maxGasRaw "${assessment.gas.requiredRaw}".`
             : 'Fix that, then ask again without dryRun.'),
     }
   }
@@ -1376,8 +1631,37 @@ async function runSelfPay(
     }
   }
 
-  // The ceiling the balance was just checked against: a fresh estimate above it is refused with nothing signed.
-  const sent = await deps.selfPay.execute(call, { maxFeeRaw: assessment.gas.requiredRaw as string })
+  // The figure the user was shown bounds what is signed. Without it, or when the gas now costs more than they were shown, nothing
+  // is signed: the user is shown the current figure and asked again.
+  const requiredRaw = assessment.gas.requiredRaw as string
+  if (a.maxGasRaw === undefined) {
+    return {
+      state: 'refused',
+      paid: false,
+      policyKey,
+      interpretation,
+      gasOptions: { self },
+      message:
+        `NOTHING WAS SENT: a self-paid write needs maxGasRaw, the most gas the user agreed to, so it can never cost more than they were shown. ` +
+        `The gas the wallet asks to hold for this write is now ${assessment.gas.requiredHuman} (${requiredRaw} raw: the estimate plus a fifth). Show the user that figure and, if they ` +
+        `agree, call ${a.tool} again with gasPayer "self", maxGasRaw "${requiredRaw}" and confirm: true.`,
+    }
+  }
+  if (BigInt(requiredRaw) > BigInt(a.maxGasRaw)) {
+    return {
+      state: 'refused',
+      paid: false,
+      policyKey,
+      interpretation,
+      gasOptions: { self },
+      message:
+        `NOTHING WAS SENT: the gas the wallet asks to hold for this write is now ${assessment.gas.requiredHuman} (${requiredRaw} raw: the estimate plus a fifth), more than the ${a.maxGasRaw} raw the user agreed to. ` +
+        `Show the user the new figure and, if they agree, call ${a.tool} again with gasPayer "self", maxGasRaw "${requiredRaw}" and confirm: true.`,
+    }
+  }
+  // The ceiling the balance was just checked against, and never above what the user was shown: a fresh estimate above it is refused with
+  // nothing signed.
+  const sent = await deps.selfPay.execute(call, { maxFeeRaw: requiredRaw })
   switch (sent.kind) {
     case 'rejected':
       return { state: 'refused', paid: false, policyKey, interpretation, message: `NOTHING WAS SENT and no gas was spent: ${sent.reason}. Fix the cause and ask again.` }
@@ -1414,13 +1698,23 @@ async function runSelfPay(
       return {
         state: 'unknown',
         policyKey,
+        txHash: sent.txHash,
         interpretation,
         message:
           `The transaction was sent but the node's answer never arrived (${sent.reason}), so it MAY be on chain and the gas MAY be spent. Do NOT send it again. ` +
-          `Read the policy with get_my_policy to see whether it took effect (sent with nonce ${sent.nonce}).`,
+          `Read the policy with get_my_policy to see whether it took effect (transaction ${sent.txHash}, nonce ${sent.nonce}). It can be included only until ledger ${sent.ceilLedgerSeq}; ` +
+          `this wallet remembers it and will not send another for this key until it has landed or can no longer land.`,
       }
     case 'submitted': {
       const landed = await confirmSelfWrite(deps, call, a.pollBudgetMs, sent.txHash)
+      // Landed or failed settles it; "not yet" leaves the note, so a later call is held back until it lands or can no longer land.
+      if (landed.kind !== 'not_yet') {
+        try {
+          await deps.selfPay.clearSend?.(policyKey, sent.txHash)
+        } catch {
+          // A note that stays only costs a lookup on the next call.
+        }
+      }
       if (landed.kind === 'failed') {
         return {
           state: 'write_failed',
@@ -1470,7 +1764,7 @@ async function runSelfPay(
  * pay through the wallet's own capped payer, bookmark the receipt, and poll the collect. Nothing here knows which write it
  * is except the route it pays to, the operation it bookmarks, and the words it uses.
  */
-async function runPaidFlow(
+async function runPaidFlowLocked(
   deps: WritePolicyDeps,
   client: PolicyWriteClient,
   a: {
@@ -1552,6 +1846,10 @@ async function runPaidFlow(
             : 'Ask again without dryRun to deploy.'),
     }
   }
+
+  // A self-paid send that is not settled could overwrite this write when it lands: nothing is paid while one may still land.
+  const held = await holdForSelfPaySend(deps, policyKey, 'NOTHING WAS PAID')
+  if (held) return { ...held, paid: false, policyKey, interpretation }
 
   let paymentHeader: string
   try {
@@ -1677,7 +1975,7 @@ export async function checkPolicyWrite(
       // than quietly choosing.
       const others = pending.slice(1).map((r) => `${r.policyKey} (${r.blobId})`).join(', ')
       const result =
-        (await checkChainFirst(deps, receipt)) ?? (await pollCollect(deps, deps.client, receipt, input.pollBudgetMs ?? DEFAULT_BUDGET_MS))
+        await collectUnlessSelfPayHeld(deps, receipt, input.pollBudgetMs ?? DEFAULT_BUDGET_MS)
       return {
         ...result,
         message:
@@ -1687,7 +1985,7 @@ export async function checkPolicyWrite(
     }
   }
 
-  return (await checkChainFirst(deps, receipt)) ?? pollCollect(deps, deps.client, receipt, input.pollBudgetMs ?? DEFAULT_BUDGET_MS)
+  return collectUnlessSelfPayHeld(deps, receipt, input.pollBudgetMs ?? DEFAULT_BUDGET_MS)
 }
 
 /**
@@ -1729,6 +2027,8 @@ export interface UpdatePolicyInput {
   confirm?: boolean
   /** See {@link WritePolicyInput.gasPayer}. */
   gasPayer?: string
+  /** See {@link WritePolicyInput.maxGasRaw}. */
+  maxGasRaw?: string | number
 }
 
 /**
@@ -1752,6 +2052,8 @@ function blockString(value: unknown): string | undefined {
 export async function updatePolicy(deps: WritePolicyDeps, input: UpdatePolicyInput): Promise<WritePolicyResult> {
   const gas = parseGasPayer(input?.gasPayer)
   if (!gas.ok) return refusedGasPayer(input?.policyKey)
+  const maxGas = parseMaxGasRaw(input?.maxGasRaw)
+  if (!maxGas.ok) return refusedMaxGas(input?.policyKey)
   const client = deps.client
   // The service is needed to quote and collect a SPONSORED update; a self-paid one never contacts it.
   if (!client && gas.gasPayer !== 'self' && !(gas.gasPayer === undefined && deps.selfPay)) {
@@ -1942,6 +2244,7 @@ export async function updatePolicy(deps: WritePolicyDeps, input: UpdatePolicyInp
       tool: 'update_policy',
       verb: 'update',
       ...(blocker ? { unavailable: blocker } : {}),
+      ...(maxGas.maxGasRaw ? { maxGasRaw: maxGas.maxGasRaw } : {}),
     })
   }
   const selfUnavailable = blocker ?? (!selfCall ? NO_WINDOW_REASON : undefined)
@@ -2067,6 +2370,13 @@ const IN_PROGRESS_MESSAGE = (detail: string): string =>
   `read the policy back later with get_my_policy to see whether it took effect.`
 
 export async function removePolicy(deps: WritePolicyDeps, input: RemovePolicyInput): Promise<RemovePolicyResult> {
+  if (!(input?.confirm === true && typeof input.policyKey === 'string' && input.policyKey !== '')) return removePolicyLocked(deps, input)
+  const r = await withSelfPayLock(selfPayLockKey(deps, input.policyKey), lockWaitMs(deps), () => removePolicyLocked(deps, input))
+  if (r.kind === 'ran') return r.value
+  return { state: 'refused', policyKey: input.policyKey, message: busyMessage(input.policyKey, 'NOTHING WAS REMOVED') }
+}
+
+async function removePolicyLocked(deps: WritePolicyDeps, input: RemovePolicyInput): Promise<RemovePolicyResult> {
   const client = deps.client
   if (!client) {
     return {
@@ -2107,6 +2417,10 @@ export async function removePolicy(deps: WritePolicyDeps, input: RemovePolicyInp
         `remove_policy again with confirm: true. Never pass confirm on your own judgement.`,
     }
   }
+
+  // A self-paid update that is not settled could land after the removal and bring the old policy back.
+  const heldRemove = await holdForSelfPaySend(deps, input.policyKey, 'NOTHING WAS REMOVED')
+  if (heldRemove) return { state: heldRemove.state, policyKey: input.policyKey, message: heldRemove.message }
 
   // ── Confirmed. One free call; the service signs the permit with the owner's key and the password travels with it.
   const result = await client.remove(deps.ownerAddress, input.policyKey, deps.hsmPassword)

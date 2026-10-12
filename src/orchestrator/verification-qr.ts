@@ -54,6 +54,12 @@ export interface VerificationLinkDeps {
   linkTemplate?: string
   /** Renders `text` as a PNG QR code. */
   renderQr: (text: string) => Promise<Buffer>
+  /**
+   * Writes the QR PNG to a file and returns its path, so a chat channel that sends files (WhatsApp) has something to
+   * attach. `expiresAtMs` is when the link stops working, so the file can be removed then. Optional: without it the
+   * QR is only the image block of the tool result.
+   */
+  saveQr?: (png: Buffer, referenceId: string, expiresAtMs: number) => Promise<string>
   now?: () => number
 }
 
@@ -73,9 +79,48 @@ export type VerificationLinkResult =
       /** Absent when rendering failed; the link above is still good. */
       qrCodePngBase64?: string
       qrError?: string
+      /** The QR as a PNG file a chat channel can attach. Absent when no file was written; the link is still good. */
+      qrCodePath?: string
+      /** Why the file could not be written, when it could not. */
+      qrFileError?: string
+      /**
+       * The presented credential's saved pass-design image(s), for a chat channel to send as well. Set by the
+       * create_verification_qr tool, which knows which credential it chose; absent when none is saved or the file is gone.
+       */
+      vcPassImagePaths?: string[]
       message: string
     }
   | { created: false; reason: string }
+
+/**
+ * What the agent is told to do with the QR. A chat channel (WhatsApp) sends files and text, not MCP image blocks, and
+ * an agent with no QR file to attach has been seen sending the credential's pass-design image and calling it the QR
+ * code, so the instruction is explicit about the file, about not substituting another image, and about the fallback.
+ */
+function qrGuidance(qrCodePath: string | undefined, hasQrImage: boolean): string {
+  const fallback =
+    'If you cannot attach an image in this chat, give the user the link and say plainly that you could not send the QR code.'
+  const never =
+    "Never send any other image as the QR code, and never call another image a QR code: the credential's pass design is not one."
+  if (qrCodePath !== undefined) {
+    return (
+      `Send the user the QR code by attaching the file at ${qrCodePath} (the same image is also returned with this result, as its first image; any other image is not the QR code). ` +
+      `${never} ${fallback} Also give them the link.`
+    )
+  }
+  if (hasQrImage) {
+    // No file, but the QR image itself is returned. It is always the FIRST image of the result; a pass design, if one is
+    // returned too, comes after it. Without saying so, an agent with two unlabelled images has only their order to go on.
+    return (
+      `There is no QR image file this time, so give the user the link. The QR code is the first image returned with this result; any other image is not the QR code. ` +
+      `${never} If your channel cannot show images, say plainly that you could not send the QR code.`
+    )
+  }
+  return (
+    `No QR code could be made this time, so give the user the link and say plainly that you could not send a QR code. ` +
+    `Any image returned with this result is not the QR code. ${never}`
+  )
+}
 
 /** Fill the reference id into MyID's link template. Throws when the template is not one we will build a link from. */
 export function buildVerificationLink(template: string | undefined, referenceId: string): string {
@@ -212,8 +257,24 @@ export async function createVerificationLink(
 
   let qrCodePngBase64: string | undefined
   let qrError: string | undefined
+  let qrCodePath: string | undefined
+  let qrFileError: string | undefined
   try {
-    qrCodePngBase64 = (await deps.renderQr(link)).toString('base64')
+    const png = await deps.renderQr(link)
+    // An empty image is no image: the tool result drops it, so counting it as a QR would promise a first image that is not there.
+    if (png.length === 0) throw new Error('the QR renderer returned nothing')
+    qrCodePngBase64 = png.toString('base64')
+    if (deps.saveQr) {
+      try {
+        qrCodePath = await deps.saveQr(png, referenceId, startedAt + expiryMinutes * 60_000)
+      } catch (e) {
+        // Same rule: the link works without the file, so a file that cannot be written must not lose the presentation.
+        // Only the error code: the system's message carries a path the agent has no use for.
+        const code = (e as NodeJS.ErrnoException | null)?.code
+        qrFileError =
+          typeof code === 'string' && /^[A-Z0-9_]{1,32}$/.test(code) ? `could not write the QR file (${code})` : 'could not write the QR file'
+      }
+    }
   } catch (e) {
     // The presentation already exists and the link works on its own — do not throw it away over a picture.
     qrError = messageOf(e)
@@ -228,8 +289,10 @@ export async function createVerificationLink(
     revealed: revealed.revealed,
     ...(qrCodePngBase64 !== undefined ? { qrCodePngBase64 } : {}),
     ...(qrError !== undefined ? { qrError } : {}),
+    ...(qrCodePath !== undefined ? { qrCodePath } : {}),
+    ...(qrFileError !== undefined ? { qrFileError } : {}),
     message:
-      `Show the user the QR code and the link, and tell them to open it in the MyID app ` +
+      `${qrGuidance(qrCodePath, qrCodePngBase64 !== undefined)} Tell them to open the link in the MyID app ` +
       `(they need MyID installed first). It stops working at about ${expiresAt}, ` +
       `${expiryMinutes} minute${expiryMinutes === 1 ? '' : 's'} after it was created — if it lapses, create a new one. ` +
       `This ${revealed.revealed === 'all' ? 'reveals the whole credential' : `reveals: ${revealed.revealed.map((p) => JSON.stringify(p)).join(', ')}`}. ` +

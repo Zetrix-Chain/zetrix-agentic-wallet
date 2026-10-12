@@ -4,6 +4,8 @@
  * called (nothing sent / may be on chain / on chain), and that the service is never contacted on this path.
  */
 import { describe, it, expect, vi } from 'vitest'
+import { createHash } from 'node:crypto'
+import type { SelfPayMarker, SelfPayMarkerStore } from '../clients/self-pay-marker-store'
 import { PolicyWriteClient, type HttpSend } from '../clients/policy-write-client'
 import type { PolicyWriteReceipt, PolicyWriteReceiptStore } from '../clients/policy-write-receipt-store'
 import { updatePolicy, writePolicy, type WritePolicyDeps } from '../orchestrator/write-policy'
@@ -123,8 +125,27 @@ describe('typeAttributes / buildPolicyCall', () => {
 })
 
 // ── the chain side ─────────────────────────────────────────────────────────────────────────────────
+/** A note store in memory, with the calls it saw. */
+function memoryMarkers(): SelfPayMarkerStore & { map: Map<string, SelfPayMarker>; order: string[] } {
+  const map = new Map<string, SelfPayMarker>()
+  const order: string[] = []
+  const key = (o: string, k: string) => o + '\n' + k
+  return {
+    map,
+    order,
+    async get(o, k) { return map.get(key(o, k)) ?? null },
+    async set(m) { order.push('set'); map.set(key(m.ownerAddress, m.policyKey), m) },
+    async remove(o, k) { order.push('remove'); map.delete(key(o, k)) },
+  }
+}
+
+/** The transaction hash of the fake blob below: SHA-256 of its bytes. */
+const BLOB_HEX = '0a0b0c'
+const BLOB_HASH = createHash('sha256').update(Buffer.from(BLOB_HEX, 'hex')).digest('hex')
+
 function chainDeps(over: Partial<SelfPayChainDeps> = {}) {
   const order: string[] = []
+  const markers = memoryMarkers()
   const d: SelfPayChainDeps = {
     registryAddress: REGISTRY,
     ownerAddress: OWNER,
@@ -138,7 +159,7 @@ function chainDeps(over: Partial<SelfPayChainDeps> = {}) {
     }),
     buildBlob: vi.fn(() => {
       order.push('build')
-      return { blob: 'BLOB' }
+      return { blob: BLOB_HEX }
     }),
     sign: vi.fn(async () => {
       order.push('sign')
@@ -149,9 +170,15 @@ function chainDeps(over: Partial<SelfPayChainDeps> = {}) {
       return { hash: 'tx-1' }
     }),
     queryNativeBalance: vi.fn(async () => ztx('9000000')),
+    currentLedger: vi.fn(async () => {
+      order.push('ledger')
+      return '1000'
+    }),
+    markers,
+    now: () => new Date('2026-10-12T00:00:00.000Z'),
     ...over,
   }
-  return { d, order }
+  return { d, order, markers }
 }
 
 /** What the balance check allowed for: a little above the 1,500,000 the fake node simulates. */
@@ -200,18 +227,20 @@ describe('createSelfPay: execute', () => {
     const { d, order } = chainDeps()
     const r = await createSelfPay(d).execute(CALL, LIMIT)
     // Signed with the CEILING the balance was checked against, not the simulated figure.
-    expect(r).toEqual({ kind: 'submitted', txHash: 'tx-1', nonce: '41', feeLimit: '1800000' })
-    expect(order).toEqual(['nonce', 'estimate', 'build', 'sign', 'submit'])
+    expect(r).toEqual({ kind: 'submitted', txHash: 'tx-1', nonce: '41', feeLimit: '1800000', ceilLedgerSeq: '1060' })
+    // The ledger is read before the blob is built (it sets the expiry), and the note is written after signing and before the submit.
+    expect(order).toEqual(['nonce', 'estimate', 'ledger', 'build', 'sign', 'submit'])
     const built = buildPolicyCall(CALL)
     expect(d.buildBlob).toHaveBeenCalledWith({
       sourceAddress: OWNER,
       nonce: '41',
       gasPrice: '1000',
       feeLimit: '1800000',
+      ceilLedgerSeq: '1060',
       operations: [{ type: 'contractInvokeByGas', data: { contractAddress: REGISTRY, input: built.ok ? built.input : '' } }],
     })
-    expect(d.sign).toHaveBeenCalledWith('BLOB')
-    expect(d.submit).toHaveBeenCalledWith({ blob: 'BLOB', signBlob: 'SIG', publicKey: 'PUB' })
+    expect(d.sign).toHaveBeenCalledWith(BLOB_HEX)
+    expect(d.submit).toHaveBeenCalledWith({ blob: BLOB_HEX, signBlob: 'SIG', publicKey: 'PUB' })
   })
 
   it('a call that cannot be built sends nothing and touches no chain dependency', async () => {
@@ -275,7 +304,7 @@ describe('createSelfPay: execute', () => {
   it('an answer that never arrives means it MAY be on chain, and the nonce is reported', async () => {
     const { d } = chainDeps({ submit: vi.fn(async () => { throw new Error('socket hang up') }) })
     const r = await createSelfPay(d).execute(CALL, LIMIT)
-    expect(r).toEqual({ kind: 'unknown', reason: 'socket hang up', nonce: '41' })
+    expect(r).toEqual({ kind: 'unknown', reason: 'socket hang up', nonce: '41', txHash: BLOB_HASH, ceilLedgerSeq: '1060' })
   })
 })
 
@@ -323,7 +352,7 @@ function selfPayDeps(over: Partial<SelfPayDeps> = {}): SelfPayDeps {
   return {
     estimateGas: vi.fn(async () => ({ gasRaw: '1000000' })),
     queryNativeBalance: vi.fn(async () => ztx('5000000')),
-    execute: vi.fn(async (): Promise<SelfPayExecResult> => ({ kind: 'submitted', txHash: 'tx-1', nonce: '7', feeLimit: '1000000' })),
+    execute: vi.fn(async (): Promise<SelfPayExecResult> => ({ kind: 'submitted', txHash: 'tx-1', nonce: '7', feeLimit: '1000000', ceilLedgerSeq: '1060' })),
     ...over,
   }
 }
@@ -355,8 +384,10 @@ function harness(over: Partial<WritePolicyDeps> = {}) {
   return { d, calls, pay, sleep }
 }
 
-const CREATE_IN = { policyKey: 'native-v1', attributes: NEW_ATTRS, templateId: TEMPLATE_ID, requestKey: 'r', pollBudgetMs: 60_000, gasPayer: 'self' }
-const UPDATE_IN = { policyKey: 'native-v1', attributes: NEW_ATTRS, expectedUpdatedAtBlock: '12345', pollBudgetMs: 60_000, gasPayer: 'self' }
+/** The figure the user was shown: the estimate of the harness (1,000,000) plus a fifth. */
+const SHOWN = '1200000'
+const CREATE_IN = { policyKey: 'native-v1', attributes: NEW_ATTRS, templateId: TEMPLATE_ID, requestKey: 'r', pollBudgetMs: 60_000, gasPayer: 'self', maxGasRaw: SHOWN }
+const UPDATE_IN = { policyKey: 'native-v1', attributes: NEW_ATTRS, expectedUpdatedAtBlock: '12345', pollBudgetMs: 60_000, gasPayer: 'self', maxGasRaw: SHOWN }
 
 describe('write_policy with gasPayer "self"', () => {
   it('never contacts the service and never pays a fee, even with no service configured', async () => {
@@ -398,7 +429,8 @@ describe('write_policy with gasPayer "self"', () => {
     expect(r.gasOptions?.self).toMatchObject({ fee: 'none', status: 'enough' })
     expect(r.gasOptions).not.toHaveProperty('sponsored')
     expect(r.message).toContain('QUOTE ONLY')
-    expect(r.message).toContain('gasPayer "self" and confirm: true')
+    expect(r.message).toContain('gasPayer "self", maxGasRaw "1200000"')
+    expect(r.message).toContain('and confirm: true')
     expect(h.d.selfPay!.execute).not.toHaveBeenCalled()
   })
 
@@ -506,12 +538,14 @@ describe('write_policy with gasPayer "self"', () => {
     })
 
     it('an answer that never came: unknown, never "written", never "send again"', async () => {
-      const r = await ended({ kind: 'unknown', reason: 'socket hang up', nonce: '41' })
+      const r = await ended({ kind: 'unknown', reason: 'socket hang up', nonce: '41', txHash: 'ab'.repeat(32), ceilLedgerSeq: '1060' })
       expect(r.state).toBe('unknown')
       expect(r.message).toContain('MAY be on chain')
       expect(r.message).toContain('Do NOT send it again')
       expect(r.message).toContain('nonce 41')
-      expect(r).not.toHaveProperty('txHash')
+      expect(r.txHash).toBe('ab'.repeat(32))
+      expect(r.message).toContain('until ledger 1060')
+      expect(r.message).toContain('remembers it')
     })
   })
 
@@ -807,7 +841,7 @@ describe('R1-M1: the fee that is signed is the fee that was checked', () => {
 
   it('the orchestrator hands over exactly the amount the balance was checked against', async () => {
     const h = harness({ readPolicy: seq(NOT_FOUND, AFTER_CREATE), selfPay: selfPayDeps({ estimateGas: async () => ({ gasRaw: '1500000' }) }) })
-    await writePolicy(h.d, { ...CREATE_IN, confirm: true } as never)
+    await writePolicy(h.d, { ...CREATE_IN, maxGasRaw: '1800000', confirm: true } as never)
     // 1,500,000 + a fifth.
     expect(h.d.selfPay!.execute).toHaveBeenCalledWith(expect.anything(), { maxFeeRaw: '1800000' })
   })
@@ -1146,7 +1180,7 @@ describe('R1-L8: more of what must hold', () => {
   })
 
   it('an unknown outcome submits exactly once, never again', async () => {
-    const selfPay = selfPayDeps({ execute: vi.fn(async (): Promise<SelfPayExecResult> => ({ kind: 'unknown', reason: 'socket hang up', nonce: '9' })) })
+    const selfPay = selfPayDeps({ execute: vi.fn(async (): Promise<SelfPayExecResult> => ({ kind: 'unknown', reason: 'socket hang up', nonce: '9', txHash: 'cd'.repeat(32), ceilLedgerSeq: '1060' })) })
     const h = harness({ selfPay })
     const r = await writePolicy(h.d, { ...CREATE_IN, confirm: true } as never)
     expect(r.state).toBe('unknown')
@@ -1154,7 +1188,7 @@ describe('R1-L8: more of what must hold', () => {
   })
 
   it('a repeat call after an unknown outcome reads the chain first: a write that landed is "already exists", not sent twice', async () => {
-    const selfPay = selfPayDeps({ execute: vi.fn(async (): Promise<SelfPayExecResult> => ({ kind: 'unknown', reason: 'socket hang up', nonce: '9' })) })
+    const selfPay = selfPayDeps({ execute: vi.fn(async (): Promise<SelfPayExecResult> => ({ kind: 'unknown', reason: 'socket hang up', nonce: '9', txHash: 'cd'.repeat(32), ceilLedgerSeq: '1060' })) })
     const first = harness({ selfPay })
     await writePolicy(first.d, { ...CREATE_IN, confirm: true } as never)
     const second = harness({ selfPay, readPolicy: seq(AFTER_CREATE) })
@@ -1619,3 +1653,1167 @@ describe('R3-L2: the "neither" answers, from every cause', () => {
     expect(again.state).toBe('written')
   })
 })
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+// the fee that is signed is never above the gas figure the user was shown
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+import { parseMaxGasRaw } from '../orchestrator/policy-gas-choice'
+
+describe('parseMaxGasRaw', () => {
+  it.each([[undefined], [null], ['']])('%j means "not given"', (v) => {
+    expect(parseMaxGasRaw(v)).toEqual({ ok: true })
+  })
+
+  it('a positive whole number as digits, or as a safe-integer number, is read as its digits', () => {
+    expect(parseMaxGasRaw('1200000')).toEqual({ ok: true, maxGasRaw: '1200000' })
+    expect(parseMaxGasRaw(1200000)).toEqual({ ok: true, maxGasRaw: '1200000' })
+    expect(parseMaxGasRaw('1')).toEqual({ ok: true, maxGasRaw: '1' })
+    expect(parseMaxGasRaw('99999999999999999')).toEqual({ ok: true, maxGasRaw: '99999999999999999' })
+  })
+
+  it.each([['0'], ['-1'], ['1.5'], ['01'], [' 5'], ['5 '], ['1e6'], ['0x10'], ['abc'], ['1234567890123456789'], [0], [-3], [1.5], [Number.NaN], [Number.POSITIVE_INFINITY], [2 ** 60], [true], [{}], [['1']]])(
+    '%j is refused, never guessed',
+    (v) => {
+      expect(parseMaxGasRaw(v)).toEqual({ ok: false })
+    },
+  )
+})
+
+describe('a self-paid send is bounded by what the user was shown', () => {
+  it('without maxGasRaw nothing is signed, and the refusal gives the figure to show and exactly what to call with', async () => {
+    const { maxGasRaw: _m, ...withoutIt } = CREATE_IN
+    const h = harness()
+    const r = await writePolicy(h.d, { ...withoutIt, confirm: true } as never)
+    expect(r.state).toBe('refused')
+    expect(r.paid).toBe(false)
+    expect(r.message).toContain('NOTHING WAS SENT')
+    expect(r.message).toContain('needs maxGasRaw')
+    expect(r.message).toContain('1.2 ZTX')
+    expect(r.message).toContain('maxGasRaw "1200000"')
+    expect(r.message).toContain('confirm: true')
+    expect(r.gasOptions?.self?.gas.requiredRaw).toBe('1200000')
+    expect(h.d.selfPay!.execute).not.toHaveBeenCalled()
+  })
+
+  it('the same for an update', async () => {
+    const { maxGasRaw: _m, ...withoutIt } = UPDATE_IN
+    const h = harness({ readPolicy: seq(BEFORE, BEFORE) })
+    const r = await updatePolicy(h.d, { ...withoutIt, confirm: true } as never)
+    expect(r.state).toBe('refused')
+    expect(r.message).toContain('call update_policy again')
+    expect(h.d.selfPay!.execute).not.toHaveBeenCalled()
+  })
+
+  it('a figure below what the gas now costs is refused with nothing signed, naming both figures and what to pass', async () => {
+    const h = harness()
+    const r = await writePolicy(h.d, { ...CREATE_IN, maxGasRaw: '1199999', confirm: true } as never)
+    expect(r.state).toBe('refused')
+    expect(r.paid).toBe(false)
+    expect(r.message).toContain('NOTHING WAS SENT')
+    expect(r.message).toContain('1200000 raw')
+    expect(r.message).toContain('1199999 raw')
+    expect(r.message).toContain('gasPayer "self", maxGasRaw "1200000" and confirm: true')
+    expect(h.d.selfPay!.execute).not.toHaveBeenCalled()
+  })
+
+  it('exactly the figure shown is allowed, and so is a higher one: the ceiling signed is the wallet\'s own, never the higher figure', async () => {
+    for (const shown of ['1200000', '9000000']) {
+      const h = harness({ readPolicy: seq(NOT_FOUND, AFTER_CREATE) })
+      const r = await writePolicy(h.d, { ...CREATE_IN, maxGasRaw: shown, confirm: true } as never)
+      expect(r.state).toBe('written')
+      expect(h.d.selfPay!.execute).toHaveBeenCalledWith(expect.anything(), { maxFeeRaw: '1200000' })
+    }
+  })
+
+  it('a figure given as a number is accepted', async () => {
+    const h = harness({ readPolicy: seq(NOT_FOUND, AFTER_CREATE) })
+    expect((await writePolicy(h.d, { ...CREATE_IN, maxGasRaw: 1200000, confirm: true } as never)).state).toBe('written')
+  })
+
+  it('the gas rising between the quote and the confirm is caught: shown 1.2, now 1.8', async () => {
+    const selfPay = selfPayDeps({ estimateGas: vi.fn(async () => ({ gasRaw: '1500000' })) })
+    const h = harness({ selfPay })
+    const r = await writePolicy(h.d, { ...CREATE_IN, maxGasRaw: '1200000', confirm: true } as never)
+    expect(r.state).toBe('refused')
+    expect(r.message).toContain('1800000 raw')
+    expect(r.message).toContain('gasPayer "self", maxGasRaw "1800000" and confirm: true')
+    expect(selfPay.execute).not.toHaveBeenCalled()
+  })
+
+  it.each([['0'], ['-5'], ['1.5'], ['abc'], [{}], [true]])('a maxGasRaw of %j is refused before the chain is even read', async (bad) => {
+    const preflight = vi.fn(async () => ({ ready: true, policyKey: 'native-v1', blockers: [], interpretation: [], notChecked: [] }))
+    const h = harness({ preflight: preflight as never })
+    const r = await writePolicy(h.d, { ...CREATE_IN, maxGasRaw: bad, confirm: true } as never)
+    expect(r.state).toBe('refused')
+    expect(r.message).toContain('maxGasRaw must be a positive whole number')
+    expect(r.message).toContain('NOTHING WAS PAID')
+    expect(h.calls).toEqual([])
+    expect(h.d.readPolicy).not.toHaveBeenCalled()
+    expect(preflight).not.toHaveBeenCalled()
+    expect(h.d.selfPay!.execute).not.toHaveBeenCalled()
+  })
+
+  it('a malformed maxGasRaw is refused for an update too, and with gasPayer "sponsored" (a typo is caught either way)', async () => {
+    const u = harness({ readPolicy: seq(BEFORE) })
+    expect((await updatePolicy(u.d, { ...UPDATE_IN, maxGasRaw: 'x', confirm: true } as never)).message).toContain('maxGasRaw must be')
+    const s = harness()
+    expect((await writePolicy(s.d, { ...CREATE_IN, gasPayer: 'sponsored', maxGasRaw: 'x' } as never)).message).toContain('maxGasRaw must be')
+  })
+
+  it('a quote and a dry run do not need it, and tell the agent what to pass to send', async () => {
+    const { maxGasRaw: _m, ...withoutIt } = CREATE_IN
+    const quote = await writePolicy(harness().d, withoutIt as never)
+    expect(quote.state).toBe('quoted')
+    expect(quote.message).toContain('maxGasRaw "1200000"')
+    const dry = await writePolicy(harness().d, { ...withoutIt, dryRun: true } as never)
+    expect(dry.state).toBe('quoted')
+    expect(dry.message).toContain('maxGasRaw "1200000"')
+  })
+
+  it('when the gas could not be estimated the quote does not tell the agent to pass an empty figure', async () => {
+    const { maxGasRaw: _m, ...withoutIt } = CREATE_IN
+    const h = harness({ selfPay: selfPayDeps({ estimateGas: async () => ({ error: 'node down' }) }) })
+    const r = await writePolicy(h.d, withoutIt as never)
+    expect(r.state).toBe('quoted')
+    expect(r.message).not.toContain('maxGasRaw')
+    expect(r.message).toContain('gasPayer "self" and confirm: true')
+  })
+
+  it('the choice tells the agent to pass the self figure for "self"', async () => {
+    const http = (async () => ({
+      ok: false,
+      status: 402,
+      headers: { get: () => null },
+      text: async () => JSON.stringify({ x402Version: 1, accepts: [{ scheme: 'exact', asset: 'ZTX3JMYR', maxAmountRequired: '50000', extra: { gasModel: 'facilitator', prepareEndpoint: 'https://x/f' } }] }),
+    })) as unknown as HttpSend
+    const h = harness({ client: new PolicyWriteClient('https://x/api', http) })
+    const { gasPayer: _g, maxGasRaw: _m, ...noChoice } = CREATE_IN
+    const r = await writePolicy(h.d, noChoice as never)
+    expect(r.state).toBe('needs_choice')
+    expect(r.message).toContain('for "self" also pass maxGasRaw "1200000"')
+  })
+
+  it('a sponsored write with a valid maxGasRaw still goes through, and the figure is ignored', async () => {
+    const steps = [
+      { status: 402, body: { x402Version: 1, accepts: [{ scheme: 'exact', asset: 'ZTX3JMYR', maxAmountRequired: '50000', extra: { gasModel: 'facilitator', prepareEndpoint: 'https://x/f' } }] }, headers: {} as Record<string, string> },
+      { status: 202, body: { state: 'PAID_PENDING', receipt: 'blob-1' }, headers: { 'X-PAYMENT-RECEIPT': 'blob-1' } as Record<string, string> },
+      { status: 200, body: { state: 'WRITTEN', policyKey: 'native-v1', txHash: 'tx-1' }, headers: {} as Record<string, string> },
+    ]
+    let n = 0
+    const http = (async () => {
+      const st = steps[Math.min(n++, steps.length - 1)]
+      return { ok: st.status < 300, status: st.status, headers: { get: (k: string) => st.headers[k] ?? null }, text: async () => JSON.stringify(st.body) }
+    }) as unknown as HttpSend
+    const h = harness({ client: new PolicyWriteClient('https://x/api', http), readPolicy: seq(NOT_FOUND) })
+    const r = await writePolicy(h.d, { ...CREATE_IN, gasPayer: 'sponsored', maxGasRaw: '1', confirm: true } as never)
+    expect(r.state).toBe('written')
+    expect(h.pay).toHaveBeenCalledTimes(1)
+    expect(h.d.selfPay!.execute).not.toHaveBeenCalled()
+  })
+
+  it('the sponsored path does not ask for it', async () => {
+    const steps = [
+      { status: 402, body: { x402Version: 1, accepts: [{ scheme: 'exact', asset: 'ZTX3JMYR', maxAmountRequired: '50000', extra: { gasModel: 'facilitator', prepareEndpoint: 'https://x/f' } }] } },
+    ]
+    const http = (async () => ({ ok: false, status: steps[0].status, headers: { get: () => null }, text: async () => JSON.stringify(steps[0].body) })) as unknown as HttpSend
+    const h = harness({ client: new PolicyWriteClient('https://x/api', http) })
+    const { maxGasRaw: _m, ...withoutIt } = CREATE_IN
+    const r = await writePolicy(h.d, { ...withoutIt, gasPayer: 'sponsored' } as never)
+    expect(r.state).toBe('quoted')
+    expect(r.message).not.toContain('maxGasRaw')
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+// an unsettled self-paid send is remembered, and settles in bounded time
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+import { mkdtemp, mkdir, readdir, readFile, rm, writeFile, stat } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { createFsSelfPayMarkerStore, isMarkerShape, markerFileName } from '../clients/self-pay-marker-store'
+import { SELF_PAY_CEIL_LEDGERS } from '../orchestrator/policy-self-pay'
+
+const MARKER: SelfPayMarker = {
+  policyKey: 'native-v1',
+  ownerAddress: OWNER,
+  operation: 'CREATE',
+  nonce: '41',
+  txHash: 'ab'.repeat(32),
+  ceilLedgerSeq: '1060',
+  submittedAt: '2026-10-12T00:00:00.000Z',
+}
+
+describe('the note store', () => {
+  const fresh = async () => createFsSelfPayMarkerStore(await mkdtemp(join(tmpdir(), 'self-pay-markers-')))
+
+  it('keeps a note, reads it back, and removes it', async () => {
+    const store = await fresh()
+    expect(await store.get(OWNER, 'native-v1')).toBeNull()
+    await store.set(MARKER)
+    expect(await store.get(OWNER, 'native-v1')).toEqual(MARKER)
+    await store.remove(OWNER, 'native-v1')
+    expect(await store.get(OWNER, 'native-v1')).toBeNull()
+    await store.remove(OWNER, 'native-v1')
+  })
+
+  it('one note per owner and key: another key or another owner is not affected', async () => {
+    const store = await fresh()
+    await store.set(MARKER)
+    expect(await store.get(OWNER, 'ztp20-v1')).toBeNull()
+    expect(await store.get('ZTX3SomeoneElse', 'native-v1')).toBeNull()
+    await store.set({ ...MARKER, policyKey: 'ztp20-v1', nonce: '42' })
+    expect((await store.get(OWNER, 'native-v1'))?.nonce).toBe('41')
+    expect((await store.get(OWNER, 'ztp20-v1'))?.nonce).toBe('42')
+  })
+
+  it('a second note for the same key replaces the first', async () => {
+    const store = await fresh()
+    await store.set(MARKER)
+    await store.set({ ...MARKER, nonce: '77' })
+    expect((await store.get(OWNER, 'native-v1'))?.nonce).toBe('77')
+  })
+
+  it('is written atomically, one file per note, with no leftover temp file, and holds no secret', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'self-pay-markers-'))
+    await createFsSelfPayMarkerStore(dir).set(MARKER)
+    const files = await readdir(dir)
+    expect(files).toEqual([markerFileName(OWNER, 'native-v1')])
+    const raw = await readFile(join(dir, files[0]), 'utf8')
+    expect(JSON.parse(raw)).toEqual(MARKER)
+    expect(raw).not.toMatch(/password|signature|publicKey|blob/i)
+    if (process.platform !== 'win32') expect((await stat(join(dir, files[0]))).mode & 0o777).toBe(0o600)
+  })
+
+  it('refuses to save a malformed note (so a malformed one can never be what a later call trusts)', async () => {
+    const store = await fresh()
+    await expect(store.set({ ...MARKER, txHash: 'nope' })).rejects.toThrow('malformed')
+    expect(await store.get(OWNER, 'native-v1')).toBeNull()
+  })
+
+  it('isMarkerShape: the bounds', () => {
+    expect(isMarkerShape(MARKER)).toBe(true)
+    expect(isMarkerShape({ ...MARKER, nonce: '1'.repeat(21) })).toBe(false)
+    expect(isMarkerShape({ ...MARKER, policyKey: '' })).toBe(false)
+    expect(isMarkerShape({ ...MARKER, submittedAt: '' })).toBe(false)
+    expect(isMarkerShape(null)).toBe(false)
+  })
+})
+
+describe('createSelfPay gives the transaction an expiry and writes the note before the submit', () => {
+  it('reads the ledger, sets the expiry on the transaction, and the note carries the nonce, hash and expiry', async () => {
+    const { d, markers } = chainDeps()
+    const r = await createSelfPay(d).execute(CALL, LIMIT)
+    expect(r).toMatchObject({ kind: 'submitted', ceilLedgerSeq: String(1000 + SELF_PAY_CEIL_LEDGERS) })
+    expect(d.buildBlob).toHaveBeenCalledWith(expect.objectContaining({ ceilLedgerSeq: '1060' }))
+    expect(markers.map.get(OWNER + '\n' + 'native-v1')).toEqual({
+      policyKey: 'native-v1',
+      ownerAddress: OWNER,
+      operation: 'CREATE',
+      nonce: '41',
+      txHash: BLOB_HASH,
+      ceilLedgerSeq: '1060',
+      submittedAt: '2026-10-12T00:00:00.000Z',
+    })
+  })
+
+  it('the note is written after signing and BEFORE the submit', async () => {
+    const seen: string[] = []
+    const { d, markers } = chainDeps()
+    const set = markers.set.bind(markers)
+    markers.set = async (m) => {
+      seen.push('marker')
+      await set(m)
+    }
+    ;(d.sign as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      seen.push('sign')
+      return { signBlob: 'SIG', publicKey: 'PUB' }
+    })
+    ;(d.submit as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      seen.push('submit')
+      return { hash: 'tx-1' }
+    })
+    await createSelfPay(d).execute(CALL, LIMIT)
+    expect(seen).toEqual(['sign', 'marker', 'submit'])
+  })
+
+  it('a ledger that cannot be read means nothing is signed', async () => {
+    for (const currentLedger of [vi.fn(async () => undefined), vi.fn(async () => 'abc'), vi.fn(async () => { throw new Error('node down') })]) {
+      const { d, markers } = chainDeps({ currentLedger: currentLedger as never })
+      const r = await createSelfPay(d).execute(CALL, LIMIT)
+      expect(r).toMatchObject({ kind: 'rejected', reason: expect.stringContaining('expiry') })
+      expect(d.buildBlob).not.toHaveBeenCalled()
+      expect(d.sign).not.toHaveBeenCalled()
+      expect(d.submit).not.toHaveBeenCalled()
+      expect(markers.map.size).toBe(0)
+    }
+  })
+
+  it('a ledger that is not plain digits is not accepted for the expiry, even if it would parse as a number', async () => {
+    for (const bad of ['0x3e8', '', ' 1000 ', '-5', '1e3']) {
+      const { d, markers } = chainDeps({ currentLedger: vi.fn(async () => bad) as never })
+      const r = await createSelfPay(d).execute(CALL, LIMIT)
+      expect(r, bad).toMatchObject({ kind: 'rejected', reason: expect.stringContaining('expiry') })
+      expect(d.sign).not.toHaveBeenCalled()
+      expect(markers.map.size).toBe(0)
+    }
+  })
+
+  it('the note records which operation was sent', async () => {
+    const { d, markers } = chainDeps()
+    await createSelfPay(d).execute({ ...CALL, operation: 'UPDATE' }, LIMIT)
+    expect([...markers.map.values()][0]?.operation).toBe('UPDATE')
+  })
+
+  it('a note that cannot be written means nothing is sent', async () => {
+    const { d, markers } = chainDeps()
+    markers.set = async () => {
+      throw new Error('disk full')
+    }
+    const r = await createSelfPay(d).execute(CALL, LIMIT)
+    expect(r).toMatchObject({ kind: 'rejected', reason: expect.stringContaining('could not be recorded') })
+    expect(d.sign).toHaveBeenCalled()
+    expect(d.submit).not.toHaveBeenCalled()
+  })
+
+  it('a refusal by the node removes the note (nothing is on chain); an unknown answer and a success keep it', async () => {
+    const refused = chainDeps({ submit: vi.fn(async () => { throw Object.assign(new Error('submit rejected'), { submitRejected: true }) }) })
+    expect((await createSelfPay(refused.d).execute(CALL, LIMIT)).kind).toBe('rejected')
+    expect(refused.markers.map.size).toBe(0)
+    const lost = chainDeps({ submit: vi.fn(async () => { throw new Error('socket hang up') }) })
+    expect((await createSelfPay(lost.d).execute(CALL, LIMIT)).kind).toBe('unknown')
+    expect(lost.markers.map.size).toBe(1)
+    const ok = chainDeps()
+    expect((await createSelfPay(ok.d).execute(CALL, LIMIT)).kind).toBe('submitted')
+    expect(ok.markers.map.size).toBe(1)
+  })
+
+  it('a failed removal after a refusal does not turn the refusal into something else', async () => {
+    const { d, markers } = chainDeps({ submit: vi.fn(async () => { throw Object.assign(new Error('submit rejected'), { submitRejected: true }) }) })
+    markers.remove = async () => {
+      throw new Error('locked')
+    }
+    expect((await createSelfPay(d).execute(CALL, LIMIT)).kind).toBe('rejected')
+  })
+
+  it('exposes the note, its removal and the ledger to the orchestrator', async () => {
+    const { d, markers } = chainDeps()
+    const sp = createSelfPay(d)
+    await markers.set(MARKER)
+    expect(await sp.pendingSend!('native-v1')).toEqual(MARKER)
+    await sp.clearSend!('native-v1')
+    expect(await sp.pendingSend!('native-v1')).toBeNull()
+    expect(await sp.currentLedger!()).toBe('1000')
+  })
+})
+
+describe('a repeat call for a key with an unsettled send', () => {
+  const noteFor = (over: Partial<SelfPayMarker> = {}): SelfPayMarker => ({ ...MARKER, ...over })
+  const withNote = (note: SelfPayMarker | null, over: Partial<SelfPayDeps> = {}) => {
+    let held: SelfPayMarker | null = note
+    const clearSend = vi.fn(async () => {
+      held = null
+    })
+    const selfPay = selfPayDeps({
+      pendingSend: vi.fn(async () => held),
+      clearSend,
+      currentLedger: vi.fn(async () => '1010'),
+      lookupTransaction: vi.fn(async () => ({ status: 'unknown' as const })),
+      ...over,
+    })
+    return { selfPay, clearSend, held: () => held }
+  }
+
+  it('while it can still land: nothing is sent, nothing is looked at on chain, and it says when it settles', async () => {
+    const n = withNote(noteFor())
+    const h = harness({ selfPay: n.selfPay })
+    const r = await writePolicy(h.d, { ...CREATE_IN, confirm: true } as never)
+    expect(r.state).toBe('unknown')
+    expect(r.txHash).toBe(MARKER.txHash)
+    expect(r.message).toContain('NOTHING WAS SENT')
+    expect(r.message).toContain('until ledger 1060')
+    expect(r.message).toContain('now 1010')
+    expect(r.message).toContain('after ledger 1060')
+    expect(r.message).toContain('get_my_policy')
+    expect(n.selfPay.execute).not.toHaveBeenCalled()
+    expect(h.d.readPolicy).not.toHaveBeenCalled()
+    expect(n.clearSend).not.toHaveBeenCalled()
+  })
+
+  it('also as a quote and a dry run, and for an update', async () => {
+    for (const extra of [{}, { dryRun: true }]) {
+      const n = withNote(noteFor())
+      expect((await writePolicy(harness({ selfPay: n.selfPay }).d, { ...CREATE_IN, ...extra } as never)).state).toBe('unknown')
+    }
+    const n = withNote(noteFor({ operation: 'UPDATE' }))
+    const r = await updatePolicy(harness({ selfPay: n.selfPay, readPolicy: seq(BEFORE) }).d, { ...UPDATE_IN, confirm: true } as never)
+    expect(r.state).toBe('unknown')
+    expect(r.message).toContain('self-paid update')
+  })
+
+  it('on the expiry ledger itself it can still land; one ledger later it cannot, so the note is cleared and the call goes on', async () => {
+    const onIt = withNote(noteFor(), { currentLedger: vi.fn(async () => '1060') })
+    expect((await writePolicy(harness({ selfPay: onIt.selfPay }).d, { ...CREATE_IN, confirm: true } as never)).state).toBe('unknown')
+    const past = withNote(noteFor(), { currentLedger: vi.fn(async () => '1061') })
+    const h = harness({ selfPay: past.selfPay, readPolicy: seq(NOT_FOUND, AFTER_CREATE) })
+    const r = await writePolicy(h.d, { ...CREATE_IN, confirm: true } as never)
+    expect(r.state).toBe('written')
+    expect(past.clearSend).toHaveBeenCalledTimes(2)
+    expect(past.selfPay.execute).toHaveBeenCalledTimes(1)
+  })
+
+  it('a transaction that landed is found by its hash, the note is cleared, and the chain checks decide (a create is then "already exists")', async () => {
+    const n = withNote(noteFor(), { lookupTransaction: vi.fn(async () => ({ status: 'success' as const })) })
+    const h = harness({ selfPay: n.selfPay, readPolicy: seq(AFTER_CREATE) })
+    const r = await writePolicy(h.d, { ...CREATE_IN, confirm: true } as never)
+    expect(r.state).toBe('already_exists')
+    expect(n.clearSend).toHaveBeenCalledTimes(1)
+    expect(n.selfPay.execute).not.toHaveBeenCalled()
+    expect(n.selfPay.lookupTransaction).toHaveBeenCalledWith(MARKER.txHash)
+  })
+
+  it('a transaction that failed on chain settles it too: the note is cleared and the call goes on', async () => {
+    const n = withNote(noteFor(), { lookupTransaction: vi.fn(async () => ({ status: 'failed' as const, errorCode: 151 })) })
+    const h = harness({ selfPay: n.selfPay, readPolicy: seq(NOT_FOUND, AFTER_CREATE) })
+    expect((await writePolicy(h.d, { ...CREATE_IN, confirm: true } as never)).state).toBe('written')
+    expect(n.clearSend).toHaveBeenCalled()
+  })
+
+  it('when neither the lookup nor the ledger can say, it is not settled: nothing is sent', async () => {
+    for (const over of [
+      { lookupTransaction: vi.fn(async () => { throw new Error('down') }), currentLedger: vi.fn(async () => { throw new Error('down') }) },
+      { lookupTransaction: undefined, currentLedger: vi.fn(async () => undefined) },
+      { lookupTransaction: undefined, currentLedger: vi.fn(async () => 'abc') },
+      { lookupTransaction: undefined, currentLedger: vi.fn(async () => '99999 junk') },
+      { lookupTransaction: undefined, currentLedger: vi.fn(async () => '0x7fffffff') },
+      { lookupTransaction: undefined, currentLedger: undefined },
+    ]) {
+      const n = withNote(noteFor(), over as never)
+      const r = await writePolicy(harness({ selfPay: n.selfPay }).d, { ...CREATE_IN, confirm: true } as never)
+      expect(r.state).toBe('unknown')
+      expect(r.message).not.toContain('(the ledger is now')
+      expect(n.selfPay.execute).not.toHaveBeenCalled()
+      expect(n.clearSend).not.toHaveBeenCalled()
+    }
+  })
+
+  it('a note that cannot be read is not read as "no note": nothing is sent', async () => {
+    const n = withNote(null, { pendingSend: vi.fn(async () => { throw new Error('unreadable') }) })
+    const r = await writePolicy(harness({ selfPay: n.selfPay }).d, { ...CREATE_IN, confirm: true } as never)
+    expect(r.state).toBe('unavailable')
+    expect(r.message).toContain('NOTHING WAS SENT')
+    expect(n.selfPay.execute).not.toHaveBeenCalled()
+  })
+
+  it('no note is the ordinary flow, and another key\'s note is not in the way', async () => {
+    const none = withNote(null)
+    expect((await writePolicy(harness({ selfPay: none.selfPay, readPolicy: seq(NOT_FOUND, AFTER_CREATE) }).d, { ...CREATE_IN, confirm: true } as never)).state).toBe('written')
+    const store = chainDeps().markers
+    await store.set(MARKER)
+    const sp = selfPayDeps({ pendingSend: (key) => store.get(OWNER, key), clearSend: (key) => store.remove(OWNER, key), currentLedger: async () => '1010' })
+    const h = harness({ selfPay: sp, readPolicy: seq(NOT_FOUND, AFTER_CREATE) })
+    expect((await writePolicy(h.d, { ...CREATE_IN, policyKey: 'ztp20-v1', confirm: true } as never)).state).toBe('written')
+  })
+
+  it('a dependency that offers no note at all behaves as before', async () => {
+    const h = harness({ readPolicy: seq(NOT_FOUND, AFTER_CREATE) })
+    expect((await writePolicy(h.d, { ...CREATE_IN, confirm: true } as never)).state).toBe('written')
+  })
+
+  it('the lookup, the ledger and the note read are each bounded: one that never answers is cut off, and the note still blocks', async () => {
+    const hang = () => new Promise<never>(() => undefined)
+    const n = withNote(noteFor(), { lookupTransaction: vi.fn(hang) as never, currentLedger: vi.fn(hang) as never })
+    const r = await writePolicy(harness({ selfPay: n.selfPay, readTimeoutMs: 5 }).d, { ...CREATE_IN, confirm: true } as never)
+    expect(r.state).toBe('unknown')
+    expect(n.selfPay.execute).not.toHaveBeenCalled()
+    const stuck = withNote(null, { pendingSend: vi.fn(hang) as never })
+    expect((await writePolicy(harness({ selfPay: stuck.selfPay, readTimeoutMs: 5 }).d, { ...CREATE_IN, confirm: true } as never)).state).toBe('unavailable')
+  })
+})
+
+describe('the note is cleared once the outcome is settled, and kept while it is not', () => {
+  const noteStore = () => chainDeps().markers
+
+  const run = async (result: SelfPayExecResult, over: Partial<WritePolicyDeps> = {}, store = noteStore()) => {
+    const selfPay = selfPayDeps({
+      execute: vi.fn(async () => {
+        await store.set(MARKER)
+        return result
+      }),
+      pendingSend: (key) => store.get(OWNER, key),
+      clearSend: (key) => store.remove(OWNER, key),
+      currentLedger: async () => '1000',
+    })
+    const h = harness({ selfPay, ...over })
+    const r = await writePolicy(h.d, { ...CREATE_IN, confirm: true } as never)
+    return { r, store }
+  }
+  const SUBMITTED: SelfPayExecResult = { kind: 'submitted', txHash: MARKER.txHash, nonce: '41', feeLimit: '1200000', ceilLedgerSeq: '1060' }
+
+  it('landed: cleared', async () => {
+    const { r, store } = await run(SUBMITTED, { readPolicy: seq(NOT_FOUND, AFTER_CREATE) })
+    expect(r.state).toBe('written')
+    expect(await store.get(OWNER, 'native-v1')).toBeNull()
+  })
+
+  it('failed on chain: cleared', async () => {
+    const store2 = noteStore()
+    const selfPay = selfPayDeps({
+      execute: vi.fn(async () => {
+        await store2.set(MARKER)
+        return SUBMITTED
+      }),
+      lookupTransaction: vi.fn(async () => ({ status: 'failed' as const, errorCode: 151 })),
+      clearSend: (key) => store2.remove(OWNER, key),
+      pendingSend: (key) => store2.get(OWNER, key),
+      currentLedger: async () => '1000',
+    })
+    const res = await writePolicy(harness({ selfPay, readPolicy: seq(NOT_FOUND) }).d, { ...CREATE_IN, confirm: true } as never)
+    expect(res.state).toBe('write_failed')
+    expect(await store2.get(OWNER, 'native-v1')).toBeNull()
+  })
+
+  it('not confirmed yet: KEPT, so a later call is held back, and the message says so', async () => {
+    const { r, store } = await run(SUBMITTED, { readPolicy: seq(NOT_FOUND) })
+    expect(r.state).toBe('submitted')
+    expect(await store.get(OWNER, 'native-v1')).toEqual(MARKER)
+  })
+
+  it('an answer that never came: kept', async () => {
+    const { r, store } = await run({ kind: 'unknown', reason: 'socket hang up', nonce: '41', txHash: MARKER.txHash, ceilLedgerSeq: '1060' })
+    expect(r.state).toBe('unknown')
+    expect(await store.get(OWNER, 'native-v1')).toEqual(MARKER)
+  })
+
+  it('end to end: the unsettled send blocks the next call, and once the ledger passes the expiry the next call goes through', async () => {
+    const store = noteStore()
+    let ledger = '1000'
+    const mk = () =>
+      selfPayDeps({
+        execute: vi.fn(async (): Promise<SelfPayExecResult> => {
+          await store.set(MARKER)
+          return { kind: 'unknown', reason: 'socket hang up', nonce: '41', txHash: MARKER.txHash, ceilLedgerSeq: '1060' }
+        }),
+        pendingSend: (key) => store.get(OWNER, key),
+        clearSend: (key) => store.remove(OWNER, key),
+        currentLedger: async () => ledger,
+      })
+    const first = mk()
+    expect((await writePolicy(harness({ selfPay: first }).d, { ...CREATE_IN, confirm: true } as never)).state).toBe('unknown')
+    expect(first.execute).toHaveBeenCalledTimes(1)
+    ledger = '1030'
+    const second = mk()
+    const blocked = await writePolicy(harness({ selfPay: second }).d, { ...CREATE_IN, confirm: true } as never)
+    expect(blocked.message).toContain('NOTHING WAS SENT this time')
+    expect(second.execute).not.toHaveBeenCalled()
+    ledger = '1061'
+    const third = mk()
+    const r = await writePolicy(harness({ selfPay: third, readPolicy: seq(NOT_FOUND) }).d, { ...CREATE_IN, confirm: true } as never)
+    expect(third.execute).toHaveBeenCalledTimes(1)
+    expect(r.state).toBe('unknown')
+  })
+})
+
+describe('the wiring', () => {
+  it('buildPolicyWriteDeps keeps the notes in the state directory, and reads the ledger through the chain seam', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'state-'))
+    const { d: chain } = chainDeps()
+    const { registryAddress: _r, ownerAddress: _o, markers: _m, ...selfPayChain } = chain
+    const deps = buildPolicyWriteDeps({
+      policyWriteUrl: 'https://ms.test/api',
+      network: 'zetrix:testnet',
+      stateDir: dir,
+      ownerAddress: OWNER,
+      hsmPassword: 'p',
+      pay: async () => 'header',
+      gasPreference: 'sponsored',
+      sleep: async () => undefined,
+      policyTemplateAddress: TEMPLATE_CONTRACT,
+      chainQuery: (async () => ({ errorCode: 0, result: { query_rets: [] } })) as never,
+      queryBalance: async (token: string) => ({ token, error: 'query_failed' }),
+      caps: undefined,
+      policyRegistryAddress: REGISTRY,
+      selfPayChain,
+      readVocabulary: async () => ({ available: false, cause: 'unreachable', detail: 'x' }),
+    } as never).policyWriteDeps!
+    expect(deps.selfPay?.pendingSend).toBeDefined()
+    expect(await deps.selfPay!.currentLedger!()).toBe('1000')
+    expect(await deps.selfPay!.pendingSend!('native-v1')).toBeNull()
+    const store = createFsSelfPayMarkerStore(join(dir, 'self-pay-markers', 'zetrix-testnet'))
+    await store.set(MARKER)
+    expect(await deps.selfPay!.pendingSend!('native-v1')).toEqual(MARKER)
+    await deps.selfPay!.clearSend!('native-v1', 'cd'.repeat(32))
+    expect(await store.get(OWNER, 'native-v1')).toEqual(MARKER)
+    await deps.selfPay!.clearSend!('native-v1', MARKER.txHash)
+    expect(await store.get(OWNER, 'native-v1')).toBeNull()
+  })
+})
+
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+// Review round 2: the note fails closed, is removed only by its own transaction, one send at a time per key,
+// and guards the sponsored, collect and remove paths too.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+import { removePolicy } from '../orchestrator/write-policy'
+
+describe('R2-M1: a note that cannot be trusted is never read as "no note"', () => {
+  const dirAndStore = async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'self-pay-r2-'))
+    return { dir, store: createFsSelfPayMarkerStore(dir), file: join(dir, markerFileName(OWNER, 'native-v1')) }
+  }
+
+  it('the store: only a missing file is "no note"; a directory, an empty file, bad JSON and a wrong shape all throw, naming the file', async () => {
+    const { store, file } = await dirAndStore()
+    expect(await store.get(OWNER, 'native-v1')).toBeNull()
+    await mkdir(file)
+    await expect(store.get(OWNER, 'native-v1')).rejects.toThrow(file)
+    await rm(file, { recursive: true })
+    for (const content of ['', 'not json', '[]', '{}', JSON.stringify({ ...MARKER, txHash: 'zz' }), JSON.stringify({ ...MARKER, policyKey: 'other' }), JSON.stringify({ ...MARKER, ownerAddress: 'ZTX3Other' })]) {
+      await writeFile(file, content, 'utf8')
+      await expect(store.get(OWNER, 'native-v1'), JSON.stringify(content)).rejects.toThrow(file)
+    }
+  })
+
+  it('writePolicy on the real store: a directory at the note path and an empty note each end unavailable, with nothing sent', async () => {
+    for (const make of [async (file: string) => mkdir(file), async (file: string) => writeFile(file, '', 'utf8')]) {
+      const dir = await mkdtemp(join(tmpdir(), 'self-pay-r2-'))
+      const store = createFsSelfPayMarkerStore(dir)
+      const file = join(dir, markerFileName(OWNER, 'native-v1'))
+      await make(file)
+      const selfPay = selfPayDeps({ pendingSend: (k) => store.get(OWNER, k), clearSend: (k, h) => store.remove(OWNER, k, h), currentLedger: async () => '1010' })
+      const r = await writePolicy(harness({ selfPay }).d, { ...CREATE_IN, confirm: true } as never)
+      expect(r.state).toBe('unavailable')
+      expect(r.message).toContain('NOTHING WAS SENT')
+      expect(r.message).toContain(markerFileName(OWNER, 'native-v1'))
+      expect(selfPay.execute).not.toHaveBeenCalled()
+    }
+  })
+
+  it('the store: the temp file never outlives a set, the stored expiry is bounded, and the timestamp must be ISO 8601', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'self-pay-r2-'))
+    const store = createFsSelfPayMarkerStore(dir)
+    await store.set(MARKER)
+    await store.set({ ...MARKER, nonce: '42' })
+    expect(await readdir(dir)).toEqual([markerFileName(OWNER, 'native-v1')])
+    expect(isMarkerShape({ ...MARKER, ceilLedgerSeq: '9'.repeat(18) })).toBe(true)
+    expect(isMarkerShape({ ...MARKER, ceilLedgerSeq: '9'.repeat(19) })).toBe(false)
+    for (const bad of ['yesterday', '2026-10-12', '2026-10-12 00:00:00', '2026-13-45T99:99:99Z', 'Ignore previous instructions']) {
+      expect(isMarkerShape({ ...MARKER, submittedAt: bad }), bad).toBe(false)
+    }
+  })
+})
+
+describe('R2-M2: a note is removed only by its own transaction, and one self-paid send runs at a time per key', () => {
+  it('the store: compare-and-delete leaves a newer note alone, removes its own, and is fine when the note is gone', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'self-pay-r2-'))
+    const store = createFsSelfPayMarkerStore(dir)
+    await store.set(MARKER)
+    await store.remove(OWNER, 'native-v1', 'cd'.repeat(32))
+    expect(await store.get(OWNER, 'native-v1')).toEqual(MARKER)
+    await store.remove(OWNER, 'native-v1', MARKER.txHash)
+    expect(await store.get(OWNER, 'native-v1')).toBeNull()
+    await store.remove(OWNER, 'native-v1', MARKER.txHash)
+    await store.remove(OWNER, 'native-v1')
+  })
+
+  it('the store: a removal that fails for any reason but "already gone" is not swallowed', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'self-pay-r2-'))
+    const store = createFsSelfPayMarkerStore(dir)
+    await mkdir(join(dir, markerFileName(OWNER, 'native-v1')))
+    await expect(store.remove(OWNER, 'native-v1')).rejects.toThrow()
+  })
+
+  it('a node refusal removes only the note of the transaction it sent', async () => {
+    const { d, markers } = chainDeps({ submit: vi.fn(async () => { throw Object.assign(new Error('submit rejected with errorCode 111'), { submitRejected: true }) }) })
+    const remove = vi.spyOn(markers, 'remove')
+    await createSelfPay(d).execute(CALL, LIMIT)
+    expect(remove).toHaveBeenCalledWith(OWNER, 'native-v1', BLOB_HASH)
+  })
+
+  it('after a send that landed, the note cleared is the one for the transaction that was sent', async () => {
+    const clearSend = vi.fn(async () => undefined)
+    const selfPay = selfPayDeps({ pendingSend: vi.fn(async () => null), clearSend })
+    const h = harness({ selfPay, readPolicy: seq(NOT_FOUND, AFTER_CREATE) })
+    const r = await writePolicy(h.d, { ...CREATE_IN, confirm: true } as never)
+    expect(r.state).toBe('written')
+    expect(clearSend).toHaveBeenCalledWith('native-v1', 'tx-1')
+  })
+
+  it('the note read is the note cleared: its own hash goes to clearSend', async () => {
+    const clearSend = vi.fn(async () => undefined)
+    const selfPay = selfPayDeps({
+      pendingSend: vi.fn(async () => MARKER),
+      clearSend,
+      currentLedger: vi.fn(async () => '1061'),
+    })
+    const h = harness({ selfPay, readPolicy: seq(NOT_FOUND, AFTER_CREATE) })
+    await writePolicy(h.d, { ...CREATE_IN, confirm: true } as never)
+    expect(clearSend).toHaveBeenCalledWith('native-v1', MARKER.txHash)
+  })
+
+  it('two confirmed calls for one key at once: the second waits, sees the first one\'s note and sends nothing', async () => {
+    let held: SelfPayMarker | null = null
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const pendingSend = vi.fn(async () => held)
+    const execute = vi.fn(async (): Promise<SelfPayExecResult> => {
+      await gate
+      held = { ...MARKER }
+      return { kind: 'unknown', reason: 'socket hang up', nonce: '41', txHash: MARKER.txHash, ceilLedgerSeq: '1060' }
+    })
+    const selfPay = selfPayDeps({ pendingSend, execute, clearSend: vi.fn(async () => undefined), currentLedger: vi.fn(async () => '1010') })
+    const first = writePolicy(harness({ selfPay }).d, { ...CREATE_IN, confirm: true } as never)
+    const second = writePolicy(harness({ selfPay }).d, { ...CREATE_IN, confirm: true } as never)
+    // Let both run as far as they can: the second must be held at the lock, so the note has been read once.
+    for (let i = 0; i < 50; i++) await new Promise((resolve) => setImmediate(resolve))
+    expect(pendingSend).toHaveBeenCalledTimes(1)
+    release()
+    const [a, b] = await Promise.all([first, second])
+    expect(a.state).toBe('unknown')
+    expect(b.state).toBe('unknown')
+    expect(b.message).toContain('NOTHING WAS SENT this time')
+    expect(execute).toHaveBeenCalledTimes(1)
+  })
+
+  it('calls for different keys do not wait for each other', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const execute = vi.fn(async (): Promise<SelfPayExecResult> => {
+      await gate
+      return { kind: 'rejected', reason: 'x' }
+    })
+    const selfPay = selfPayDeps({ pendingSend: vi.fn(async () => null), execute })
+    const a = writePolicy(harness({ selfPay }).d, { ...CREATE_IN, confirm: true } as never)
+    const b = writePolicy(harness({ selfPay }).d, { ...CREATE_IN, policyKey: 'ztp20-v1', confirm: true } as never)
+    for (let i = 0; i < 50; i++) await new Promise((resolve) => setImmediate(resolve))
+    expect(execute).toHaveBeenCalledTimes(2)
+    release()
+    await Promise.all([a, b])
+  })
+})
+
+describe('R2-M3: the note guards the sponsored, collect and remove paths too', () => {
+  const HELD = () => ({
+    selfPay: selfPayDeps({
+      pendingSend: vi.fn(async () => MARKER),
+      clearSend: vi.fn(async () => undefined),
+      currentLedger: vi.fn(async () => '1010'),
+      lookupTransaction: vi.fn(async () => ({ status: 'unknown' as const })),
+    }),
+  })
+  const httpSteps = (steps: Array<{ status: number; body: unknown; headers?: Record<string, string> }>) => {
+    let n = 0
+    return (async () => {
+      const st = steps[Math.min(n++, steps.length - 1)]
+      return { ok: st.status < 300, status: st.status, headers: { get: (k: string) => st.headers?.[k] ?? null }, text: async () => JSON.stringify(st.body) }
+    }) as unknown as HttpSend
+  }
+  const SPONSORED_402 = { status: 402, body: { x402Version: 1, accepts: [{ scheme: 'exact', asset: 'ZTX3JMYR', maxAmountRequired: '50000', extra: { gasModel: 'facilitator', prepareEndpoint: 'https://x/f' } }] } }
+
+  it('a sponsored write is refused before paying while a self-paid send may still land', async () => {
+    const { selfPay } = HELD()
+    const h = harness({ selfPay, client: new PolicyWriteClient('https://x/api', httpSteps([SPONSORED_402])) })
+    const r = await writePolicy(h.d, { ...CREATE_IN, gasPayer: 'sponsored', confirm: true } as never)
+    expect(r.state).toBe('refused')
+    expect(r.paid).toBe(false)
+    expect(r.txHash).toBe(MARKER.txHash)
+    expect(r.message).toContain('NOTHING WAS PAID')
+    expect(r.message).toContain('after ledger 1060')
+    expect(h.pay).not.toHaveBeenCalled()
+  })
+
+  it('an update through the sponsored path is refused the same way', async () => {
+    const { selfPay } = HELD()
+    const h = harness({ selfPay, readPolicy: seq(BEFORE), client: new PolicyWriteClient('https://x/api', httpSteps([SPONSORED_402])) })
+    const r = await updatePolicy(h.d, { ...UPDATE_IN, gasPayer: 'sponsored', confirm: true } as never)
+    expect(r.state).toBe('refused')
+    expect(r.message).toContain('NOTHING WAS PAID')
+    expect(h.pay).not.toHaveBeenCalled()
+  })
+
+  it('a quote or dry run is not held: only a call that is about to spend is', async () => {
+    const { selfPay } = HELD()
+    const h = harness({ selfPay, client: new PolicyWriteClient('https://x/api', httpSteps([SPONSORED_402])) })
+    const r = await writePolicy(h.d, { ...CREATE_IN, gasPayer: 'sponsored', dryRun: true } as never)
+    expect(r.state).toBe('quoted')
+  })
+
+  it('a note that cannot be read stops a sponsored write too (unavailable, nothing paid)', async () => {
+    const selfPay = selfPayDeps({ pendingSend: vi.fn(async () => { throw new Error('the note of an earlier self-paid send (x.json) cannot be trusted: it is empty') }) })
+    const h = harness({ selfPay, client: new PolicyWriteClient('https://x/api', httpSteps([SPONSORED_402])) })
+    const r = await writePolicy(h.d, { ...CREATE_IN, gasPayer: 'sponsored', confirm: true } as never)
+    expect(r.state).toBe('unavailable')
+    expect(r.message).toContain('x.json')
+    expect(r.message).toContain('NOTHING WAS PAID')
+    expect(h.pay).not.toHaveBeenCalled()
+  })
+
+  it('a note that has settled does not hold a sponsored write, and its own note is cleared', async () => {
+    const clearSend = vi.fn(async () => undefined)
+    const selfPay = selfPayDeps({ pendingSend: vi.fn(async () => MARKER), clearSend, currentLedger: vi.fn(async () => '1061') })
+    const steps = [
+      SPONSORED_402,
+      { status: 202, body: { state: 'PAID_PENDING', receipt: 'blob-1' }, headers: { 'X-PAYMENT-RECEIPT': 'blob-1' } },
+      { status: 200, body: { state: 'WRITTEN', policyKey: 'native-v1', txHash: 'tx-1' } },
+    ]
+    const h = harness({ selfPay, readPolicy: seq(NOT_FOUND), client: new PolicyWriteClient('https://x/api', httpSteps(steps)) })
+    const r = await writePolicy(h.d, { ...CREATE_IN, gasPayer: 'sponsored', confirm: true } as never)
+    expect(r.state).toBe('written')
+    expect(clearSend).toHaveBeenCalledWith('native-v1', MARKER.txHash)
+  })
+
+  it('collecting an already-paid write is refused while a self-paid send may still land, and the payment is not lost', async () => {
+    const { selfPay } = HELD()
+    const h = harness({
+      selfPay,
+      client: new PolicyWriteClient('https://x/api', httpSteps([{ status: 409, body: { state: 'ALREADY_IN_FLIGHT', receipt: 'blob-old', detail: 'already paid' } }])),
+    })
+    const r = await writePolicy(h.d, { ...CREATE_IN, gasPayer: 'sponsored', confirm: true } as never)
+    expect(r.state).toBe('refused')
+    expect(r.paid).toBe(true)
+    expect(r.paymentReceipt).toBe('blob-old')
+    expect(r.message).toContain('NOTHING WAS COLLECTED')
+    expect(r.message).toContain('do not pay again')
+  })
+
+  it('remove_policy is refused while a self-paid send may still land, and sends nothing', async () => {
+    const { selfPay } = HELD()
+    const h = harness({ selfPay })
+    const r = await removePolicy(h.d, { policyKey: 'native-v1', confirm: true } as never)
+    expect(r.state).toBe('refused')
+    expect(r.message).toContain('NOTHING WAS REMOVED')
+    expect(r.message).toContain('after ledger 1060')
+    expect(h.calls).toEqual([])
+  })
+
+  it('remove_policy without a note goes on as before', async () => {
+    const selfPay = selfPayDeps({ pendingSend: vi.fn(async () => null) })
+    const h = harness({ selfPay })
+    const r = await removePolicy(h.d, { policyKey: 'native-v1', confirm: true } as never)
+    expect(r.state).not.toBe('refused')
+    expect(h.calls.length).toBeGreaterThan(0)
+  })
+})
+
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+// Review round 3: every path that spends or removes holds the same per-key lock as a self-paid send.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+import { checkPolicyWrite } from '../orchestrator/write-policy'
+
+describe('R3-M1: a sponsored write, a collect and a removal wait for a self-paid send that is still signing', () => {
+  const httpSteps = (steps: Array<{ status: number; body: unknown }>) => {
+    let n = 0
+    return (async () => {
+      const st = steps[Math.min(n++, steps.length - 1)]
+      return { ok: st.status < 300, status: st.status, headers: { get: () => null }, text: async () => JSON.stringify(st.body) }
+    }) as unknown as HttpSend
+  }
+  const SPONSORED_402 = { status: 402, body: { x402Version: 1, accepts: [{ scheme: 'exact', asset: 'ZTX3JMYR', maxAmountRequired: '50000', extra: { gasModel: 'facilitator', prepareEndpoint: 'https://x/f' } }] } }
+  const turns = async () => {
+    for (let i = 0; i < 50; i++) await new Promise((resolve) => setImmediate(resolve))
+  }
+  /** A self-paid send that is signing (no note yet); releasing it leaves its note, as a send whose answer never came does. */
+  const signing = () => {
+    let held: SelfPayMarker | null = null
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const pendingSend = vi.fn(async () => held)
+    const execute = vi.fn(async (): Promise<SelfPayExecResult> => {
+      await gate
+      held = { ...MARKER }
+      return { kind: 'unknown', reason: 'socket hang up', nonce: '41', txHash: MARKER.txHash, ceilLedgerSeq: '1060' }
+    })
+    const selfPay = selfPayDeps({ pendingSend, execute, clearSend: vi.fn(async () => undefined), currentLedger: vi.fn(async () => '1010'), lookupTransaction: vi.fn(async () => ({ status: 'unknown' as const })) })
+    /** Resolves once the send is inside execute: the lock is held and the note not yet written. */
+    const entered = async () => {
+      for (let i = 0; i < 500 && execute.mock.calls.length === 0; i++) await new Promise((resolve) => setImmediate(resolve))
+      expect(execute).toHaveBeenCalledTimes(1)
+    }
+    return { selfPay, release: () => release(), pendingSend, entered }
+  }
+
+  it('a sponsored write does not read the note until the self-paid send is done, and then pays nothing', async () => {
+    const s = signing()
+    const self = writePolicy(harness({ selfPay: s.selfPay }).d, { ...CREATE_IN, confirm: true } as never)
+    await s.entered()
+    const hs = harness({ selfPay: s.selfPay, client: new PolicyWriteClient('https://x/api', httpSteps([SPONSORED_402])) })
+    const sponsored = writePolicy(hs.d, { ...CREATE_IN, gasPayer: 'sponsored', confirm: true } as never)
+    await turns()
+    expect(hs.pay).not.toHaveBeenCalled()
+    expect(s.pendingSend).toHaveBeenCalledTimes(1)
+    s.release()
+    const [a, b] = await Promise.all([self, sponsored])
+    expect(a.state).toBe('unknown')
+    expect(b.state).toBe('refused')
+    expect(b.message).toContain('NOTHING WAS PAID')
+    expect(hs.pay).not.toHaveBeenCalled()
+  })
+
+  it('a removal waits the same way, and removes nothing', async () => {
+    const s = signing()
+    const self = writePolicy(harness({ selfPay: s.selfPay }).d, { ...CREATE_IN, confirm: true } as never)
+    await s.entered()
+    const hr = harness({ selfPay: s.selfPay })
+    const removal = removePolicy(hr.d, { policyKey: 'native-v1', confirm: true } as never)
+    await turns()
+    expect(hr.calls).toEqual([])
+    s.release()
+    const [, r] = await Promise.all([self, removal])
+    expect(r.state).toBe('refused')
+    expect(r.message).toContain('NOTHING WAS REMOVED')
+    expect(hr.calls).toEqual([])
+  })
+
+  it('a removal for another key does not wait', async () => {
+    const s = signing()
+    const self = writePolicy(harness({ selfPay: s.selfPay }).d, { ...CREATE_IN, confirm: true } as never)
+    await s.entered()
+    const hr = harness({ selfPay: selfPayDeps({ pendingSend: vi.fn(async () => null) }) })
+    const removal = removePolicy(hr.d, { policyKey: 'ztp20-v1', confirm: true } as never)
+    await turns()
+    expect(hr.calls.length).toBeGreaterThan(0)
+    s.release()
+    await Promise.all([self, removal])
+  })
+
+  it('a collect through check_policy_write is held too: nothing is collected and the payment is not lost', async () => {
+    const h = harness({ selfPay: HELD_SELF_PAY() })
+    await h.d.receipts.set({ blobId: 'blob-old', policyKey: 'native-v1', ownerAddress: OWNER, paidAt: '2026-10-12T00:00:00.000Z', operation: 'CREATE' } as never)
+    const r = await checkPolicyWrite(h.d, { paymentReceipt: 'blob-old' } as never)
+    expect(r.state).toBe('refused')
+    expect(r.paid).toBe(true)
+    expect(r.paymentReceipt).toBe('blob-old')
+    expect(r.message).toContain('NOTHING WAS COLLECTED')
+    expect(h.calls).toEqual([])
+  })
+
+  it('collecting an already-paid write waits for a signing self-paid send, then is refused with the payment kept', async () => {
+    const s = signing()
+    const self = writePolicy(harness({ selfPay: s.selfPay }).d, { ...CREATE_IN, confirm: true } as never)
+    await s.entered()
+    const hc = harness({
+      selfPay: s.selfPay,
+      client: new PolicyWriteClient('https://x/api', httpSteps([{ status: 409, body: { state: 'ALREADY_IN_FLIGHT', receipt: 'blob-old', detail: 'already paid' } }])),
+    })
+    const collect = writePolicy(hc.d, { ...CREATE_IN, gasPayer: 'sponsored', confirm: true } as never)
+    await turns()
+    expect(s.pendingSend).toHaveBeenCalledTimes(1)
+    s.release()
+    const [, c] = await Promise.all([self, collect])
+    expect(c.state).toBe('refused')
+    expect(c.paid).toBe(true)
+    expect(c.message).toContain('NOTHING WAS COLLECTED')
+  })
+
+  it('check_policy_write waits for a signing self-paid send, then is refused with the payment kept', async () => {
+    const s = signing()
+    const self = writePolicy(harness({ selfPay: s.selfPay }).d, { ...CREATE_IN, confirm: true } as never)
+    await s.entered()
+    const hk = harness({ selfPay: s.selfPay })
+    await hk.d.receipts.set({ blobId: 'blob-old', policyKey: 'native-v1', ownerAddress: OWNER, paidAt: '2026-10-12T00:00:00.000Z', operation: 'CREATE' } as never)
+    const check = checkPolicyWrite(hk.d, { paymentReceipt: 'blob-old' } as never)
+    await turns()
+    expect(s.pendingSend).toHaveBeenCalledTimes(1)
+    s.release()
+    const [, c] = await Promise.all([self, check])
+    expect(c.state).toBe('refused')
+    expect(c.message).toContain('NOTHING WAS COLLECTED')
+    expect(hk.calls).toEqual([])
+  })
+
+  it('a write the chain already shows needs no collect, so a note does not hold check_policy_write back', async () => {
+    const h = harness({ selfPay: HELD_SELF_PAY(), readPolicy: seq(AFTER_CREATE) })
+    await h.d.receipts.set({
+      blobId: 'blob-old',
+      policyKey: 'native-v1',
+      ownerAddress: OWNER,
+      paidAt: '2026-10-12T00:00:00.000Z',
+      operation: 'CREATE',
+      verify: { attributes: [{ attributeName: 'cumulativeMax', value: '500000000' }] },
+    } as never)
+    const r = await checkPolicyWrite(h.d, { paymentReceipt: 'blob-old' } as never)
+    expect(r.state).toBe('written')
+    expect(h.calls).toEqual([])
+  })
+
+  it('a removal that was only asked about (no confirm) does not wait for a signing self-paid send', async () => {
+    const s = signing()
+    const self = writePolicy(harness({ selfPay: s.selfPay }).d, { ...CREATE_IN, confirm: true } as never)
+    await s.entered()
+    const r = await removePolicy(harness({ selfPay: s.selfPay }).d, { policyKey: 'native-v1' } as never)
+    // It answered at once (this harness holds no policy to describe); a held call would still be waiting.
+    expect(r.state).toBe('not_found')
+    s.release()
+    await self
+  })
+
+  it('R4-M1: a call that cannot get the key in time does nothing, and still does nothing after the holder finishes', async () => {
+    const s = signing()
+    const self = writePolicy(harness({ selfPay: s.selfPay }).d, { ...CREATE_IN, confirm: true } as never)
+    await s.entered()
+    const wait = { selfPay: s.selfPay, lockWaitMs: 20 }
+    const hs = harness({ ...wait, client: new PolicyWriteClient('https://x/api', httpSteps([SPONSORED_402])) })
+    const hr = harness(wait)
+    const hc = harness({ ...wait, client: new PolicyWriteClient('https://x/api', httpSteps([{ status: 409, body: { state: 'ALREADY_IN_FLIGHT', receipt: 'blob-old', detail: 'already paid' } }])) })
+    const hk = harness(wait)
+    await hk.d.receipts.set({ blobId: 'blob-old', policyKey: 'native-v1', ownerAddress: OWNER, paidAt: '2026-10-12T00:00:00.000Z', operation: 'CREATE' } as never)
+    const hn = harness(wait)
+    const [sponsored, removal, collect, check, second] = await Promise.all([
+      writePolicy(hs.d, { ...CREATE_IN, gasPayer: 'sponsored', confirm: true } as never),
+      removePolicy(hr.d, { policyKey: 'native-v1', confirm: true } as never),
+      writePolicy(hc.d, { ...CREATE_IN, gasPayer: 'sponsored', confirm: true } as never),
+      checkPolicyWrite(hk.d, { paymentReceipt: 'blob-old' } as never),
+      writePolicy(hn.d, { ...CREATE_IN, confirm: true } as never),
+    ])
+    for (const [r, nothing] of [[sponsored, 'PAID'], [removal, 'REMOVED'], [collect, 'COLLECTED'], [check, 'COLLECTED'], [second, 'SENT']] as const) {
+      expect(r.state, nothing).toBe('refused')
+      expect(r.message, nothing).toContain('in progress in this wallet')
+      expect(r.message, nothing).toContain('NOTHING WAS ' + nothing)
+    }
+    expect(collect.paid).toBe(true)
+    expect(check.paid).toBe(true)
+    // The holder finishes; the calls that gave up must not wake up and act.
+    s.release()
+    await self
+    await turns()
+    expect(hs.pay).not.toHaveBeenCalled()
+    expect(hc.pay).not.toHaveBeenCalled()
+    expect(hr.calls).toEqual([])
+    expect(hk.calls).toEqual([])
+    expect(s.selfPay.execute).toHaveBeenCalledTimes(1)
+    expect(s.pendingSend).toHaveBeenCalledTimes(1)
+  })
+
+  it('R4-M1: a call that gave up keeps its place, so the one behind it still waits for the holder', async () => {
+    const s = signing()
+    const self = writePolicy(harness({ selfPay: s.selfPay }).d, { ...CREATE_IN, confirm: true } as never)
+    await s.entered()
+    const gaveUp = writePolicy(harness({ selfPay: s.selfPay, lockWaitMs: 20 }).d, { ...CREATE_IN, confirm: true } as never)
+    const patient = writePolicy(harness({ selfPay: s.selfPay, lockWaitMs: 5000 }).d, { ...CREATE_IN, confirm: true } as never)
+    expect((await gaveUp).state).toBe('refused')
+    await turns()
+    expect(s.pendingSend).toHaveBeenCalledTimes(1)
+    s.release()
+    const [, p] = await Promise.all([self, patient])
+    expect(p.state).toBe('unknown')
+    expect(p.message).toContain('NOTHING WAS SENT this time')
+    expect(s.selfPay.execute).toHaveBeenCalledTimes(1)
+  })
+
+  it('R4-L4: asking the user to choose who pays never waits for the key', async () => {
+    const s = signing()
+    const self = writePolicy(harness({ selfPay: s.selfPay }).d, { ...CREATE_IN, confirm: true } as never)
+    await s.entered()
+    const h = harness({ selfPay: s.selfPay, client: new PolicyWriteClient('https://x/api', httpSteps([SPONSORED_402])) })
+    const { gasPayer: _g, ...noChoice } = CREATE_IN
+    const r = await writePolicy(h.d, { ...noChoice, confirm: true } as never)
+    expect(r.state).toBe('needs_choice')
+    s.release()
+    await self
+  })
+
+  it('every request to the policy write service carries a timeout, so a hung one cannot hold a key', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'state-'))
+    const { d: chain } = chainDeps()
+    const { registryAddress: _r, ownerAddress: _o, markers: _m, ...selfPayChain } = chain
+    const fetchSpy = vi.fn(async () => ({ ok: false, status: 500, headers: { get: () => null }, text: async () => '' }))
+    vi.stubGlobal('fetch', fetchSpy)
+    try {
+      const deps = buildPolicyWriteDeps({
+        policyWriteUrl: 'https://ms.test/api',
+        network: 'zetrix:testnet',
+        stateDir: dir,
+        ownerAddress: OWNER,
+        hsmPassword: 'p',
+        pay: async () => 'header',
+        gasPreference: 'sponsored',
+        sleep: async () => undefined,
+        policyTemplateAddress: TEMPLATE_CONTRACT,
+        chainQuery: (async () => ({ errorCode: 0, result: { query_rets: [] } })) as never,
+        queryBalance: async (token: string) => ({ token, error: 'query_failed' }),
+        caps: undefined,
+        policyRegistryAddress: REGISTRY,
+        selfPayChain,
+        readVocabulary: async () => ({ available: false, cause: 'unreachable', detail: 'x' }),
+      } as never).policyWriteDeps!
+      await deps.client!.remove(OWNER, 'native-v1', 'p')
+      expect(fetchSpy).toHaveBeenCalled()
+      const init = (fetchSpy.mock.calls[0] as unknown as [string, { signal?: unknown }])[1]
+      expect(init.signal).toBeInstanceOf(AbortSignal)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('R4-L1: a quote or a dry run only looks at an expired note, it does not clear it', async () => {
+    const clearSend = vi.fn(async () => undefined)
+    const selfPay = selfPayDeps({ pendingSend: vi.fn(async () => MARKER), clearSend, currentLedger: vi.fn(async () => '1061') })
+    const { maxGasRaw: _m, ...quoteOnly } = CREATE_IN
+    const q = await writePolicy(harness({ selfPay }).d, { ...quoteOnly, gasPayer: 'self' } as never)
+    expect(q.state).toBe('quoted')
+    const dry = await writePolicy(harness({ selfPay }).d, { ...CREATE_IN, dryRun: true } as never)
+    expect(dry.state).toBe('quoted')
+    expect(clearSend).not.toHaveBeenCalled()
+  })
+
+  it('R4-L2: a note whose write failed after the file was in place is removed again, since nothing was sent', async () => {
+    const { d, markers } = chainDeps()
+    const set = markers.set.bind(markers)
+    markers.set = async (m) => {
+      await set(m)
+      throw new Error('directory fsync failed')
+    }
+    const r = await createSelfPay(d).execute(CALL, LIMIT)
+    expect(r).toMatchObject({ kind: 'rejected', reason: expect.stringContaining('nothing was sent') })
+    expect(d.submit).not.toHaveBeenCalled()
+    expect(markers.map.size).toBe(0)
+  })
+
+  it('the lock is released when the first call throws: the next call is not stuck behind it', async () => {
+    const execute = vi.fn(async (): Promise<SelfPayExecResult> => {
+      throw new Error('signer exploded')
+    })
+    const selfPay = selfPayDeps({ pendingSend: vi.fn(async () => null), execute })
+    await writePolicy(harness({ selfPay }).d, { ...CREATE_IN, confirm: true } as never).catch(() => undefined)
+    await writePolicy(harness({ selfPay }).d, { ...CREATE_IN, confirm: true } as never).catch(() => undefined)
+    expect(execute).toHaveBeenCalledTimes(2)
+  })
+
+  it('on the real filesystem a damaged note stops a sponsored write and a removal, naming the file and saying how long to wait', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'self-pay-r3-'))
+    const store = createFsSelfPayMarkerStore(dir)
+    await writeFile(join(dir, markerFileName(OWNER, 'native-v1')), '', 'utf8')
+    const selfPay = selfPayDeps({ pendingSend: (k) => store.get(OWNER, k), clearSend: (k, h) => store.remove(OWNER, k, h) })
+    const hs = harness({ selfPay, client: new PolicyWriteClient('https://x/api', httpSteps([SPONSORED_402])) })
+    const sponsored = await writePolicy(hs.d, { ...CREATE_IN, gasPayer: 'sponsored', confirm: true } as never)
+    expect(sponsored.state).toBe('unavailable')
+    expect(sponsored.message).toContain(markerFileName(OWNER, 'native-v1'))
+    expect(sponsored.message).toContain('60 ledgers')
+    expect(hs.pay).not.toHaveBeenCalled()
+    const hr = harness({ selfPay })
+    const removal = await removePolicy(hr.d, { policyKey: 'native-v1', confirm: true } as never)
+    expect(removal.state).toBe('unavailable')
+    expect(removal.message).toContain(markerFileName(OWNER, 'native-v1'))
+    expect(hr.calls).toEqual([])
+  })
+
+  it('a timestamp that is not a real calendar date is not a valid note', () => {
+    expect(isMarkerShape({ ...MARKER, submittedAt: '2026-02-30T00:00:00Z' })).toBe(false)
+    expect(isMarkerShape({ ...MARKER, submittedAt: '2026-02-28T00:00:00Z' })).toBe(true)
+  })
+})
+
+function HELD_SELF_PAY() {
+  return selfPayDeps({
+    pendingSend: vi.fn(async () => MARKER),
+    clearSend: vi.fn(async () => undefined),
+    currentLedger: vi.fn(async () => '1010'),
+    lookupTransaction: vi.fn(async () => ({ status: 'unknown' as const })),
+  })
+}
