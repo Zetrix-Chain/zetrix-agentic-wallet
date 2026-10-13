@@ -16,6 +16,7 @@
  * duplicate charge into one the wallet had promised would not happen.
  */
 
+import { aiBirthcertChoice, type AiBirthcertKind } from './birthcert-choice.js'
 import { describePaymentCap, describePolicyGovernedCap, type PaymentCapDescription } from '../payment-guard.js'
 import type { TokenBalanceResult } from '../clients/token-balance-client.js'
 
@@ -74,6 +75,11 @@ export interface PreflightResult {
   blockers: string[]
   /** What preflight could not verify, so a clean result is not mistaken for a guarantee. */
   notChecked: string[]
+  /**
+   * Present on every AI Birthcert result (either kind): what the agent must do when the user did not say Basic or
+   * Verified. Guidance only; nothing priced or reported ready depends on it.
+   */
+  choice?: string
 }
 
 export interface PreflightInput {
@@ -94,6 +100,8 @@ export interface PreflightInput {
 }
 
 export interface PreflightDeps {
+  /** True when `credential` names the Basic AI Birthcert (by name or template id). Optional: absent, only the Verified one is recognised. */
+  isBasicAiBirthcert?: (credential: string) => boolean
   /** Whether the wallet already holds a valid copy of the credential, answered locally. Optional: absent, nothing is checked. */
   findHeld?: (credential: string) => Promise<HeldCredential | undefined>
   /** `requestAiBirthcertVerification` with `dryRun`, returning `{ quote }` or `{ error }`. */
@@ -119,6 +127,8 @@ export async function credentialPreflight(deps: PreflightDeps, input: PreflightI
   const blockers: string[] = []
   const notChecked: string[] = []
   const isVerified = input.credential === VERIFIED_AI_BIRTHCERT
+  const kind: AiBirthcertKind | undefined = isVerified ? 'verified' : deps.isBasicAiBirthcert?.(input.credential) ? 'basic' : undefined
+  const choice = kind ? { choice: aiBirthcertChoice(kind) } : {}
 
   // FIRST, and free: if the wallet already holds this credential, nothing below matters. The paid call has its own guard
   // against replacing a valid credential, but by then the agent has already walked the user through choosing a name.
@@ -142,6 +152,7 @@ export async function credentialPreflight(deps: PreflightDeps, input: PreflightI
                 `replacement, run this check again with replacing: true.`,
             ],
             notChecked: [],
+            ...choice,
           }
         }
       } else {
@@ -178,6 +189,7 @@ export async function credentialPreflight(deps: PreflightDeps, input: PreflightI
       ...(schema ? { schema } : {}),
       blockers: [`Could not price this credential: ${why}`],
       notChecked: [...notChecked, ...uncheckable(isVerified)],
+      ...choice,
     }
   }
 
@@ -262,6 +274,7 @@ export async function credentialPreflight(deps: PreflightDeps, input: PreflightI
     ...(schema ? { schema } : {}),
     blockers,
     notChecked: [...notChecked, ...gasNotes, ...uncheckable(isVerified, isFree)],
+    ...choice,
   }
 }
 
@@ -315,7 +328,7 @@ function uncheckable(isVerified: boolean, isFree = false): string[] {
   // charge — but this is exactly the kind of caveat `notChecked` exists to carry.
   if (isFree) {
     items.unshift(
-      'Whether issuance is still free at apply time — `paymentRequired` is a service-wide MBI setting and can change between this quote and issuance.',
+      'Whether issuance is still free at apply time — whether the service charges is a service-wide setting and can change between this quote and issuance.',
     )
   }
   return items

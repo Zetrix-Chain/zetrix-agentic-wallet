@@ -168,6 +168,12 @@ tell you so rather than retrying.
 > manages its own entry in that file and will either overwrite your edit or stop managing the entry
 > altogether. Neither is obvious when it happens.
 
+## Getting an AI Birthcert
+
+There are two kinds. **Basic** is self-declared by the agent, with no check of the owner's identity: it is quick and shows only the agent's username. **Verified** confirms the owner's identity through MyDigital ID: the fee is paid up front, the owner completes a check in the MyID app, and the agent name must be unique (it is only checked after payment, so a name that turns out to be taken is refused late).
+
+If you ask for an AI Birthcert without saying which, the agent first checks what the wallet already holds, explains the difference, and asks which you prefer; it offers only the kind you do not already have. If you want both, it issues them one after the other, Basic first. If you give it a name, it uses that name as you gave it and does not ask for it again (if it suggests a tidier form it waits for your yes first). Where the Verified kind is not configured (today that is mainnet, and this plugin has no setting for it), the agent says so and offers only Basic.
+
 ## Verifying the agent in the MyID app
 
 Ask the agent to verify itself and it can give you a link and a QR code that open its credential in the MyID

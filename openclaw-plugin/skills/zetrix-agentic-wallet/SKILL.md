@@ -83,6 +83,24 @@ imply a name has been reserved or verified.
 If `ready` is false, `blockers` lists **every** reason at once. Give the user all of them together;
 fixing one at a time is exactly the trap this replaces.
 
+## Which AI Birthcert (Basic or Verified)
+
+A request for an AI Birthcert that does not say which kind ("get me an AI birth VC", "an AI Birthcert") is **not** a request for either one. Do not pick. The wallet does not read the request: you choose by the tool and credential you name first, so you must ask.
+
+1. **Check what the wallet already holds — free.** Run `credential_preflight` for `AI Birthcert` (the Basic one) and for `verified_ai_birthcert` (the Verified one). `alreadyHeld` says what it has and until when. Holding one kind never blocks the other.
+2. **Explain the difference in plain words, then ask which they prefer.**
+   - **Basic:** self-declared by the agent, with no check of the owner's identity. It is quick, shows only the agent's username, and does not mean the owner was verified.
+   - **Verified:** the owner's identity is confirmed through MyDigital ID. The fee is paid up front, the owner completes a check in the MyID app, and the agent name must be unique. The name is only checked after payment, so a name that turns out to be taken is refused late, and whether the fee was spent cannot be confirmed.
+3. **Offer only what they do not hold.** If they hold Basic, offer Verified, or keeping what they have. If they hold Verified, offer Basic as an extra (it does not replace the Verified one). If they hold both, say so and issue nothing unless they ask for a replacement. A replacement is its own explicit choice (`replacing: true`, `confirmReplaceExistingVc`), never inferred; it replaces the wallet's saved copy, and the old one stays valid unless it is revoked.
+4. **If they want both, issue them one after the other, Basic first.** Finish the first, show the credential, and only then start the second. Never start both at once. Each has its own price and needs its own yes: "both" is not a yes to either payment. Never assume Basic is free; read its price from its own check.
+5. **A request that names the kind skips the question** ("verified", "basic", MyDigital ID, owner verification). Where the Verified check is **not configured** (on mainnet, by default), its preflight says so: tell the user, and offer the Basic one only.
+
+**When more than one credential is held and one must be presented:** `create_verification_qr` prefers the Verified one, then the Basic one, and says which it used. `prove_identity` does not choose: pass `vc`, using the one the request or the verifier's challenge names, and if it names none, prefer the Verified one over the Basic one and say which you presented.
+
+## Asking for a name
+
+For any name or identifier a credential needs (`agentUsername`, `agentName`), ask the user and never invent one. When they answer — even with a short phrase, even one that repeats words from your question — that IS the name: use it as given and do not ask for it again, unless it was refused (for example already in use). Tidying it (spaces or capitals, say) is optional and never needed; if you do want to suggest a tidier form, ask and WAIT for their answer, and use the tidied form only after a yes. Never go ahead on a name, or on a payment, that the user has not agreed to. Any example you give is only an example of the format, not a suggestion to use.
+
 ## Before spending
 
 All three paid tools (`pay_and_fetch`, `subscribe_and_issue`, `request_ai_birthcert_verification`)
@@ -95,8 +113,7 @@ spend from the user's wallet. Every time:
    it tells you which attributes are required. Paying before checking risks paying for an issuance
    that then fails.
 5. For `request_ai_birthcert_verification`, get `agentName` from the user directly — never invent it
-   — and tell them it must be unique. Payment happens at session creation, before myid checks the
-   name; a duplicate name still gets charged and only fails afterwards, at issuance. Calling this
+   — and tell them it must be unique. Payment happens at session creation, and myid checks the name only afterwards, at issuance; a duplicate name is refused then, and whether the fee was spent cannot be confirmed, so never tell the user they were or were not charged for it. Calling this
    tool again with the SAME name while a session is still pending does not pay again — it returns
    that same session.
 6. Before it pays, `request_ai_birthcert_verification` checks whether this holder already has a

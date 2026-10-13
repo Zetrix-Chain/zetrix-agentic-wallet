@@ -289,10 +289,10 @@ describe('SKILL.md', () => {
     const mentioned = [...skill.matchAll(/`([a-z_]{4,})`/g)].map((m) => m[1])
     const toolish = mentioned.filter((n) => n.includes('_') && !n.startsWith('mcp__'))
     const unknown = toolish.filter(
-      // Result/error codes and commands the skill legitimately names, which are not tools.
+      // Result/error codes, commands and credential identifiers the skill legitimately names, which are not tools.
       (n) =>
         !walletToolNames.includes(n) &&
-        !['not_activated', 'resource_payment', 'export_credentials', 'query_failed', 'unknown_token', 'needs_choice', 'write_failed'].includes(n),
+        !['not_activated', 'resource_payment', 'export_credentials', 'query_failed', 'unknown_token', 'needs_choice', 'write_failed', 'verified_ai_birthcert'].includes(n),
     )
     expect(unknown).toEqual([])
   })

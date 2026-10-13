@@ -10,6 +10,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.2] — 13 October 2026
+
+### Changed
+
+- **An AI Birthcert request that does not say Basic or Verified is put to the user.** "Get me AI Birth VC" was answered with the Basic credential in one chat and the Verified one in another: the wallet does not read the request, the agent chooses by the tool and credential it names first, and nothing told it which or asked the user. Every AI Birthcert `credential_preflight` result now carries a `choice` note, and the tool text and the plugin skill say the same: check what the wallet already holds, explain the two kinds in plain words, offer only what it does not hold, ask which the user prefers, and, if they want both, issue them one after the other, Basic first. The older sentence in `request_ai_birthcert_verification` that said the user "most likely wants" the Basic one, and to use `subscribe_and_issue`, is replaced by the same rule: if the request does not say which kind, do not start it, check both and ask. Each kind has its own price and needs its own yes, so "both" is not a yes to either payment. Where the Verified kind is not configured (mainnet, by default), the note says to offer Basic only. `prove_identity` now says what to do when several credentials are held: pass one, prefer the Verified one when the request names none, and say which was presented.
+
+- **The Basic AI Birthcert's testnet pass design was updated.** The Basic AI Birthcert is now issued on testnet with the new pass-design image id, so the card image that comes back with the credential is the current one. Mainnet and other templates are unchanged.
+
+### Fixed
+
+- **The agent no longer asks again for a name the user has already given.** Asked for `agentUsername`, a user answered "QA Basic VC" twice and the agent kept asking, because the rule "never invent a name" said nothing about a short answer that repeats the question. An answer is now the name: the agent uses it as given and does not ask for it again (unless it was refused), tidying it is optional and the agent waits for a yes before using a tidied form, it never goes ahead on a name or a payment the user has not agreed to, and it treats any example it gives as only an example of the format.
+- **The agent no longer shows the raw `paymentRequired` field name to the user.** QA saw "issuance is currently free (paymentRequired: false)": the wallet's own agent-facing text used the raw MBI field name as vocabulary, and a preflight `notChecked` item that the agent is told to relay contained it. `notChecked` no longer names the field, and the preflight and dry-run descriptions tell the agent to say free or chargeable in plain words and never to quote JSON field names.
+
 ## [0.14.1] — 12 October 2026
 
 ### Fixed

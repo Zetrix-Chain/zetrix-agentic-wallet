@@ -61,7 +61,7 @@ const TEMPLATE_ALIASES: TemplateAliasEntry[] = [
     deriveAttributes: { id: 'agentUsername' },
     validateAttributes: { dob: validateDob, countryOfOrigin: validateCountryOfOrigin },
     passDesignId: {
-      testnet: 'did:zid:992e1e18985ba36a09ba0fbfeb601ddeb449f5e4e882ed69d0d620085f399818',
+      testnet: 'did:zid:bb7202482ef6053be6d46ad8e2190b0ba1e3b2024d24ce7f37bc4c3747e2378f',
       mainnet: 'did:zid:915955cb71c6fd2a256d04344f57381084903cb6a85a1c9ddb71c746f08932ab',
     },
   },

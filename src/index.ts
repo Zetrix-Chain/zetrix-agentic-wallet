@@ -100,12 +100,14 @@ export function buildToolList() {
     },
     {
       name: 'prove_identity',
-      description: 'Answer an x401 PROOF-REQUEST and return the PROOF-RESPONSE header to replay to the resource server.',
+      description:
+        'Answer an x401 PROOF-REQUEST and return the PROOF-RESPONSE header to replay to the resource server. ' +
+        'If the wallet holds several credentials, pass vc: use the one the request or the verifier\'s challenge names, and if it names none, prefer the Verified AI Birthcert over the Basic one and say which one you presented.',
       inputSchema: {
         type: 'object',
         properties: {
           proofRequest: { type: 'string', description: 'The PROOF-REQUEST header value from the 401 challenge.' },
-          vc: { type: 'object', description: 'The VerifiableCredential to present. Omit to use the wallet\'s single locally-cached credential, if there is exactly one — the call fails with a clear error if none or several are cached.' },
+          vc: { type: 'object', description: 'The VerifiableCredential to present. Omit to use the wallet\'s single locally-cached credential, if there is exactly one — the call fails with a clear error if none or several are cached, so with several, pass it.' },
           revealAttribute: { type: 'array', items: { type: 'string' }, description: 'Dotted disclosure paths to reveal. Omit to reveal exactly the claims the challenge (DCQL) requests; a challenge naming no claims reveals all.' },
           issuerKeys: {
             type: 'object',
@@ -872,7 +874,7 @@ export function buildToolList() {
         'For the AI Birthcert specifically: this issues the BASIC one — self-declared by the agent, ' +
         'agent-paid via x402, owner identity NOT identity-verified. If the user asked for a "verified" AI ' +
         'birthcert (owner identity confirmed via MyDigital ID), use request_ai_birthcert_verification ' +
-        'instead — this tool cannot produce that credential.',
+        'instead — this tool cannot produce that credential. If the user did not say which kind, ask first: see the `choice` note in credential_preflight.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -893,7 +895,9 @@ export function buildToolList() {
               'Claim values for the credential (schema varies by template — check what the issuer requires ' +
               'before guessing). ALWAYS ask the human owner directly for any name/identifier-type value ' +
               '(e.g. an agentUsername or similar field) — NEVER invent, guess, or silently reuse one of ' +
-              'your own choosing; if the template requires one, get it from the user first. "agentDid" is ' +
+              'your own choosing; if the template requires one, get it from the user first. ' +
+              'When the user answers with a name — even a short phrase, even one that repeats words from your question — that IS the name: use it as given and do not ask for it again, unless it was refused (for example already in use). Tidying it (spaces or capitals, say) is optional and never needed; if you do want to suggest a tidier form, ask and WAIT for their answer, and use the tidied form only after a yes. Never go ahead on a name, or on a payment, that the user has not agreed to. Any example you give is only an example of the format, not a suggestion to use. ' +
+              '"agentDid" is ' +
               'the one exception: it does not need to be supplied, since it is auto-filled with this ' +
               "wallet's own holder DID (the credential's self-referential subject) unless you explicitly " +
               'override it.',
@@ -910,6 +914,7 @@ export function buildToolList() {
               '`quote.paymentRequired` is the authoritative free-vs-paid answer: false means issuance is currently ' +
               'free and `maxAmountRequired` will not be charged. When the field is ABSENT the MBI predates it and ' +
               'the amount is unconfirmed — report it as a possible charge, never as certainly free. ' +
+              'Tell the user in plain words that it is free or chargeable; never quote JSON field names such as paymentRequired to them. ' +
               'Still validates required attributes locally first — a missing one blocks before any MBI call.',
           },
           forceReissue: {
@@ -1011,8 +1016,7 @@ export function buildToolList() {
         'different again, and NOT simply "known to have succeeded" either — see the note on it above: ' +
         'it is two states, only one of which is confirmed, so read `message` there too rather than ' +
         'assuming success from the shape alone. ' +
-        'If the user did NOT ask for a "verified" credential specifically, they most likely want the ' +
-        'self-declared, non-verified Basic AI Birthcert instead — use subscribe_and_issue for that. ' +
+        'If the request does not say which kind of AI Birthcert the user wants, do not start this: run credential_preflight for both kinds and ask which they prefer (see its `choice` note), and use this tool only for the Verified kind; if they want the self-declared, non-verified Basic one, use subscribe_and_issue for that. ' +
         'BEFORE this pays or starts a session, it checks whether this holder already has a Verified ' +
         'AI Birthcert — found in the local cache, or (if the cache has not seen it yet) resolved from ' +
         'a previously-issued session. If one exists and is STILL VALID, nothing is paid and no session ' +
@@ -1039,7 +1043,8 @@ export function buildToolList() {
             description:
               'A unique, human-readable name for this agent. Must not already be in use for a Verified ' +
               'AI Birthcert, or issuance will fail. ALWAYS ask the human owner directly which name to ' +
-              'use for a new session — NEVER invent, guess, or silently choose one yourself.',
+              'use for a new session — NEVER invent, guess, or silently choose one yourself. ' +
+              'When the user answers with a name — even a short phrase, even one that repeats words from your question — that IS the name: use it as given and do not ask for it again, unless it was refused (for example already in use). Tidying it (spaces or capitals, say) is optional and never needed; if you do want to suggest a tidier form, ask and WAIT for their answer, and use the tidied form only after a yes. Never go ahead on a name, or on a payment, that the user has not agreed to. Any example you give is only an example of the format, not a suggestion to use.',
           },
           agentPurpose: { type: 'string', description: 'Optional — what this agent does, e.g. "Negotiate and settle supplier invoices".' },
           evidenceAssuranceLevel: { type: 'string', description: 'Optional — assurance level of the identity evidence, e.g. "high".' },
@@ -1121,20 +1126,22 @@ export function buildToolList() {
         'Report `fee.display` and each balance\'s `display` to the user, never the raw base-unit numbers. ' +
         '`fee.paymentRequired: false` means issuance is currently FREE — `fee.display` is then only what it ' +
         'WOULD cost if payment were switched back on, so do not ask the user to fund it and do not present ' +
-        'that amount as a charge. ' +
+        'that amount as a charge. Tell the user in plain words that it is free or chargeable; never quote JSON field names such as paymentRequired to them. ' +
         'A free credential sends no transaction, so no gas is spent and a missing ZTX balance is not a blocker on it: never ask the user to fund ZTX for a free credential, and if notChecked mentions ZTX, pass it on as a note only. When the field is ' +
         'ABSENT the cost is unknown (an older MBI), and it is treated as chargeable — never report absent as free. ' +
         'If the result has `alreadyHeld`, this wallet already holds a valid copy of that credential: tell the user so, name it, ' +
-        'and stop — do not ask for an agent name or any other detail, and do not begin an issuance. A new one would replace it. ' +
-        'Only when the user has explicitly said they want a replacement, run this check with replacing: true.',
+        'and stop — do not ask for an agent name or any other detail, and do not begin an issuance. A new one would replace it. That stop applies to that credential only: the `choice` note still applies to the other kind. ' +
+        'Only when the user has explicitly said they want a replacement, run this check with replacing: true. ' +
+        'When a user asks for an AI Birthcert and the request does not say which kind they want (Basic, which is self-declared, or Verified, through MyDigital ID), do not pick one: follow the `choice` note in the result, which is to run this check for both kinds, tell the user the difference in plain words, and ask which they prefer.',
       inputSchema: {
         type: 'object',
         properties: {
           credential: {
             type: 'string',
             description:
-              'Which credential to price: "verified_ai_birthcert" for the MyDigital-ID-verified AI Birthcert, ' +
-              'or a template id (did:zid:...) / known template name (e.g. "AI Birthcert") for a template-issued one.',
+              'Which credential to price: "verified_ai_birthcert" for the VERIFIED (MyDigital-ID-verified) AI Birthcert, ' +
+              'or a template id (did:zid:...) / known template name for a template-issued one — "AI Birthcert" is the BASIC, self-declared one. ' +
+              'For the Verified one use exactly "verified_ai_birthcert": any name containing "birthcert" is priced as the Basic one.',
           },
           agentName: {
             type: 'string',

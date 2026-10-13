@@ -3,7 +3,7 @@ import { resolveTemplateAlias, deriveTemplateAttributes, validateTemplateAttribu
 
 const TESTNET_ID = 'did:zid:3c0fb79adff08e14e06dcd6e3243205010dd65f533434a3d96c55575d1d3d959'
 const MAINNET_ID = 'did:zid:19091d19049abb8869b4b8e2f4a887bd1d1d86e5f5ebd0c8297000255f67765b'
-const BIRTHCERT_TESTNET_PASS_DESIGN_ID = 'did:zid:992e1e18985ba36a09ba0fbfeb601ddeb449f5e4e882ed69d0d620085f399818'
+const BIRTHCERT_TESTNET_PASS_DESIGN_ID = 'did:zid:bb7202482ef6053be6d46ad8e2190b0ba1e3b2024d24ce7f37bc4c3747e2378f'
 const BIRTHCERT_MAINNET_PASS_DESIGN_ID = 'did:zid:915955cb71c6fd2a256d04344f57381084903cb6a85a1c9ddb71c746f08932ab'
 
 describe('resolveTemplateAlias', () => {

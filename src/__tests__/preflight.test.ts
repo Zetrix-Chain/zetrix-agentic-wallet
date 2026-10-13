@@ -80,6 +80,8 @@ describe('credentialPreflight — know before you pay (R1)', () => {
     const free = await credentialPreflight(freeDeps as never, { credential: 'did:zid:t-free' })
     expect(free.ready).toBe(true)
     expect(free.notChecked.join(' ')).toMatch(/still free at apply time/)
+    // notChecked is relayed to the user verbatim, so it must not carry the raw MBI field name.
+    expect(free.notChecked.join(' ')).not.toMatch(/paymentRequired/)
 
     // A chargeable credential must not carry it — the caveat is only true when the answer relied on
     // the flag, and a notChecked list that cries wolf stops being read.
@@ -332,5 +334,104 @@ describe('credentialPreflight — know before you pay (R1)', () => {
       const out = await credentialPreflight(d as never, { credential: VERIFIED_AI_BIRTHCERT })
       expect(out.balances.map((b) => b.token)).toEqual(['JMYR', 'ZTX'])
     })
+  })
+})
+
+
+// "Get me AI Birth VC" does not say Basic or Verified. The agent chose differently in different chats, and
+// nothing asked the user. Every AI Birthcert preflight result now carries a note that tells the agent what to do.
+describe('credentialPreflight: the Basic-or-Verified note on an AI Birthcert', () => {
+  const isBasic = (c: string) => c === 'AI Birthcert' || c === 'did:zid:basic'
+
+  it('is on a Verified AI Birthcert result, and explains both kinds and how to proceed', async () => {
+    const out = await credentialPreflight(deps() as never, { credential: VERIFIED_AI_BIRTHCERT })
+
+    expect(out.choice).toBeDefined()
+    const note = out.choice as string
+    expect(note).toMatch(/BASIC/)
+    expect(note).toMatch(/VERIFIED/)
+    expect(note).toMatch(/self-declared/i)
+    expect(note).toMatch(/MyDigital ID/)
+    expect(note).toMatch(/has not said which/i)
+    expect(note).toMatch(/ask/i)
+    expect(note).toMatch(/one after the other/i)
+    expect(note).toMatch(/Basic first/i)
+    expect(note).toMatch(/not already hold|does not already hold|do not already hold/i)
+  })
+
+  // Review R1-M1: "both" is not consent for the Verified payment; each kind has its own price and its own yes.
+  it('says each kind has its own price and needs its own yes', async () => {
+    const out = await credentialPreflight(deps() as never, { credential: VERIFIED_AI_BIRTHCERT })
+
+    expect(out.choice).toMatch(/own price/i)
+    expect(out.choice).toMatch(/own yes/i)
+  })
+
+  // Review R1-L2: Basic is MBI-priced and may be chargeable, so the agent must not tell the user it is free.
+  it('does not let the agent assume Basic is free', async () => {
+    const out = await credentialPreflight(deps() as never, { credential: VERIFIED_AI_BIRTHCERT })
+
+    expect(out.choice).toMatch(/never assume Basic is free/i)
+  })
+
+  // Review R1-M2: the wallet deliberately makes no claim about the fee when a name is refused (SSIVC's uniqueness check
+  // may run before the fee is deducted), so this note must not either.
+  it('does not say a name that is taken still costs the fee, and says that cannot be confirmed', async () => {
+    const out = await credentialPreflight(deps() as never, { credential: VERIFIED_AI_BIRTHCERT })
+
+    expect(out.choice).not.toMatch(/still costs the fee/i)
+    expect(out.choice).not.toMatch(/still gets charged/i)
+    expect(out.choice).toMatch(/cannot be confirmed/i)
+  })
+
+  it('is on a Basic AI Birthcert result too, said to be for the Basic one', async () => {
+    const out = await credentialPreflight({ ...deps(), isBasicAiBirthcert: isBasic } as never, { credential: 'AI Birthcert' })
+
+    expect(out.choice).toMatch(/This result is for the BASIC one/)
+  })
+
+  it('says which kind the result is for, on the Verified one', async () => {
+    const out = await credentialPreflight(deps() as never, { credential: VERIFIED_AI_BIRTHCERT })
+
+    expect(out.choice).toMatch(/This result is for the VERIFIED one/)
+  })
+
+  it('is on a result that stopped because the credential is already held, so the agent offers the other kind', async () => {
+    const d = deps({ findHeld: vi.fn().mockResolvedValue({ label: 'Basic AI Birthcert', vcId: 'did:zid:vc', validUntil: '2027-01-01T00:00:00Z' }), isBasicAiBirthcert: isBasic })
+
+    const out = await credentialPreflight(d as never, { credential: 'AI Birthcert' })
+
+    expect(out.alreadyHeld).toBeDefined()
+    expect(out.choice).toBeDefined()
+  })
+
+  it('is on a result that could not be priced', async () => {
+    const d = deps({ quoteTemplate: vi.fn().mockResolvedValue({ error: 'no quote' }), isBasicAiBirthcert: isBasic })
+
+    const out = await credentialPreflight(d as never, { credential: 'AI Birthcert' })
+
+    expect(out.ready).toBe(false)
+    expect(out.choice).toBeDefined()
+  })
+
+  it('is NOT on a credential that is not an AI Birthcert', async () => {
+    const out = await credentialPreflight({ ...deps(), isBasicAiBirthcert: isBasic } as never, { credential: 'did:zid:something-else' })
+
+    expect(out.choice).toBeUndefined()
+  })
+
+  it('is not on a template credential when nothing says which template is the Basic AI Birthcert', async () => {
+    const out = await credentialPreflight(deps() as never, { credential: 'AI Birthcert' })
+
+    expect(out.choice).toBeUndefined()
+  })
+
+  it('does not change what is priced, or readiness: it is guidance only', async () => {
+    const withNote = await credentialPreflight(deps() as never, { credential: VERIFIED_AI_BIRTHCERT })
+    const { choice: _choice, ...rest } = withNote
+
+    expect(rest.ready).toBe(true)
+    expect(rest.blockers).toEqual([])
+    expect(rest.fee).toMatchObject({ maxAmountRequired: '1000000' })
   })
 })

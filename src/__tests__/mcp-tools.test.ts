@@ -179,7 +179,7 @@ describe('createTools', () => {
     const { deps, mbi } = makeDeps()
     await createTools(deps).subscribe_and_issue({ templateId: 'AI Birthcert', attributes: { name: 'x' } })
     const sentData = JSON.parse((mbi.applyChallenge.mock.calls[0][0] as { data: string }).data)
-    expect(sentData[0].passDesignId).toBe('did:zid:992e1e18985ba36a09ba0fbfeb601ddeb449f5e4e882ed69d0d620085f399818')
+    expect(sentData[0].passDesignId).toBe('did:zid:bb7202482ef6053be6d46ad8e2190b0ba1e3b2024d24ce7f37bc4c3747e2378f')
   })
 
   it('subscribe_and_issue includes the Basic Birthcert passDesignId (mainnet) when configured for mainnet', async () => {
@@ -657,6 +657,86 @@ describe('createTools — AI Birthcert verification', () => {
       expect(quote).not.toHaveBeenCalled()
       expect(out.blockers[0]).toMatch(/must be a did:zid/i)
     })
+  })
+})
+
+// the tool layer decides which template is the Basic AI Birthcert for the note, from the network's alias.
+describe('credential_preflight: the Basic-or-Verified note, through the tool', () => {
+  const BASIC_TESTNET = 'did:zid:3c0fb79adff08e14e06dcd6e3243205010dd65f533434a3d96c55575d1d3d959'
+
+  it('is on a Basic AI Birthcert asked for by its name', async () => {
+    const { deps } = makeDeps()
+    const out = (await createTools({
+      ...deps,
+      queryTokenBalance: vi.fn().mockResolvedValue({ token: 'JMYR', balance: '5000000', decimals: 6, display: '5 JMYR' }),
+    }).credential_preflight({ credential: 'AI Birthcert' })) as { choice?: string }
+
+    expect(out.choice).toMatch(/This result is for the BASIC one/)
+  })
+
+  it('is on a Basic AI Birthcert asked for by its template id', async () => {
+    const { deps } = makeDeps()
+    const out = (await createTools({
+      ...deps,
+      queryTokenBalance: vi.fn().mockResolvedValue({ token: 'JMYR', balance: '5000000', decimals: 6, display: '5 JMYR' }),
+    }).credential_preflight({ credential: BASIC_TESTNET })) as { choice?: string }
+
+    expect(out.choice).toMatch(/This result is for the BASIC one/)
+  })
+
+  it('is not on some other template', async () => {
+    const { deps } = makeDeps()
+    const out = (await createTools({
+      ...deps,
+      queryTokenBalance: vi.fn().mockResolvedValue({ token: 'JMYR', balance: '5000000', decimals: 6, display: '5 JMYR' }),
+    }).credential_preflight({ credential: 'did:zid:0000000000000000000000000000000000000000000000000000000000000000' })) as { choice?: string }
+
+    expect(out.choice).toBeUndefined()
+  })
+
+  // Review R1-L7: the Basic template id differs by network, and the Verified template is not the Basic one.
+  it('recognises the MAINNET Basic AI Birthcert by its id on a mainnet wallet', async () => {
+    const { deps } = makeDeps()
+    const out = (await createTools({
+      ...deps,
+      config: { ...deps.config, network: 'zetrix:mainnet' },
+      queryTokenBalance: vi.fn().mockResolvedValue({ token: 'JMYR', balance: '5000000', decimals: 6, display: '5 JMYR' }),
+    }).credential_preflight({ credential: 'did:zid:19091d19049abb8869b4b8e2f4a887bd1d1d86e5f5ebd0c8297000255f67765b' })) as { choice?: string }
+
+    expect(out.choice).toMatch(/This result is for the BASIC one/)
+  })
+
+  it('does not take the TESTNET Basic id for the Basic AI Birthcert on a mainnet wallet', async () => {
+    const { deps } = makeDeps()
+    const out = (await createTools({
+      ...deps,
+      config: { ...deps.config, network: 'zetrix:mainnet' },
+      queryTokenBalance: vi.fn().mockResolvedValue({ token: 'JMYR', balance: '5000000', decimals: 6, display: '5 JMYR' }),
+    }).credential_preflight({ credential: BASIC_TESTNET })) as { choice?: string }
+
+    expect(out.choice).toBeUndefined()
+  })
+
+  it('does not take the Verified AI Birthcert template id for the Basic one', async () => {
+    const { deps } = makeDeps()
+    const out = (await createTools({
+      ...deps,
+      queryTokenBalance: vi.fn().mockResolvedValue({ token: 'JMYR', balance: '5000000', decimals: 6, display: '5 JMYR' }),
+    }).credential_preflight({ credential: 'did:zid:9641ee92552e9bcec672f300b071ff86d340ac78c83c225e95971cab8108fb80' })) as { choice?: string }
+
+    expect(out.choice).toBeUndefined()
+  })
+
+  it('on a wallet where the Verified kind is not configured, still carries the note, and says Basic is the only one to offer', async () => {
+    const { deps } = makeDeps()
+    const out = (await createTools({ ...deps, verifyAiBirthcert: undefined }).credential_preflight({ credential: 'verified_ai_birthcert' })) as {
+      ready: boolean
+      choice?: string
+    }
+
+    expect(out.ready).toBe(false)
+    expect(out.choice).toMatch(/not available/i)
+    expect(out.choice).toMatch(/Basic/)
   })
 })
 

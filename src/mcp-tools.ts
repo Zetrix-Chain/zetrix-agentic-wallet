@@ -27,6 +27,7 @@
  *   transfer_token                      — send native ZTX or any ZTP20 token to an address
  */
 
+import { aiBirthcertChoice } from './orchestrator/birthcert-choice.js'
 import { access } from 'node:fs/promises'
 import type { X401Wallet } from 'x401-zetrix-client'
 import type { VcPresentInput } from './clients/mbi-vp-adapter.js'
@@ -508,7 +509,15 @@ export function createTools(deps: ToolDeps) {
      */
     async credential_preflight(input: PreflightInput) {
       if (input.credential === VERIFIED_AI_BIRTHCERT && !deps.verifyAiBirthcert) {
-        return { credential: input.credential, ready: false, balances: [], blockers: [AI_BIRTHCERT_NOT_CONFIGURED_ERROR], notChecked: [] }
+        // Not available here (mainnet, say): the agent must offer the Basic one only, not the Verified one it cannot issue.
+        return {
+          credential: input.credential,
+          ready: false,
+          balances: [],
+          blockers: [AI_BIRTHCERT_NOT_CONFIGURED_ERROR],
+          notChecked: [],
+          choice: aiBirthcertChoice('verified', { unavailable: true }),
+        }
       }
       if (!deps.queryTokenBalance) {
         return {
@@ -519,8 +528,12 @@ export function createTools(deps: ToolDeps) {
           notChecked: [],
         }
       }
+      const basicId = resolveTemplateAlias('ai birthcert', deps.config.network)
+      const isBasicAiBirthcert = (credential: string) =>
+        basicId !== undefined && (credential === basicId || resolveTemplateAlias(credential, deps.config.network) === basicId)
       return credentialPreflight(
         {
+          isBasicAiBirthcert,
           quoteVerified: (q) => deps.verifyAiBirthcert!.request(q as RequestAiBirthcertVerificationInput) as Promise<Record<string, unknown>>,
           quoteTemplate: async (templateId) => {
             const resolved = resolveTemplateAlias(templateId, deps.config.network) ?? templateId
