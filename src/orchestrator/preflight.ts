@@ -17,6 +17,7 @@
  */
 
 import { aiBirthcertChoice, type AiBirthcertKind } from './birthcert-choice.js'
+import type { NextStep } from './next-step.js'
 import { describePaymentCap, describePolicyGovernedCap, type PaymentCapDescription } from '../payment-guard.js'
 import type { TokenBalanceResult } from '../clients/token-balance-client.js'
 
@@ -34,7 +35,11 @@ export interface PreflightFee {
   payTo?: string
   /** Which side pays network gas. Absent when the server quoted no gas model. */
   gasModel?: 'sponsored' | 'self'
-  /** The fee in whole tokens with its symbol, when the balance read resolved decimals. */
+  /**
+   * The fee in whole tokens with its symbol. When the balance read could not resolve decimals it is
+   * the raw count labelled "base units of <symbol>" instead — never a bare number, which would read
+   * as whole tokens and overstate the amount by 10^decimals.
+   */
   display?: string
   /**
    * Whether MBI will actually charge `maxAmountRequired`.
@@ -75,6 +80,13 @@ export interface PreflightResult {
   blockers: string[]
   /** What preflight could not verify, so a clean result is not mistaken for a guarantee. */
   notChecked: string[]
+  /** What to do next, as a field. See next-step.ts. */
+  nextStep?: NextStep
+  /**
+   * Verified only: an earlier payment no credential has used up yet. The next request reuses it, so the fee
+   * does not gate (`ready` ignores balance and cap) and `note` tells the agent not to ask the user to agree to a fee.
+   */
+  unusedPayment?: { agentName: string; linkOpen: boolean; settling?: true; note: string }
   /**
    * Present on every AI Birthcert result (either kind): what the agent must do when the user did not say Basic or
    * Verified. Guidance only; nothing priced or reported ready depends on it.
@@ -112,6 +124,11 @@ export interface PreflightDeps {
   caps: Record<string, string> | undefined
   /** True when the owner's spending policy governs the asset, so the default cap is not applied. */
   policyGoverns?: (asset: string) => Promise<boolean>
+  /**
+   * Verified only: an earlier payment the next request would reuse (`findUnusedVerificationPayment`). Optional:
+   * absent, nothing is checked. Throws when it cannot tell.
+   */
+  findUnusedPayment?: () => Promise<{ agentName: string; linkOpen: boolean; settling?: true } | undefined>
 }
 
 /**
@@ -152,6 +169,7 @@ export async function credentialPreflight(deps: PreflightDeps, input: PreflightI
                 `replacement, run this check again with replacing: true.`,
             ],
             notChecked: [],
+            nextStep: 'tell_user_already_held',
             ...choice,
           }
         }
@@ -169,6 +187,26 @@ export async function credentialPreflight(deps: PreflightDeps, input: PreflightI
     }
   }
 
+  // Verified only. Checked before the price so that the price, when shown, is not read as what the next link costs.
+  let unusedPayment: PreflightResult['unusedPayment']
+  if (isVerified && deps.findUnusedPayment) {
+    try {
+      const found = await deps.findUnusedPayment()
+      if (found) {
+        unusedPayment = { ...found, note: unusedPaymentNote(found) }
+        notChecked.push(
+          'Whether the service still accepts the earlier payment. If it refuses the earlier payment, request_ai_birthcert_verification ' +
+            'says so and pays nothing; a new link would then cost the fee again, and the user must agree to that first.',
+        )
+      }
+    } catch (e) {
+      notChecked.push(
+        `Whether an earlier payment could be reused could not be checked (${e instanceof Error ? e.message : String(e)}), so the fee below is ` +
+          'what a new link would cost if there is none.',
+      )
+    }
+  }
+
   const quoted = isVerified
     ? await deps.quoteVerified({ agentName: input.agentName?.trim() || placeholderAgentName(), dryRun: true })
     : await deps.quoteTemplate(input.credential)
@@ -181,6 +219,23 @@ export async function credentialPreflight(deps: PreflightDeps, input: PreflightI
   if (!quote) {
     // A quote is free, so failing to get one is a real blocker rather than a reason to guess a price.
     const why = String(quoted.error ?? quoted.reason ?? 'the price could not be read')
+    // Unless the next link reuses an earlier payment: then no price is charged, so it cannot block (review R1).
+    if (unusedPayment) {
+      return {
+        credential: input.credential,
+        ready: true,
+        balances: [],
+        unusedPayment,
+        nextStep: 'confirm_kind_then_collect_details',
+        blockers: [],
+        notChecked: [
+          ...notChecked,
+          `The price could not be read (${why}). It only matters if the earlier payment is refused.`,
+          ...uncheckable(isVerified),
+        ],
+        ...choice,
+      }
+    }
     return {
       credential: input.credential,
       ready: false,
@@ -189,6 +244,7 @@ export async function credentialPreflight(deps: PreflightDeps, input: PreflightI
       ...(schema ? { schema } : {}),
       blockers: [`Could not price this credential: ${why}`],
       notChecked: [...notChecked, ...uncheckable(isVerified)],
+      nextStep: 'resolve_blockers',
       ...choice,
     }
   }
@@ -218,14 +274,16 @@ export async function credentialPreflight(deps: PreflightDeps, input: PreflightI
   // top-up that was never spent. Strictly `=== false`: an absent flag is an older MBI without this field,
   // i.e. unknown, and unknown must keep behaving as chargeable rather than be read as free.
   const isFree = quote.paymentRequired === false
+  // Neither the balance nor the cap can stand in the way of a payment that will not be made.
+  const noPaymentDue = isFree || unusedPayment !== undefined
 
   const feeBalance = balances[0]
   if ('error' in feeBalance) {
     // Worth reporting even when free: the same read backs the gas check and the `display` amount,
     // and a silent failure there would make a clean result look better verified than it is.
     blockers.push(`Could not read the ${asset} balance (${feeBalance.error}) — retry before paying.`)
-  } else if (!isFree && BigInt(feeBalance.balance) < BigInt(requiredRaw)) {
-    blockers.push(`Not enough ${feeBalance.token}: the fee is ${renderAmount(requiredRaw, feeBalance)}, the balance is ${feeBalance.display}.`)
+  } else if (!noPaymentDue && BigInt(feeBalance.balance) < BigInt(requiredRaw)) {
+    blockers.push(`Not enough ${feeBalance.token}: the fee is ${renderAmount(requiredRaw, feeBalance)}, the balance is ${renderAmount(feeBalance.balance, feeBalance)}.`)
   }
 
   // Gas is separate from the fee, but it is only spent when a transaction is sent, and a free issuance
@@ -237,12 +295,15 @@ export async function credentialPreflight(deps: PreflightDeps, input: PreflightI
     if (gas && 'error' in gas) {
       const msg = `Could not read the ZTX balance (${gas.error}) — ZTX pays network gas and is separate from the fee.`
       if (isFree) gasNotes.push(`${msg} Issuance is free right now, so none is needed unless it becomes chargeable.`)
+      else if (unusedPayment) gasNotes.push(`${msg} The next link reuses an earlier payment, so none is needed for it.`)
       else blockers.push(msg)
     } else if (gas && BigInt(gas.balance) === 0n) {
       if (isFree) {
         gasNotes.push(
           'This wallet holds no ZTX. Issuance is free right now, so no payment is made and no gas is needed; if it becomes chargeable and this wallet pays its own gas, it will need ZTX.',
         )
+      } else if (unusedPayment) {
+        gasNotes.push('This wallet holds no ZTX. The next link reuses an earlier payment, so no transaction is sent and no gas is needed for it.')
       } else {
         blockers.push(`No ZTX for network gas. ZTX is separate from the ${feeBalance.token ?? asset} fee and is needed for every transaction.`)
       }
@@ -255,7 +316,7 @@ export async function credentialPreflight(deps: PreflightDeps, input: PreflightI
     deps.policyGoverns && (await deps.policyGoverns(asset))
       ? describePolicyGovernedCap(asset)
       : describePaymentCap(asset, requiredRaw, deps.caps)
-  if (!cap.wouldPass && !isFree) blockers.push(renderCapBlocker(cap, requiredRaw, feeBalance))
+  if (!cap.wouldPass && !noPaymentDue) blockers.push(renderCapBlocker(cap, requiredRaw, feeBalance))
 
   return {
     credential: input.credential,
@@ -271,16 +332,44 @@ export async function credentialPreflight(deps: PreflightDeps, input: PreflightI
     balances,
     cap,
     ...(alreadyHeld ? { alreadyHeld } : {}),
+    ...(unusedPayment ? { unusedPayment } : {}),
     ...(schema ? { schema } : {}),
     blockers,
     notChecked: [...notChecked, ...gasNotes, ...uncheckable(isVerified, isFree)],
+    // An AI Birthcert carries the `choice` question; a bare collect_details made weaker models skip it (review R1).
+    nextStep: blockers.length > 0 ? 'resolve_blockers' : kind ? 'confirm_kind_then_collect_details' : 'collect_details',
     ...choice,
   }
 }
 
-/** Render a raw amount using the decimals the balance read already resolved. */
+/** What the agent is told about an earlier payment the next link reuses. Verdict first, so a summary keeps it. */
+function unusedPaymentNote(found: { agentName: string; linkOpen: boolean; settling?: true }): string {
+  if (found.settling) {
+    return (
+      'No new payment is needed for the next verification link: an earlier payment is still being settled, and ' +
+      'request_ai_birthcert_verification follows that payment rather than paying again. Do not ask the user to agree to a fee ' +
+      'for it. Its outcome is not known yet, so do not tell the user it succeeded; call check_ai_birthcert_verification to ' +
+      `follow it (it was for the name "${found.agentName}").`
+    )
+  }
+  const head =
+    'No new payment is needed for the next verification link: an earlier payment has not been used yet (it is only used up once ' +
+    'the credential is issued), and request_ai_birthcert_verification reuses it. Do not ask the user to agree to a fee for it, and do ' +
+    'not count it as another payment. The fee below is what a link costs when there is no earlier payment.'
+  return found.linkOpen
+    ? `${head} Its link is still open: calling with the same name, "${found.agentName}", hands back that same link, and a different ` +
+        'name is refused until it ends.'
+    : `${head} Its link has ended, so the next link can use any name the user chooses.`
+}
+
+/**
+ * Render a raw amount using the decimals the balance read already resolved. When decimals could not
+ * be read the amount cannot be shown as whole tokens, so it is labelled as base units rather than
+ * returned bare: a bare count beside a ticker reads as whole tokens and is off by 10^decimals.
+ */
 export function renderAmount(raw: string, balance: TokenBalanceResult): string {
-  if ('error' in balance || balance.decimals === null) return raw
+  if ('error' in balance) return raw
+  if (balance.decimals === null) return `${raw} base units of ${balance.token}`
   const d = BigInt(10) ** BigInt(balance.decimals)
   const whole = BigInt(raw) / d
   const frac = (BigInt(raw) % d).toString().padStart(balance.decimals, '0').replace(/0+$/, '')

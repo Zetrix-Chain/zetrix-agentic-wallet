@@ -60,7 +60,7 @@ import { buildToolContent } from './tool-result.js'
 import { SsivcClient } from './clients/ssivc-client.js'
 import { createFsSsivcSessionStore } from './clients/ssivc-session-store.js'
 import { createFsDownloadQuarantineStore } from './clients/ssivc-download-quarantine-store.js'
-import { requestAiBirthcertVerification, checkAiBirthcertVerification, clearStuckPaymentReceipt } from './orchestrator/verify-ai-birthcert.js'
+import { requestAiBirthcertVerification, checkAiBirthcertVerification, clearStuckPaymentReceipt, findUnusedVerificationPayment } from './orchestrator/verify-ai-birthcert.js'
 import type { ClearStuckPaymentReceiptInput } from './orchestrator/verify-ai-birthcert.js'
 import { PolicyDecisionClient } from './clients/policy-decision-client.js'
 import { needsNativeGasCheck, orderAccepts, prepareBaseUrl } from './accept-selection.js'
@@ -81,6 +81,18 @@ const packageVersion = packageJson.version
 /** Longest a single request to the policy write service may take. A hung one must not hold a policy key for ever. */
 const POLICY_HTTP_TIMEOUT_MS = 60_000
 
+/**
+ * The quote a paid issuance tool returns with needsConfirmation, as the shape `confirm` takes. Declared, not
+ * boolean: the schema is the only type contract a host or model sees, and a boolean confirm is refused.
+ */
+const CONFIRM_QUOTE_PROPERTIES = {
+  asset: { type: 'string', description: 'Exactly as the quote gave it.' },
+  maxAmountRequired: { type: 'string', description: 'Exactly as the quote gave it, in raw base units.' },
+  payTo: { type: 'string', description: 'Exactly as the quote gave it; leave it out only if the quote had none.' },
+  gasModel: { type: 'string', enum: ['sponsored', 'self'], description: 'Exactly as the quote gave it.' },
+  assetSymbol: { type: 'string', description: 'For display only, when the quote has it; ignored when the price is checked.' },
+}
+
 export function buildToolList() {
   return [
     {
@@ -88,13 +100,13 @@ export function buildToolList() {
       description:
         'Report the holder DID/address/network and the client-supplied held credentials. With `token`, ' +
         'also returns that token\'s balance and its contract address (`tokenAddress`) — the value a policy\'s ' +
-        'tokenAddress needs, so the user never has to be asked for it.',
+        'tokenAddress needs, so the user never has to be asked for it. Report a balance to the user as its `display` amount only.',
       inputSchema: {
         type: 'object',
         properties: {
           heldCredentials: { type: 'array', items: { type: 'object' }, description: 'VCs the client holds. Omit to report whatever the wallet has cached locally from prior subscribe_and_issue calls instead.' },
-          token: { type: 'string', description: 'Optional token symbol (e.g. "ZTX", "JMYR") OR a ZTP20 contract address, to check its balance for the active network alongside the usual status fields. Returns { balance, decimals, display } — `balance` is in the asset\'s raw base units and `display` is the same amount in whole tokens with its symbol (e.g. balance "473999900", decimals 6, display "473.9999 JMYR"). Quote a `display` value to the user, never a bare `balance`. A failed lookup reports { error: "query_failed" } rather than a zero balance; an unrecognised name reports { error: "unknown_token" }.' },
-          tokens: { type: 'array', items: { type: 'string' }, description: 'Several tokens (symbols and/or ZTP20 contract addresses) in one call, returned as `tokenBalances` in the order asked. Prefer this over repeated single-token calls when checking affordability: a credential fee and the native ZTX needed for gas are separate balances, and asking one at a time is how "you hold the token but no gas" is discovered only after the first shortfall was already fixed. Each entry carries its own result or error, so one failure does not hide the rest.' },
+          token: { type: 'string', description: 'Optional token symbol (e.g. "ZTX", "JMYR") OR a ZTP20 contract address, to check its balance for the active network alongside the usual status fields. Returns { balance, decimals, display } — `balance` is in the asset\'s raw base units and `display` is the same amount in whole tokens with its symbol (e.g. balance "473999900", decimals 6, display "473.9999 JMYR"). Quote only the `display` value to the user, never a bare `balance`, and never add the base units or the decimals unless the user asks. When `decimals` is null, `display` is still in raw base units, so say the amount could not be converted to whole tokens rather than quoting it as a balance. A failed lookup reports { error: "query_failed" } rather than a zero balance; an unrecognised name reports { error: "unknown_token" }.' },
+          tokens: { type: 'array', items: { type: 'string' }, description: 'Several tokens (symbols and/or ZTP20 contract addresses) in one call, returned as `tokenBalances` in the order asked. Prefer this over repeated single-token calls when checking affordability: a credential fee and the native ZTX needed for gas are separate balances, and asking one at a time is how "you hold the token but no gas" is discovered only after the first shortfall was already fixed. Each entry carries its own result or error, so one failure does not hide the rest. Report each entry as for `token`: quote only its `display`, and when its `decimals` is null say the amount could not be converted to whole tokens.' },
         },
       },
     },
@@ -840,8 +852,10 @@ export function buildToolList() {
         'spending policy refuses the fee, the result has `policyDenied: true` (a decision: do not retry) or ' +
         '`policyCheckUnavailable: true` (transient: trying again shortly is right); either way nothing was paid and ' +
         'no credential was issued. If a ' +
-        'still-valid credential for this templateId is already cached locally, it is returned directly with ' +
-        'no payment (fromCache: true). Setting forceReissue:true alone does NOT pay again — it only asks to ' +
+        'still-valid credential for this templateId is already cached locally, it is returned with no payment as ' +
+        '{ issued: false, alreadyHeld: true, fromCache: true, reason }: the user already has it, so never tell the user it was just issued. ' +
+        'If it carries different values from the ones asked for (a different username, say), `differsFromRequest` lists them: ' +
+        'tell the user and ask whether to keep it or replace it. Setting forceReissue:true alone does NOT pay again — it only asks to ' +
         'be shown that existing credential first: you get back { issued: false, vcId, vc, fromCache: true, ' +
         'reason } instead, and nothing is paid. Show that existing credential to the user and ask whether ' +
         'they actually want to replace it; only call this tool again, with BOTH forceReissue:true and ' +
@@ -874,7 +888,13 @@ export function buildToolList() {
         'For the AI Birthcert specifically: this issues the BASIC one — self-declared by the agent, ' +
         'agent-paid via x402, owner identity NOT identity-verified. If the user asked for a "verified" AI ' +
         'birthcert (owner identity confirmed via MyDigital ID), use request_ai_birthcert_verification ' +
-        'instead — this tool cannot produce that credential. If the user did not say which kind, ask first: see the `choice` note in credential_preflight.',
+        'instead — this tool cannot produce that credential. If the user did not say which kind, ask first: see the `choice` note in credential_preflight. ' +
+        'Without a confirmed price a chargeable issuance stops at the price and signs, pays and issues nothing: you get ' +
+        '{ issued: false, needsConfirmation: true, quote, askUser, reason }. Put the askUser question to the user, and only after ' +
+        'their explicit yes call again with confirm set to that quote object, unchanged (confirm: true is not accepted). If the ' +
+        'issuer\'s payment request then differs from it in token, amount, payee or gas model, nothing is paid and you get ' +
+        'needsConfirmation again with the new price. A free issuance, and a credential already held, need no confirm. ' +
+        'Results may carry nextStep (what to do next) and askUser (the question to put to the user).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -925,6 +945,16 @@ export function buildToolList() {
               'it with confirmReplaceExistingVc to actually pay and reissue over a still-valid one. Has no ' +
               'effect when nothing valid is cached — that case always pays and issues fresh regardless.',
           },
+          confirm: {
+            type: 'object',
+            properties: CONFIRM_QUOTE_PROPERTIES,
+            required: ['asset', 'maxAmountRequired', 'gasModel'],
+            description:
+              'The user\'s explicit yes to the price: the quote object from a needsConfirmation result, passed back unchanged. ' +
+              'Anything else, including true, stops at the price (needsConfirmation: true) and nothing is signed, paid or issued. ' +
+              'Pass it only after the user has seen that price and said yes to it, ' +
+              'never on your own judgement: a yes to something else, such as the name, is not a yes to the payment.',
+          },
           confirmReplaceExistingVc: {
             type: 'string',
             description:
@@ -934,7 +964,7 @@ export function buildToolList() {
               'and never set it without forceReissue also being true. A mismatched value is ignored: nothing ' +
               'is paid and you get the same { issued: false, reason } response again, naming the id to ' +
               'confirm. Setting it without forceReissue does nothing at all either way — that case is a ' +
-              'plain cache hit ({ issued: true }) regardless of what this field is set to.',
+              'plain cache hit ({ issued: false, alreadyHeld: true }) regardless of what this field is set to.',
           },
         },
         required: ['templateId', 'attributes'],
@@ -950,7 +980,7 @@ export function buildToolList() {
         'If a spending policy refuses the session fee, the result is { error } with `policyDenied: true` ' +
         '(a decision: do not retry) or `policyCheckUnavailable: true` (transient: trying again shortly is right); ' +
         'either way nothing was paid and no session was created. ' +
-        'Returns { sessionId, verificationUrl, expiresAt, expiresIn, expiresInSeconds, message } — show verificationUrl to the human owner ' +
+        'Returns { sessionId, verificationUrl, expiresAt, expiresIn, expiresInSeconds, paidThisCall, message } — show verificationUrl to the human owner ' +
         'and ask them to open it and complete MyDigital ID verification (typically finishes in ' +
         'seconds). Tell them how long the link is good for by quoting `expiresIn` exactly as given: ' +
         'the wallet works it out from its own clock, so never calculate the time remaining yourself ' +
@@ -975,9 +1005,13 @@ export function buildToolList() {
         'evidenceAssuranceLevel, ownerType, ownerVerified — do not silently omit them; they only need ' +
         'to say no. Calling this ' +
         'again with the SAME agentName while a prior session is still pending returns that same ' +
-        'session unchanged — no new session is started and nothing is paid again. This tool spends ' +
+        'session unchanged — no new session is started and nothing is paid again. A new link after an expired one ' +
+        'does not pay again either: it reuses the payment already made, which is only used up once the credential is ' +
+        'issued. Every session result says so in `paidThisCall` (true only when THIS call sent a payment), and ' +
+        '`message` opens with "No new payment" when it did not. Count a fee only when paidThisCall is true: never tell ' +
+        'the user they paid once per link. This tool spends ' +
         'real funds: it self-pays an x402 challenge, subject to the same credential-issuance payment ' +
-        'cap as subscribe_and_issue, which by default allows exactly 1 JMYR per call. Set ' +
+        'cap as subscribe_and_issue, which by default allows at most 1 JMYR for one payment. Set ' +
         'MAX_PAYMENT_AMOUNT to override it; a spending policy that governs the asset replaces the default cap. ' +
         'It can return ' +
         '{ error: "..." } instead of a session. Read `message` before deciding what to tell the ' +
@@ -1017,6 +1051,14 @@ export function buildToolList() {
         'it is two states, only one of which is confirmed, so read `message` there too rather than ' +
         'assuming success from the shape alone. ' +
         'If the request does not say which kind of AI Birthcert the user wants, do not start this: run credential_preflight for both kinds and ask which they prefer (see its `choice` note), and use this tool only for the Verified kind; if they want the self-declared, non-verified Basic one, use subscribe_and_issue for that. ' +
+        'Without a confirmed price a call that would pay stops at the price and pays nothing: you get { needsConfirmation: true, ' +
+        'paidThisCall: false, quote, askUser, message }. Put the askUser question to the user, and only after their explicit yes ' +
+        'call again with confirm set to that quote object, unchanged (confirm: true is not accepted). If the payment request then ' +
+        'differs from it in token, amount, payee or gas model, nothing is paid and you get needsConfirmation again with the new ' +
+        'price; the quote\'s gasModel decides which option is paid, so if the sponsored option is refused you are given the ' +
+        'self-pay price to ask about, never a silent switch. A call that pays nothing (the same open link, or a new link after an ' +
+        'expired one) needs no confirm. ' +
+        'Results may carry nextStep (what to do next) and askUser (the question to put to the user). ' +
         'BEFORE this pays or starts a session, it checks whether this holder already has a Verified ' +
         'AI Birthcert — found in the local cache, or (if the cache has not seen it yet) resolved from ' +
         'a previously-issued session. If one exists and is STILL VALID, nothing is paid and no session ' +
@@ -1024,8 +1066,8 @@ export function buildToolList() {
         'that existing credential to the user and ask whether they actually want to replace it; only ' +
         'call this tool again, with confirmReplaceExistingVc set to exactly existingVerifiedVc.vcId, if ' +
         'they explicitly say yes. Never pass confirmReplaceExistingVc on your own judgement. If the ' +
-        'existing VC has already EXPIRED, this proceeds automatically — no confirmation needed — and ' +
-        'the result carries replacedExpiredVc: { vcId, validUntil } naming the one it replaced. That ' +
+        'existing VC has already EXPIRED, it needs no confirmReplaceExistingVc, but the payment still stops at the price like ' +
+        'any other, and a result that went ahead carries replacedExpiredVc: { vcId, validUntil } naming the one it replaced. That ' +
         'field can appear on a settled session, on a payment still settling, or on an EARLIER call\'s ' +
         'still-pending session simply being returned unchanged — so treat it only as "the holder\'s old ' +
         'VC had expired", never as proof that THIS call itself just spent money; read the rest of the ' +
@@ -1096,6 +1138,16 @@ export function buildToolList() {
               'offer the user this option for a receipt that is not stuck yet. A bare "retry" or "yes" ' +
               'from the user is not agreement to pay again.',
           },
+          confirm: {
+            type: 'object',
+            properties: CONFIRM_QUOTE_PROPERTIES,
+            required: ['asset', 'maxAmountRequired', 'gasModel'],
+            description:
+              'The user\'s explicit yes to the price: the quote object from a needsConfirmation result, passed back unchanged. ' +
+              'Anything else, including true, stops at the price (needsConfirmation: true) and nothing is paid. ' +
+              'Pass it only after the user has seen that price and said yes to it, ' +
+              'never on your own judgement: a yes to something else, such as the name, is not a yes to the payment.',
+          },
           confirmReplaceExistingVc: {
             type: 'string',
             description:
@@ -1116,7 +1168,7 @@ export function buildToolList() {
       description:
         'FREE readiness check — call this FIRST, before collecting ANY application detail from the user, ' +
         'whenever they ask for a credential. Spends nothing, signs no transaction, creates no session. ' +
-        'Returns { ready, fee, balances, cap, schema?, alreadyHeld?, blockers, notChecked }: the live fee and which side ' +
+        'Returns { ready, fee, balances, cap, schema?, alreadyHeld?, unusedPayment?, blockers, notChecked }: the live fee and which side ' +
         'pays gas, the balances that matter, whether the spending limit permits it, and — for a template ' +
         'credential — the attributes it requires. `blockers` lists EVERY reason it is not ready at once ' +
         '(a low balance and a too-low spending limit are different problems and both appear together), so ' +
@@ -1124,6 +1176,7 @@ export function buildToolList() {
         'ALWAYS relay `notChecked` too: a clean result is not a guarantee. In particular it does NOT ' +
         'check whether an agent name is free — myid decides that at issuance, after payment. ' +
         'Report `fee.display` and each balance\'s `display` to the user, never the raw base-unit numbers. ' +
+        'If a balance\'s `decimals` is null, its `display` is still in raw base units, so say the amount could not be converted to whole tokens rather than quoting it. ' +
         '`fee.paymentRequired: false` means issuance is currently FREE — `fee.display` is then only what it ' +
         'WOULD cost if payment were switched back on, so do not ask the user to fund it and do not present ' +
         'that amount as a charge. Tell the user in plain words that it is free or chargeable; never quote JSON field names such as paymentRequired to them. ' +
@@ -1132,7 +1185,11 @@ export function buildToolList() {
         'If the result has `alreadyHeld`, this wallet already holds a valid copy of that credential: tell the user so, name it, ' +
         'and stop — do not ask for an agent name or any other detail, and do not begin an issuance. A new one would replace it. That stop applies to that credential only: the `choice` note still applies to the other kind. ' +
         'Only when the user has explicitly said they want a replacement, run this check with replacing: true. ' +
-        'When a user asks for an AI Birthcert and the request does not say which kind they want (Basic, which is self-declared, or Verified, through MyDigital ID), do not pick one: follow the `choice` note in the result, which is to run this check for both kinds, tell the user the difference in plain words, and ask which they prefer.',
+        'If a Verified result has `unusedPayment`, an earlier payment has not been used yet and the next link reuses it: ' +
+        'no new payment is needed, so do not ask the user to agree to a fee for it, and follow its `note`. ' +
+        'When a user asks for an AI Birthcert and the request does not say which kind they want (Basic, which is self-declared, or Verified, through MyDigital ID), do not pick one: follow the `choice` note in the result, which is to run this check for both kinds, tell the user the difference in plain words, and ask which they prefer. ' +
+        'The result also says what to do next in nextStep: confirm_kind_then_collect_details (an AI Birthcert: ask Basic or Verified ' +
+        'unless the user already said, then collect the details), collect_details, resolve_blockers or tell_user_already_held.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1141,7 +1198,8 @@ export function buildToolList() {
             description:
               'Which credential to price: "verified_ai_birthcert" for the VERIFIED (MyDigital-ID-verified) AI Birthcert, ' +
               'or a template id (did:zid:...) / known template name for a template-issued one — "AI Birthcert" is the BASIC, self-declared one. ' +
-              'For the Verified one use exactly "verified_ai_birthcert": any name containing "birthcert" is priced as the Basic one.',
+              'For the Verified one use exactly "verified_ai_birthcert". A name that says verified (such as "Verified AI Birthcert") is also treated as the Verified one; ' +
+              'any other name containing "birthcert" is priced as the Basic one.',
           },
           agentName: {
             type: 'string',
@@ -1529,13 +1587,16 @@ export function buildPolicyWriteDeps(input: {
   }
 }
 /**
- * An amount as the user would read it: `"50000 (0.05 JMYR)"`, or the raw figure and a label when it
- * cannot be scaled. One function, used by both the payment-cap refusals and the policy-write
+ * An amount as the user would read it: `"50000 (0.05 JMYR)"`, or `"50000 base units of JMYR"` when the
+ * decimals cannot be read (a bare count would read as whole tokens). One function, used by both the payment-cap refusals and the policy-write
  * quote, so the two cannot drift into describing the same amount differently.
  */
 export async function describeAssetAmount(asset: string, raw: string, query: ContractQuery): Promise<string> {
-  const { symbol, decimals } = await resolveAssetInfo(asset, query)
+  const { symbol, decimals, decimalsReadable } = await resolveAssetInfo(asset, query)
   const label = symbol || '(unknown asset)'
+  // An unreadable decimals comes back as 0, which `formatHumanAmount` leaves unscaled — so `1000000` would read
+  // as "1000000 JMYR" when it is really 1 JMYR. A bare count beside a ticker reads as whole tokens, so say what it is.
+  if (!decimalsReadable) return `${raw} base units of ${label}`
   const human = formatHumanAmount(raw, decimals)
   return human === raw ? `${raw} ${label}` : `${raw} (${human} ${label})`
 }
@@ -2053,6 +2114,7 @@ async function main(): Promise<void> {
           request: (input: Parameters<typeof requestAiBirthcertVerification>[1]) => requestAiBirthcertVerification(verifyAiBirthcertDeps, input),
           check: () => checkAiBirthcertVerification(verifyAiBirthcertDeps),
           clearStuckReceipt: (input: ClearStuckPaymentReceiptInput) => clearStuckPaymentReceipt(verifyAiBirthcertDeps, input),
+          findUnusedPayment: () => findUnusedVerificationPayment(verifyAiBirthcertDeps),
         }
       })()
     : undefined
@@ -2144,6 +2206,7 @@ async function main(): Promise<void> {
       sign: subscribeSign,
       pay: payForCredential,
       resolveSymbol,
+      formatAssetAmount,
       holderDid,
       resolveTemplateFields,
       cache: vcCache,

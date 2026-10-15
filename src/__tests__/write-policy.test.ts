@@ -1763,6 +1763,32 @@ describe('describeAssetAmount is the one amount formatter', () => {
     const failing = (async () => { throw new Error('down') }) as never
     const out = await describeAssetAmount('ZTX3SomeTokenThatCannotBeRead000000', '50000', failing)
     expect(out).toContain('50000')
+    expect(out).toBe('50000 base units of ZTX3SomeTokenThatCannotBeRead000000')
     expect(out).not.toMatch(/\(\d/)
+  })
+})
+
+// a symbol that reads with decimals missing or invalid used to come back as 0 decimals, so the raw count
+// was shown bare beside the ticker ("1000000 JMYR" for 1 JMYR). It reaches users through the policy-write price
+// quote, the cap refusals and both insufficient-funds messages, all of which call describeAssetAmount.
+describe('describeAssetAmount when the decimals cannot be read', () => {
+  const JMYR_ADDR = 'ZTX3Jmyr00000000000000000000000000'
+  const contractInfo = (info: Record<string, unknown>) =>
+    (async () => ({ errorCode: 0, result: { query_rets: [{ result: { value: JSON.stringify({ contractInfo: info }) } }] } })) as never
+
+  it('labels the amount as base units when the symbol reads but decimals are missing', async () => {
+    expect(await describeAssetAmount(JMYR_ADDR, '1000000', contractInfo({ symbol: 'JMYR' }))).toBe('1000000 base units of JMYR')
+  })
+
+  it('labels the amount as base units when decimals are invalid', async () => {
+    expect(await describeAssetAmount(JMYR_ADDR, '1000000', contractInfo({ symbol: 'JMYR', decimals: 'abc' }))).toBe('1000000 base units of JMYR')
+  })
+
+  it('still scales a readable 6-decimal token', async () => {
+    expect(await describeAssetAmount(JMYR_ADDR, '1000000', contractInfo({ symbol: 'JMYR', decimals: '6' }))).toBe('1000000 (1 JMYR)')
+  })
+
+  it('leaves a genuine 0-decimal token unscaled and unlabelled as base units', async () => {
+    expect(await describeAssetAmount(JMYR_ADDR, '1000000', contractInfo({ symbol: 'JMYR', decimals: '0' }))).toBe('1000000 JMYR')
   })
 })

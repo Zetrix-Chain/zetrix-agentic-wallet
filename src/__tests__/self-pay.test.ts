@@ -2250,7 +2250,7 @@ describe('the wiring', () => {
 
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════
-// Review round 2: the note fails closed, is removed only by its own transaction, one send at a time per key,
+// the note fails closed, is removed only by its own transaction, one send at a time per key,
 // and guards the sponsored, collect and remove paths too.
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════
 import { removePolicy } from '../orchestrator/write-policy'
@@ -2500,7 +2500,7 @@ describe('R2-M3: the note guards the sponsored, collect and remove paths too', (
 
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════
-// Review round 3: every path that spends or removes holds the same per-key lock as a self-paid send.
+// every path that spends or removes holds the same per-key lock as a self-paid send.
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════
 import { checkPolicyWrite } from '../orchestrator/write-policy'
 

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { resolveTemplateAlias, deriveTemplateAttributes, validateTemplateAttributes, resolvePassDesignId } from '../template-aliases'
+import { resolveTemplateAlias, deriveTemplateAttributes, validateTemplateAttributes, resolvePassDesignId, isVerifiedAiBirthcertName, aiBirthcertKindOfName } from '../template-aliases'
 
 const TESTNET_ID = 'did:zid:3c0fb79adff08e14e06dcd6e3243205010dd65f533434a3d96c55575d1d3d959'
 const MAINNET_ID = 'did:zid:19091d19049abb8869b4b8e2f4a887bd1d1d86e5f5ebd0c8297000255f67765b'
@@ -140,5 +140,89 @@ describe('validateTemplateAttributes', () => {
 
   it('is a no-op for a templateId with no matching entry', () => {
     expect(validateTemplateAttributes('did:zid:someOtherTemplate', 'zetrix:testnet', { dob: 'bad' })).toEqual([])
+  })
+})
+
+// "Verified AI Birthcert" contains "birthcert", so it resolved to the BASIC template.
+describe('a Verified AI Birthcert name never resolves to the Basic template', () => {
+  it.each(['Verified AI Birthcert', 'verified_ai_birthcert', 'verified birthcert', 'VERIFIED-AI-BIRTH-CERT', 'AI Birthcert (Verified)'])(
+    '%s is the Verified one and does not resolve to the Basic template',
+    (name) => {
+      expect(isVerifiedAiBirthcertName(name)).toBe(true)
+      expect(resolveTemplateAlias(name, 'zetrix:testnet')).toBeUndefined()
+    },
+  )
+
+  it.each(['AI Birthcert', 'Basic AI Birthcert', 'ai-birthcert', 'non-verified AI Birthcert', 'unverified birthcert', 'not verified birthcert'])(
+    '%s is not the Verified one and still resolves to the Basic template',
+    (name) => {
+      expect(isVerifiedAiBirthcertName(name)).toBe(false)
+      expect(resolveTemplateAlias(name, 'zetrix:testnet')).toBe(TESTNET_ID)
+    },
+  )
+
+  it('a raw did:zid id and an unrelated name are not the Verified one', () => {
+    expect(isVerifiedAiBirthcertName(TESTNET_ID)).toBe(false)
+    expect(isVerifiedAiBirthcertName('verified passport')).toBe(false)
+  })
+})
+
+// verification wording means Verified; negated or self-declared wording means Basic.
+describe('the Verified name check reads verification wording and negation', () => {
+  it.each(['birthcert verification', 'AI Birthcert (verify with MyDigital ID)', 'MyDigital ID AI Birthcert', 'MyID verified birthcert'])(
+    '%s is the Verified one',
+    (name) => {
+      expect(isVerifiedAiBirthcertName(name)).toBe(true)
+      expect(resolveTemplateAlias(name, 'zetrix:testnet')).toBeUndefined()
+    },
+  )
+
+  it.each([
+    'AI Birthcert, not yet verified',
+    'AI Birthcert not MyDigital ID verified',
+    'self-verified birthcert',
+    'self-declared AI Birthcert',
+    'AI Birthcert without verification',
+  ])('%s is not the Verified one', (name) => {
+    expect(isVerifiedAiBirthcertName(name)).toBe(false)
+    expect(resolveTemplateAlias(name, 'zetrix:testnet')).toBe(TESTNET_ID)
+  })
+})
+
+// A name with both kinds of wording is unclear, not Basic.
+describe('aiBirthcertKindOfName', () => {
+  it.each([
+    // R3: a negator cancels the word after it, Basic wording too, so these say Verified twice over.
+    ['Verified AI Birthcert, not the basic one', 'verified'],
+    ['Verified AI Birthcert (not self-declared)', 'verified'],
+    ['AI Birthcert, not self-declared but verified', 'verified'],
+    ['Verified basic AI Birthcert', 'unclear'],
+    ['AI Birthcert verifiable credential', 'basic'],
+    ['AI Birthcert with no verification', 'basic'],
+    ['Verified AI Birthcert', 'verified'],
+    ['AI Birthcert', 'basic'],
+    ['verified passport', undefined],
+  ])('%s -> %s', (name, kind) => {
+    expect(aiBirthcertKindOfName(name)).toBe(kind)
+  })
+
+  it('an unclear name resolves to no template, so it is never quietly issued as the Basic one', () => {
+    expect(resolveTemplateAlias('Verified basic AI Birthcert', 'zetrix:testnet')).toBeUndefined()
+    expect(isVerifiedAiBirthcertName('Verified basic AI Birthcert')).toBe(false)
+  })
+})
+
+// whole-word matching sent names written without separators to Basic.
+describe('Verified names without separators', () => {
+  it.each(['VerifiedAIBirthcert', 'verifiedaibirthcert', 'MyIDverified birthcert', 'MyDigitalID AI Birthcert', 'AIBirthcertVerified'])(
+    '%s is the Verified one and never resolves to the Basic template',
+    (name) => {
+      expect(aiBirthcertKindOfName(name)).toBe('verified')
+      expect(resolveTemplateAlias(name, 'zetrix:testnet')).toBeUndefined()
+    },
+  )
+
+  it.each(['AIBirthcertVerifiable', 'unverifiedaibirthcert', 'nonverified birthcert'])('%s is not the Verified one', (name) => {
+    expect(aiBirthcertKindOfName(name)).toBe('basic')
   })
 })

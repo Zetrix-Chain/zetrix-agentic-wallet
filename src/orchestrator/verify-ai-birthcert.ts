@@ -10,6 +10,7 @@
  * — reusing one that is already taken causes issuance to fail downstream.
  */
 
+import type { NextStep } from './next-step.js'
 import { createHash } from 'node:crypto'
 import { canonicalizeJson } from '../canonical-json.js'
 import { withSessionExpiry, sessionExpiryFields, type SessionExpiryFields } from './session-expiry.js'
@@ -23,6 +24,7 @@ import {
   type SsivcSessionOutcome,
 } from '../clients/ssivc-client.js'
 import { orderAccepts, isSponsored, type GasPreference } from '../accept-selection.js'
+import { asPriceConfirmation, gasNote, priceMismatch, quoteOf, type PriceConfirmation } from '../price-confirmation.js'
 import type { PayRequirement } from '../clients/mbi-client.js'
 import type { SsivcSessionStore, StoredSsivcSession } from '../clients/ssivc-session-store.js'
 import type { DownloadQuarantineStore } from '../clients/ssivc-download-quarantine-store.js'
@@ -155,6 +157,28 @@ export interface RequestAiBirthcertVerificationInput {
    * and never needs this field.
    */
   confirmReplaceExistingVc?: string
+  /**
+   * The user's explicit yes to the price: the `quote` object a `needsConfirmation` result returned, echoed back
+   * unchanged (review R1, option A). Anything else (absent, `true`, a partial object) stops at the price and pays nothing.
+   * A confirmed call pays only if the payment request it is about to pay matches the quote field for field (token,
+   * amount, payee, gas model); otherwise it stops and returns the new price. Its `gasModel` also picks which payment
+   * option is used. Not needed when the call pays nothing anyway (the same open link, or a new link reusing an earlier
+   * payment).
+   */
+  confirm?: unknown
+}
+
+/**
+ * A call that would pay, made without `confirm: true`. Nothing was paid and no session was started; the
+ * price is the same free phase-1 quote a dry run returns.
+ */
+export interface RequestVerificationNeedsConfirmation {
+  needsConfirmation: true
+  paidThisCall: false
+  quote: VerificationQuote
+  nextStep: NextStep
+  askUser: string
+  message: string
 }
 
 /** A cached Verified AI Birthcert VC's identifying facts, surfaced back to the caller. */
@@ -172,6 +196,8 @@ export interface ExistingVerifiedVcNote {
 export interface ExistingVerifiedVcBlocked {
   existingVerifiedVc: ExistingVerifiedVcNote
   message: string
+  nextStep?: NextStep
+  askUser?: string
 }
 
 /**
@@ -253,7 +279,13 @@ export interface RequestVerificationPending {
    * fee was taken, in either direction.
    */
   paymentInvalid?: boolean
+  /**
+   * Whether THIS call sent a payment. False when it replayed the receipt of an earlier, unconsumed
+   * payment. See {@link RequestVerificationResult}.
+   */
+  paidThisCall?: boolean
   message: string
+  nextStep?: NextStep
   /** Set only when this call discarded a stuck receipt before this outcome. */
   discardedPaymentReceipt?: string
   /**
@@ -274,9 +306,21 @@ export type RequestVerificationResult =
    * "no automatic re-check happens" rule needs to reach the model through this always-present
    * field, not only through the tool description's prose — the same reasoning behind
    * TELL_USER_UNCONFIRMED/TELL_USER_QUEUED below.
+   *
+   * `paidThisCall` says whether THIS call sent a payment. It is false when the session is an
+   * earlier still-pending one handed back, or a new link made by replaying the receipt of an earlier
+   * payment that no credential has used up yet (an expired link). In the QA run every link looked the
+   * same, and the agent told the user it had paid once per link; `message` then also opens with it.
    */
-  | (SsivcSessionCreated & { discardedPaymentReceipt?: string; replacedExpiredVc?: ExistingVerifiedVcNote; message: string })
+  | (SsivcSessionCreated & {
+      discardedPaymentReceipt?: string
+      replacedExpiredVc?: ExistingVerifiedVcNote
+      paidThisCall: boolean
+      message: string
+      nextStep?: NextStep
+    })
   | RequestVerificationFailure
+  | RequestVerificationNeedsConfirmation
   | { quote: VerificationQuote }
   | RequestVerificationPending
   | ExistingVerifiedVcBlocked
@@ -463,6 +507,31 @@ async function decidePriorSession(
   // than failing closed. `pending` (still in flight) and `issued` (dead receipt) remain the only two
   // statuses handled specially; everything else funnels here.
   return { kind: 'replay_receipt', receipt: stored.paymentReceipt, stored }
+}
+
+/**
+ * An earlier Verified AI Birthcert payment that no credential has used up yet, so the next
+ * `request_ai_birthcert_verification` reuses it instead of paying. For credential_preflight,
+ * which otherwise quoted the fee again and the agent asked the user to agree to a payment the wallet
+ * was never going to make.
+ *
+ * Same rule as {@link decidePriorSession}: only `issued` uses a payment up. `linkOpen` is true while
+ * the stored session is still pending; that link comes back only under the same agentName.
+ *
+ * A record with no session id is a payment still settling (or stuck): the next request replays it too, so it is no
+ * new payment either, but its outcome is not known yet. It is reported with `settling: true` (review R1), so preflight
+ * stops quoting a fee for it and points at check_ai_birthcert_verification, which follows it. A lookup failure other
+ * than a 404 is thrown, never read as "no payment".
+ */
+export async function findUnusedVerificationPayment(
+  deps: Pick<VerifyAiBirthcertDeps, 'ssivc' | 'sessionStore'>,
+): Promise<{ agentName: string; linkOpen: boolean; settling?: true } | undefined> {
+  const stored = await deps.sessionStore.get()
+  if (!stored) return undefined
+  if (stored.sessionId === '') return { agentName: stored.agentName, linkOpen: false, settling: true }
+  const status = await getConfirmedStatus(deps, stored.sessionId)
+  if (status !== 'gone' && status.status === 'issued') return undefined
+  return { agentName: stored.agentName, linkOpen: status !== 'gone' && status.status === 'pending' }
 }
 
 /** Serializes the decide → pay → persist critical section — the MCP host does not
@@ -889,6 +958,20 @@ const TELL_USER_QUEUED =
 const RECHECK_MESSAGE_URGENT_THRESHOLD_SECONDS = 300
 
 /**
+ * Opens `message` when a call handed back a link without paying. In the QA run an expired
+ * link was replaced twice, each time free, and the agent told the user it had paid three times: the
+ * results looked identical and the tool description says the tool spends. The verdict goes first so
+ * that a summary keeps it.
+ */
+const NO_NEW_PAYMENT_REPLAYED =
+  'No new payment was made on this call: this new link uses a payment already made, which is only used ' +
+  'up once the credential is issued. Do not tell the user they paid again, ' +
+  'and do not count this link as another fee. '
+const NO_NEW_PAYMENT_SAME_LINK =
+  'No new payment was made on this call: this is the same link as before, still open, and already ' +
+  'paid for. Do not tell the user they paid again. '
+
+/**
  * Attached to every result where a live SSIVC session now exists but MyDigital ID has not yet
  * confirmed it. The "no automatic re-check" rule needs to reach the model through this
  * always-present field, not only through the tool description's prose — the same reasoning behind
@@ -1252,23 +1335,50 @@ async function payAndCreateSession(
   >,
   buildBody: () => Promise<SsivcSessionRequestBody>,
   onQueued: (receipt: string) => Promise<void>,
+  confirmed: PriceConfirmation,
 ): Promise<{ session: SsivcSessionCreated; paymentReceipt: string }> {
   const challenge = await deps.ssivc.createSessionChallenge(await buildBody())
-  const candidates = orderAccepts(challenge.accepts, deps.gasPreference ?? 'sponsored')
+  // The confirmed gas model picks the option (review R1): the user agreed to that option's price, not the other's.
+  const candidates = orderAccepts(challenge.accepts, confirmed.gasModel)
   const primary = candidates[0]
   if (!primary) throw new NoPaymentOptionsError('SSIVC 402 returned no usable payment options')
+  const difference = priceMismatch(confirmed, quoteOf(primary))
+  if (difference) throw new PriceChangedError(verificationQuoteOf(primary), difference)
 
   try {
     return await attemptCandidate(deps, primary, buildBody, onQueued)
   } catch (err) {
-    // Fall back sponsored -> self-pay ONLY. Never the reverse: if the caller asked to self-pay we
-    // must not silently spend platform-subsidised gas instead. And never on an indeterminate
-    // outcome, where the first payment may still settle (see Global Constraints).
+    // Sponsored refused before any money moved: self-pay is the only option left, but it is a different price (its
+    // own token and amount, plus ZTX gas), so it is offered to the user rather than paid (review R1). Never the
+    // reverse, and never on an indeterminate outcome, where the first payment may still settle.
     const fallback = candidates[1]
     if (!fallback || !isSponsored(primary) || isSponsored(fallback) || !isDefinitiveSponsorshipFailure(err)) {
       throw await toFacilitatorInsufficientFundsError(err, primary, deps.formatAssetAmount)
     }
-    return await attemptCandidate(deps, fallback, buildBody, onQueued)
+    throw new PriceChangedError(
+      verificationQuoteOf(fallback),
+      'the sponsored option was refused before anything was paid, and the only option left is paying the network gas yourself, at its own price',
+    )
+  }
+}
+
+/** A payment option as the quote a `needsConfirmation` result carries. */
+function verificationQuoteOf(accept: PayRequirement): VerificationQuote {
+  const q = quoteOf(accept)
+  return { asset: q.asset, maxAmountRequired: q.maxAmountRequired, ...(q.payTo ? { payTo: q.payTo } : {}), gasModel: q.gasModel }
+}
+
+/**
+ * The payment request about to be paid is not the one the user confirmed (review R1, option A). Thrown before
+ * `deps.pay`, so nothing was paid; it becomes a `needsConfirmation` result carrying the request's own price.
+ */
+class PriceChangedError extends Error {
+  constructor(
+    readonly quote: VerificationQuote,
+    readonly difference: string,
+  ) {
+    super(`price changed: ${difference}`)
+    this.name = 'PriceChangedError'
   }
 }
 
@@ -1278,7 +1388,90 @@ export async function requestAiBirthcertVerification(
 ): Promise<RequestVerificationResult> {
   // Every session this tool hands back carries the time left, worked out here from the
   // wallet's own clock, so the host agent never has to do timezone arithmetic itself.
-  return withSessionExpiry(await requestAiBirthcertVerificationInner(deps, input), deps.now())
+  return withNextStep(withSessionExpiry(await requestAiBirthcertVerificationInner(deps, input), deps.now()))
+}
+
+/**
+ * The one decision in each result, as a field. An error says follow_message: its text says what to tell the user
+ * and often names the next step (check_ai_birthcert_verification, clear_stuck_payment_receipt), so a bare "stop" would
+ * strand a model that follows the field (review R2).
+ */
+function withNextStep(result: RequestVerificationResult): RequestVerificationResult {
+  if ('needsConfirmation' in result) return result
+  if ('error' in result) return { ...result, nextStep: 'follow_message' }
+  if ('existingVerifiedVc' in result) {
+    const until = result.existingVerifiedVc.validUntil ? `, valid until ${result.existingVerifiedVc.validUntil.slice(0, 10)}` : ''
+    return {
+      ...result,
+      nextStep: 'ask_user_whether_to_replace',
+      askUser: `You already have a Verified AI Birthcert${until}. Do you want to replace it?`,
+    }
+  }
+  if ('settlementPending' in result) {
+    // A refusal or a ruling on the payment is not something to wait out: its `message` says what to tell the user.
+    return { ...result, nextStep: result.issuerRejected || result.paymentInvalid ? 'follow_message' : 'wait_then_check' }
+  }
+  if ('sessionId' in result) return { ...result, nextStep: 'show_link_and_wait' }
+  return result
+}
+
+/**
+ * The price, and the question to ask, for a call that would pay but was not confirmed. The quote is the free
+ * phase-1 challenge, so nothing moves and no session is created.
+ */
+async function askToConfirmPayment(
+  deps: VerifyAiBirthcertDeps,
+  agentName: string,
+  input: RequestAiBirthcertVerificationInput,
+  lead = '',
+): Promise<RequestVerificationResult> {
+  const quoted = await quoteVerification(deps, agentName, input)
+  if (!('quote' in quoted)) return quoted
+  return needsConfirmationResult(deps, quoted.quote, lead)
+}
+
+/** The price stop itself, for a quote already in hand (an unconfirmed call, or a payment request that changed). */
+async function needsConfirmationResult(
+  deps: VerifyAiBirthcertDeps,
+  quote: VerificationQuote,
+  lead: string,
+  afterDiscard = false,
+): Promise<RequestVerificationNeedsConfirmation> {
+  const display = (await renderPrice(deps.formatAssetAmount, quote.asset, quote.maxAmountRequired)) + gasNote(quote)
+  // After a discard the receipt is gone, so repeating discardStuckReceiptAndPayFresh would be refused (review R2).
+  const keep = afterDiscard
+    ? `The stuck receipt was already discarded on this call, so call again WITHOUT discardStuckReceiptAndPayFresh, keeping ` +
+      `every other argument the same.`
+    : `Keep every other argument the same (confirmReplaceExistingVc and discardStuckReceiptAndPayFresh too, if you sent them).`
+  return {
+    needsConfirmation: true,
+    paidThisCall: false,
+    quote,
+    nextStep: 'ask_user_to_confirm_payment',
+    askUser: `Starting the Verified AI Birthcert verification costs ${display}. Shall I go ahead?`,
+    message:
+      `NOT PAID YET: ${lead}starting this verification costs ${display}, and nothing has been paid. Tell the user the price ` +
+      `and ask. Only after their explicit yes to this payment, call again with confirm set to this exact quote object ` +
+      `(asset, maxAmountRequired, payTo, gasModel, unchanged). ${keep} A yes to something else, such as the name, is not a ` +
+      `yes to the payment; confirm: true is not accepted.`,
+  }
+}
+
+/** A price in whole tokens when the wallet can resolve decimals; never a bare base-unit number presented as tokens. */
+async function renderPrice(
+  formatAssetAmount: ((asset: string, raw: string) => Promise<string>) | undefined,
+  asset: string,
+  raw: string,
+): Promise<string> {
+  if (raw === '') return `an amount the service did not state (asset "${asset}")`
+  if (formatAssetAmount) {
+    try {
+      return await formatAssetAmount(asset, raw)
+    } catch {
+      // Falls through to the raw form below, which says what it is.
+    }
+  }
+  return `${raw} base units of asset "${asset}"`
 }
 
 async function requestAiBirthcertVerificationInner(
@@ -1398,6 +1591,7 @@ async function quoteVerification(
 async function discardStuckReceiptBeforePaying(
   deps: Pick<VerifyAiBirthcertDeps, 'sessionStore' | 'now' | 'settlementStuckAfterMs'>,
   confirmReceiptId: string,
+  options: { checkOnly?: boolean } = {},
 ): Promise<{ refusal: RequestVerificationFailure } | { discarded: string }> {
   const stored = await deps.sessionStore.get()
   if (!stored) {
@@ -1449,6 +1643,7 @@ async function discardStuckReceiptBeforePaying(
       },
     }
   }
+  if (options.checkOnly) return { discarded: stored.paymentReceipt }
   await deps.sessionStore.clear()
   return { discarded: stored.paymentReceipt }
 }
@@ -1649,8 +1844,9 @@ async function checkExistingVerifiedVc(
  */
 function canCarryReplacedExpiredVc(
   result: RequestVerificationResult,
-): result is (SsivcSessionCreated & { discardedPaymentReceipt?: string; message: string }) | RequestVerificationPending {
-  return typeof result === 'object' && result !== null && !('error' in result)
+): result is (SsivcSessionCreated & { discardedPaymentReceipt?: string; paidThisCall: boolean; message: string }) | RequestVerificationPending {
+  // Not a price stop: nothing has replaced anything yet (review R1, M1).
+  return typeof result === 'object' && result !== null && !('error' in result) && !('needsConfirmation' in result)
 }
 
 async function requestAiBirthcertVerificationLocked(
@@ -1680,6 +1876,18 @@ async function requestAiBirthcertVerificationLockedInner(
   // see an empty store and take the pay-fresh path instead of replaying the receipt forever.
   if (input.discardStuckReceiptAndPayFresh === undefined) {
     return payOrReplayLocked(deps, agentName, input)
+  }
+  // Paying again is a payment like any other, so it stops at the price first (review R1). Checked before anything is
+  // discarded, so an unconfirmed call leaves the receipt where it was; the same refusals as the real discard apply.
+  if (!asPriceConfirmation(input.confirm)) {
+    const check = await discardStuckReceiptBeforePaying(deps, input.discardStuckReceiptAndPayFresh, { checkOnly: true })
+    if ('refusal' in check) return check.refusal
+    return askToConfirmPayment(
+      deps,
+      agentName,
+      input,
+      `receipt ${input.discardStuckReceiptAndPayFresh} has NOT been discarded yet. Starting over forfeits it and `,
+    )
   }
   const outcome = await discardStuckReceiptBeforePaying(deps, input.discardStuckReceiptAndPayFresh)
   if ('refusal' in outcome) return outcome.refusal
@@ -1727,8 +1935,17 @@ async function payOrReplayLocked(
 ): Promise<RequestVerificationResult> {
   const decision = await decidePriorSession(deps, agentName)
   if (decision.kind === 'still_pending')
-    return { ...decision.result, message: noAutoRecheckMessage(decision.result.expiresAt, deps.now()) }
+    return {
+      ...decision.result,
+      paidThisCall: false,
+      message: NO_NEW_PAYMENT_SAME_LINK + noAutoRecheckMessage(decision.result.expiresAt, deps.now()),
+    }
   if (decision.kind === 'blocked') return { error: decision.message }
+  // a call that would pay stops at the price unless the user has said yes. Not a replay (it pays nothing), and
+  // not discardStuckReceiptAndPayFresh: its exact receipt id is the user's agreement to pay again, and by now it has
+  // already discarded that receipt, so stopping here would strand them.
+  const confirmed = asPriceConfirmation(input.confirm)
+  if (decision.kind === 'pay_fresh' && !confirmed) return askToConfirmPayment(deps, agentName, input)
 
   /**
    * The optional fields this request should carry: what was already paid for, with an explicit
@@ -1825,6 +2042,8 @@ async function payOrReplayLocked(
         { ...deps, gasPreference: requestedGasPayer ?? deps.gasPreference },
         buildBody,
         persistQueuedReceipt,
+        // Set on this path: the gate above returned for an unconfirmed fresh payment.
+        confirmed as PriceConfirmation,
       )
     }
   } catch (rawErr) {
@@ -1845,6 +2064,15 @@ async function payOrReplayLocked(
       }
     }
     if (err instanceof NoPaymentOptionsError) return { error: err.message }
+    if (err instanceof PriceChangedError) {
+      return needsConfirmationResult(
+        deps,
+        err.quote,
+        `the payment request is not what the user agreed to (${err.difference}), so nothing was paid. The new price: `,
+        // payOrReplayLocked runs with this set only after the receipt has been discarded (requestAiBirthcertVerificationLockedInner).
+        input.discardStuckReceiptAndPayFresh !== undefined,
+      )
+    }
     if (err instanceof FacilitatorInsufficientFundsError) return { error: err.message }
     if (err instanceof SettlementStillQueuedError) {
       // Redundant refresh: the receipt was already persisted by persistQueuedReceipt the moment it
@@ -1886,7 +2114,7 @@ async function payOrReplayLocked(
             `this receipt id to support to resume manually.`,
         }
       }
-      return { settlementPending: true, paymentReceipt: err.paymentReceipt, message: err.message }
+      return { settlementPending: true, paymentReceipt: err.paymentReceipt, paidThisCall, message: err.message }
     }
     // REQ-37/AC-17 (SPEC.md §5.1/§11): a 409 means our fresh X-Payment blob was already settled —
     // most likely a prior attempt's settlement succeeded but its response was lost before we could
@@ -1985,6 +2213,7 @@ async function payOrReplayLocked(
           paymentReceipt: err.paymentReceipt,
           settlementPending: true,
           issuerRejected: true,
+          paidThisCall,
           message: agentNameInUseMessage(err.cause, agentName, paidThisCall, err.paymentReceipt),
         }
       }
@@ -1993,6 +2222,7 @@ async function payOrReplayLocked(
           paymentReceipt: err.paymentReceipt,
           settlementPending: true,
           paymentInvalid: true,
+          paidThisCall,
           // paidThisCall, because on the fresh-pay route deps.pay already ran on THIS call
           // before SSIVC ruled on the receipt. The builder's default wording denies that.
           message: paymentInvalidMessage(err.cause, err.paymentReceipt, age.humanAge, paidThisCall),
@@ -2003,6 +2233,7 @@ async function payOrReplayLocked(
           paymentReceipt: err.paymentReceipt,
           settlementPending: true,
           issuerRejected: true,
+          paidThisCall,
           // See the paymentInvalidMessage call just above.
           message: issuerRejectionMessage(err.cause, err.paymentReceipt, age.humanAge, paidThisCall),
         }
@@ -2011,6 +2242,7 @@ async function payOrReplayLocked(
         return {
           paymentReceipt: err.paymentReceipt,
           settlementPending: true,
+          paidThisCall,
           // The paidThisCall half does not open with "Nothing is lost". A fee was spent on
           // this very call with an outcome nobody knows yet, so "nothing is lost" sitting against that
           // admission reads as reassurance the wallet cannot give. The replay half keeps it: there
@@ -2068,7 +2300,11 @@ async function payOrReplayLocked(
     ...effectiveOptionalFields,
   })
 
-  return { ...paid.session, message: noAutoRecheckMessage(paid.session.expiresAt, deps.now()) }
+  return {
+    ...paid.session,
+    paidThisCall,
+    message: (paidThisCall ? '' : NO_NEW_PAYMENT_REPLAYED) + noAutoRecheckMessage(paid.session.expiresAt, deps.now()),
+  }
 }
 
 /**

@@ -369,3 +369,29 @@ describe('checkAffordability — every problem line is bounded, wherever the fig
     for (const p of r.problems) expect(p.endsWith('…'), p).toBe(false)
   })
 })
+
+describe('checkAffordability — when the fee asset decimals could not be read', () => {
+  it('labels the quote AND the balance as base units in one unit, never the bare display', async () => {
+    const { d } = deps({ [JMYR]: bal('JMYR', '473', null), ZTX: bal('ZTX', '2000000') })
+    const r = await checkAffordability(d, SELF_PAID)
+
+    expect(r.fee.status).toBe('short')
+    const text = r.problems.join(' ')
+    expect(text).toContain('the quote is 1000000 base units of JMYR, the balance is 473 base units of JMYR')
+    expect(text).not.toMatch(/the balance is 473 JMYR/)
+  })
+
+  it('labels fee.display as base units on every status, not the client bare count', async () => {
+    const { d } = deps({ [JMYR]: bal('JMYR', '5000000', null), ZTX: bal('ZTX', '2000000') })
+    const r = await checkAffordability(d, SELF_PAID)
+
+    expect(r.fee).toMatchObject({ status: 'enough', balance: '5000000', display: '5000000 base units of JMYR' })
+  })
+
+  it('still reports whole tokens when decimals are known', async () => {
+    const { d } = deps({ [JMYR]: bal('JMYR', '5000000'), ZTX: bal('ZTX', '2000000') })
+    const r = await checkAffordability(d, SELF_PAID)
+
+    expect(r.fee).toMatchObject({ status: 'enough', display: '5 JMYR' })
+  })
+})

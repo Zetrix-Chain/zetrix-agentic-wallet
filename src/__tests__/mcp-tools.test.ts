@@ -11,7 +11,7 @@ function makeDeps() {
   const makeWallet = vi.fn().mockReturnValue(wallet)
   const payer = vi.fn().mockResolvedValue({ status: 200, body: 'ok', paymentMade: false, amountPaid: '', amountPaidHuman: '', asset: '' })
   const mbi = {
-    applyChallenge: vi.fn().mockResolvedValue({ x402Version: 2, accepts: [{ extra: { paymentId: 'pid' } }], paymentId: 'pid' }),
+    applyChallenge: vi.fn().mockResolvedValue({ x402Version: 2, accepts: [{ asset: 'ZTX', maxAmountRequired: '1', payTo: 'ZTXp', extra: { paymentId: 'pid' } }], paymentId: 'pid' }),
     applySettle: vi.fn().mockResolvedValue({ vcId: 'vc-1', verifiableCredential: { id: 'vc' }, txHash: '0x' }),
   }
   const sign = vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' })
@@ -147,10 +147,10 @@ describe('createTools', () => {
 
   it('subscribe_and_issue runs the MBI flow and returns the issued VC', async () => {
     const { deps, mbi, pay } = makeDeps()
-    const out = await createTools(deps).subscribe_and_issue({ templateId: 'did:zid:t', attributes: { name: 'x' } })
+    const out = await createTools(deps).subscribe_and_issue({ templateId: 'did:zid:t', attributes: { name: 'x' }, confirm: { asset: 'ZTX', maxAmountRequired: '1', payTo: 'ZTXp', gasModel: 'self' } })
     expect(mbi.applyChallenge).toHaveBeenCalled()
     expect(pay).toHaveBeenCalled()
-    expect(out).toEqual({ issued: true, vcId: 'vc-1', vc: { id: 'vc' }, txHash: '0x', paidAsset: '', amountPaid: '' })
+    expect(out).toEqual({ issued: true, vcId: 'vc-1', vc: { id: 'vc' }, txHash: '0x', paidAsset: 'ZTX', amountPaid: '1', nextStep: 'show_credential' })
   })
 
   it('subscribe_and_issue resolves a natural-language alias to the network-appropriate templateId', async () => {
@@ -207,7 +207,7 @@ describe('createTools', () => {
     const out = await createTools({
       ...deps,
       subscribeDeps: { ...deps.subscribeDeps, passDesignId: 'did:zid:stale-inherited-pass-design' } as never,
-    }).subscribe_and_issue({ templateId: 'did:zid:t', attributes: { name: 'x' } })
+    }).subscribe_and_issue({ templateId: 'did:zid:t', attributes: { name: 'x' }, confirm: { asset: 'ZTX', maxAmountRequired: '1', payTo: 'ZTXp', gasModel: 'self' } })
     const sentData = JSON.parse((mbi.applyChallenge.mock.calls[0][0] as { data: string }).data)
     expect(sentData[0]).not.toHaveProperty('passDesignId')
     expect(out.issued).toBe(true)
@@ -500,6 +500,15 @@ describe('createTools — AI Birthcert verification', () => {
     expect(request).toHaveBeenCalledWith(expect.objectContaining({ gasPayer: 'self' }))
   })
 
+  // the user's yes reaches the orchestrator, which pays only with it.
+  it('request_ai_birthcert_verification passes confirm through', async () => {
+    const { deps } = makeDeps()
+    const request = vi.fn().mockResolvedValue({ sessionId: 's-1' })
+    const tools = createTools({ ...deps, verifyAiBirthcert: { request, check: vi.fn() } } as never)
+    await tools.request_ai_birthcert_verification({ agentName: 'A', confirm: { asset: 'ZTX', maxAmountRequired: '1', payTo: 'ZTXp', gasModel: 'self' } } as never)
+    expect(request).toHaveBeenCalledWith(expect.objectContaining({ confirm: { asset: 'ZTX', maxAmountRequired: '1', payTo: 'ZTXp', gasModel: 'self' } }))
+  })
+
   it('omits gasPayer when the caller does not set it, so the config default applies', async () => {
     const { deps } = makeDeps()
     const request = vi.fn().mockResolvedValue({ session: { sessionId: 's-1' } })
@@ -508,6 +517,25 @@ describe('createTools — AI Birthcert verification', () => {
     await tools.request_ai_birthcert_verification({ agentName: 'A' })
     const arg = request.mock.calls[0][0]
     expect(arg.gasPayer).toBeUndefined()
+  })
+
+  // the tool layer passes the earlier-payment lookup through to preflight for the Verified one.
+  it('credential_preflight for the Verified AI Birthcert reports an earlier payment the next link reuses', async () => {
+    const { deps } = makeDeps()
+    const JMYR = 'ZTX3WeinXtt28YMyr4vUZ14ddTgEMGeuc1e6b'
+    const request = vi.fn().mockResolvedValue({ quote: { asset: JMYR, maxAmountRequired: '1000000', gasModel: 'sponsored' } })
+    const findUnusedPayment = vi.fn().mockResolvedValue({ agentName: 'PMRBot', linkOpen: false })
+    const queryTokenBalance = vi.fn(async () => ({ token: 'JMYR', balance: '0', decimals: 6, display: '0 JMYR' }))
+    const tools = createTools({
+      ...deps,
+      queryTokenBalance,
+      paymentCaps: { [JMYR]: '5000000' },
+      verifyAiBirthcert: { request, check: vi.fn(), clearStuckReceipt: vi.fn(), findUnusedPayment },
+    } as never)
+    const out = (await tools.credential_preflight({ credential: 'verified_ai_birthcert' })) as unknown as Record<string, unknown>
+    expect(findUnusedPayment).toHaveBeenCalledTimes(1)
+    expect(out.unusedPayment).toMatchObject({ agentName: 'PMRBot', linkOpen: false })
+    expect(out.ready).toBe(true)
   })
 
   // Pricing a template used to go through subscribe_and_issue({ dryRun: true }), which calls
@@ -1313,4 +1341,79 @@ describe('create_verification_qr', () => {
       expect(out).toEqual({ created: false, reason: 'MBI said no' })
     })
   })
+})
+
+// a loose name for the Verified AI Birthcert was priced, or issued, as the Basic one.
+describe('a loose Verified AI Birthcert name', () => {
+  const JMYR = 'ZTX3WeinXtt28YMyr4vUZ14ddTgEMGeuc1e6b'
+
+  it.each(['Verified AI Birthcert', 'verified birthcert'])('credential_preflight treats %s as the Verified one', async (name) => {
+    const { deps } = makeDeps()
+    const request = vi.fn().mockResolvedValue({ quote: { asset: JMYR, maxAmountRequired: '1000000', gasModel: 'sponsored' } })
+    const queryTokenBalance = vi.fn(async () => ({ token: 'JMYR', balance: '5000000', decimals: 6, display: '5 JMYR' }))
+    const tools = createTools({
+      ...deps,
+      queryTokenBalance,
+      paymentCaps: { [JMYR]: '5000000' },
+      verifyAiBirthcert: { request, check: vi.fn(), clearStuckReceipt: vi.fn() },
+    } as never)
+    const out = (await tools.credential_preflight({ credential: name })) as unknown as Record<string, unknown>
+    expect(request).toHaveBeenCalledWith(expect.objectContaining({ dryRun: true }))
+    expect(out.credential).toBe('verified_ai_birthcert')
+  })
+
+  it('subscribe_and_issue refuses a Verified name, pays nothing, and points at request_ai_birthcert_verification', async () => {
+    const { deps, mbi } = makeDeps()
+    const out = (await createTools(deps).subscribe_and_issue({ templateId: 'Verified AI Birthcert', attributes: { agentUsername: 'PMRBot' } })) as unknown as Record<
+      string,
+      unknown
+    >
+    expect(out.issued).toBe(false)
+    expect(String(out.reason)).toMatch(/request_ai_birthcert_verification/)
+    expect(String(out.reason)).toMatch(/nothing was paid/i)
+    expect(mbi.applyChallenge).not.toHaveBeenCalled()
+  })
+})
+
+// a name mixing Basic and Verified wording is asked about, never issued or priced as either.
+describe('an AI Birthcert name that mixes both kinds', () => {
+  const name = 'Verified basic AI Birthcert'
+
+  it('subscribe_and_issue refuses it and pays nothing', async () => {
+    const { deps, mbi } = makeDeps()
+    const out = (await createTools(deps).subscribe_and_issue({ templateId: name, attributes: { agentUsername: 'X' } })) as unknown as Record<string, unknown>
+    expect(out.issued).toBe(false)
+    expect(String(out.reason)).toMatch(/does not say clearly/i)
+    expect(String(out.reason)).toMatch(/nothing was paid/i)
+    expect(mbi.applyChallenge).not.toHaveBeenCalled()
+  })
+
+  it('credential_preflight asks which kind instead of pricing either', async () => {
+    const { deps } = makeDeps()
+    const request = vi.fn()
+    const out = (await createTools({
+      ...deps,
+      queryTokenBalance: vi.fn(),
+      verifyAiBirthcert: { request, check: vi.fn(), clearStuckReceipt: vi.fn() },
+    } as never).credential_preflight({ credential: name })) as unknown as Record<string, unknown>
+    expect(request).not.toHaveBeenCalled()
+    expect(out.ready).toBe(false)
+    expect(String((out.blockers as string[])[0])).toMatch(/does not say clearly/i)
+    expect(out.nextStep).toBe('resolve_blockers')
+  })
+})
+
+// the price question names the credential, so a yes is to the kind the user meant.
+it('subscribe_and_issue names the Basic AI Birthcert in its price question', async () => {
+  const { deps, mbi } = makeDeps()
+  ;(mbi as Record<string, unknown>).quote = vi.fn().mockResolvedValue({
+    accepts: [{ asset: 'ZTX', maxAmountRequired: '1', payTo: 'ZTXp', extra: { paymentId: 'pid' } }],
+    paymentRequired: true,
+  })
+  const out = (await createTools(deps).subscribe_and_issue({ templateId: 'AI Birthcert', attributes: { agentUsername: 'X' } })) as unknown as Record<
+    string,
+    unknown
+  >
+  expect(out.needsConfirmation).toBe(true)
+  expect(String(out.askUser)).toMatch(/Issuing this Basic AI Birthcert \(self-declared, not identity-verified\) costs/)
 })

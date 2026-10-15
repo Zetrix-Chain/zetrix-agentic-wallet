@@ -9,7 +9,13 @@ import { MbiError } from '../clients/mbi-client'
 import type { DownloadQuarantineStore } from '../clients/ssivc-download-quarantine-store'
 
 const holderDid = 'did:zid:holder-self-1'
-const opts = { templateId: 'did:zid:t-1', attributes: { agentName: 'Jak Sparrow', purpose: 'x401+x402' } }
+// confirm: true, so the tests below reach the payment they are about.
+const opts = {
+  templateId: 'did:zid:t-1',
+  attributes: { agentName: 'Jak Sparrow', purpose: 'x401+x402' },
+  // The quote for `accept` below, echoed back; the raw asset counts as the same token.
+  confirm: { asset: 'ZTX3jmyrcontract0000000000000000000', maxAmountRequired: '1000000', payTo: 'ZTXissuer', gasModel: 'self' },
+}
 // `data` on the wire is the raw JSON; the sign `blob` is the canonical hex of
 // HexFormat.hexStringToBytes(data) — the exact bytes MBI's holder-signature verifier checks.
 // agentDid is auto-filled from the wallet's own holderDid (self-referential credential subject).
@@ -45,7 +51,7 @@ describe('subscribeAndIssue', () => {
       'X-PAYMENT-B64',
     )
     expect(resolveSymbol).toHaveBeenCalledWith('ZTX3jmyrcontract0000000000000000000')
-    expect(out).toEqual({
+    expect(out).toEqual({ nextStep: 'show_credential',
       issued: true, vcId: 'did:zid:vc', vc: { id: 'vc' }, txHash: '0xabc',
       paidAsset: 'JMYR', amountPaid: '1000000',
       schema: { required: [], optional: ['agentDid', 'agentName', 'purpose'] },
@@ -180,7 +186,7 @@ describe('subscribeAndIssue', () => {
 
     const out = await subscribeAndIssue(
       { mbi, sign, pay, holderDid, resolveTemplateFields },
-      { templateId: 'did:zid:t-1', attributes: undefined as unknown as Record<string, unknown> },
+      { templateId: 'did:zid:t-1', attributes: undefined as unknown as Record<string, unknown>, confirm: opts.confirm },
     )
 
     const dataSent = JSON.stringify([{ templateId: 'did:zid:t-1', metadata: { agentDid: holderDid } }])
@@ -226,7 +232,7 @@ describe('subscribeAndIssue', () => {
 
     const out = await subscribeAndIssue({ mbi, sign, pay, holderDid }, { ...opts, templateId: 'agent-identity' })
 
-    expect(out).toEqual({
+    expect(out).toEqual({ nextStep: 'follow_message',
       issued: false,
       reason: 'templateId must be a did:zid:... credential-definition id, got "agent-identity"',
     })
@@ -334,7 +340,7 @@ describe('subscribeAndIssue', () => {
     expect(mbi.applyChallenge).not.toHaveBeenCalled()
     expect(sign).not.toHaveBeenCalled()
     expect(pay).not.toHaveBeenCalled()
-    expect(out).toEqual({
+    expect(out).toEqual({ nextStep: 'follow_message',
       issued: false,
       reason:
         'dry run unavailable — this wallet has no MBI quote client, and pricing any other way risks issuing the credential',
@@ -387,7 +393,7 @@ describe('subscribeAndIssue', () => {
 
     const out = await subscribeAndIssue({ mbi, sign, pay, holderDid, resolveTemplateFields }, opts)
 
-    expect(out).toEqual({
+    expect(out).toEqual({ nextStep: 'follow_message',
       issued: false,
       reason: 'template requires attribute(s) not supplied: controllerDid — no payment made',
       schema: { required: ['agentName', 'purpose', 'controllerDid'], optional: [] },
@@ -488,7 +494,7 @@ describe('subscribeAndIssue', () => {
     expect(mbi.applyChallenge).not.toHaveBeenCalled()
     expect(pay).not.toHaveBeenCalled()
     expect(mbi.applySettle).not.toHaveBeenCalled()
-    expect(out).toEqual({
+    expect(out).toEqual({ nextStep: 'follow_message',
       issued: false,
       reason: 'template requires attribute(s) not supplied: controllerDid — no payment made',
       schema: { required: ['agentDid', 'agentName', 'purpose', 'controllerDid'], optional: [] },
@@ -541,7 +547,7 @@ describe('subscribeAndIssue', () => {
 
     const out = await subscribeAndIssue({ mbi, sign, pay, holderDid }, opts)
 
-    expect(out).toEqual({
+    expect(out).toEqual({ nextStep: 'follow_message',
       issued: false,
       reason: 'MBI apply (phase 1) expected 402 — HTTP 404: Template not found, inactive, or not issued by the configured issuer',
       httpStatus: 404,
@@ -562,7 +568,7 @@ describe('subscribeAndIssue', () => {
 
     const out = await subscribeAndIssue({ mbi, sign, pay, holderDid, resolveTemplateFields }, opts)
 
-    expect(out).toEqual({
+    expect(out).toEqual({ nextStep: 'follow_message',
       issued: false,
       reason: 'MBI apply (phase 2) failed — HTTP 400: X402_SIGNATURE_INVALID',
       httpStatus: 400,
@@ -630,7 +636,7 @@ describe('subscribeAndIssue', () => {
     expect(mbi.applySettle).not.toHaveBeenCalled()
     expect(cache.set).not.toHaveBeenCalled()
     expect(out).toEqual({
-      issued: true, vcId: 'did:zid:vc-cached', vc: { id: 'cached-vc' }, fromCache: true,
+      issued: false, alreadyHeld: true, nextStep: 'tell_user_already_held', reason: expect.stringMatching(/^Already held/), vcId: 'did:zid:vc-cached', vc: { id: 'cached-vc' }, fromCache: true,
       originalPayment: { txHash: '0xold', asset: 'JMYR', amount: '1000000' },
     })
   })
@@ -674,7 +680,9 @@ describe('subscribeAndIssue', () => {
       opts,
     )
 
-    expect(out).toEqual({ issued: true, vcId: 'did:zid:vc-free', vc: { id: 'free-vc' }, fromCache: true })
+    expect(out).toEqual({
+      issued: false, alreadyHeld: true, nextStep: 'tell_user_already_held', reason: expect.stringMatching(/^Already held/), vcId: 'did:zid:vc-free', vc: { id: 'free-vc' }, fromCache: true,
+    })
   })
 
   it('ignores an expired cached VC and pays + issues fresh, overwriting the stale cache entry', async () => {
@@ -808,7 +816,7 @@ describe('subscribeAndIssue', () => {
     const out = await subscribeAndIssue({ mbi, sign, pay, holderDid, cache }, { ...opts, confirmReplaceExistingVc: 'did:zid:vc-old' })
 
     expect(pay).not.toHaveBeenCalled()
-    expect(out).toMatchObject({ issued: true, vc: { id: 'old' }, vcId: 'did:zid:vc-old', fromCache: true })
+    expect(out).toMatchObject({ issued: false, alreadyHeld: true, vc: { id: 'old' }, vcId: 'did:zid:vc-old', fromCache: true })
   })
 
   // A cached entry can be valid but carry no `vcId` (an older record, or a writer that omitted it)
@@ -976,7 +984,7 @@ describe('subscribeAndIssue', () => {
 
     expect(pay).not.toHaveBeenCalled()
     expect(mbi.applySettle).not.toHaveBeenCalled()
-    expect(out).toEqual({
+    expect(out).toEqual({ nextStep: 'show_credential',
       issued: true, vcId: 'did:zid:vc-free', vc: { id: 'vc-free' }, txHash: '0xfree',
       paidAsset: 'none', amountPaid: '0',
     })
@@ -1060,7 +1068,7 @@ describe('subscribeAndIssue', () => {
     const out = await subscribeAndIssue({ mbi, sign, pay, holderDid, resolveTemplateFields }, opts)
 
     expect(mbi.applySettle).not.toHaveBeenCalled()
-    expect(out).toEqual({
+    expect(out).toEqual({ nextStep: 'follow_message',
       issued: false,
       reason: 'insufficient funds: Insufficient JMYR: required 1000000, available 200000',
       insufficientFunds: shortfall,
@@ -1235,7 +1243,8 @@ describe('subscribeAndIssue — stale cached attributes', () => {
 
     const out = await subscribeAndIssue({ ...idle, cache, resolveTemplateFields }, opts)
 
-    expect(out.issued).toBe(true)
+    expect(out.issued).toBe(false) // already held, not issued
+    expect(out.alreadyHeld).toBe(true)
     expect(idle.pay).not.toHaveBeenCalled()
     expect(cache.set).not.toHaveBeenCalled()
   })
@@ -1435,5 +1444,332 @@ describe('subscribeAndIssue — VC pass image (extraData.vcPassBase64 from /v1/v
 
     expect(out.vcPassImagePaths).toHaveLength(1)
     expect(readFileSync(out.vcPassImagePaths![0], 'utf8')).toBe('free-pass-bytes')
+  })
+})
+
+// a Basic AI Birthcert asked for under a new username came back as issued: true with the cached
+// one, username PMRBot, so the agent told the user a new credential had been issued under the name they gave.
+describe('a cache hit is reported as already held, not as issued', () => {
+  const held = {
+    templateId: 'did:zid:t-1', vcId: 'did:zid:vc-held', issuedAt: '2026-07-01T00:00:00Z', validUntil: '2099-01-01T00:00:00Z',
+    vc: { id: 'held', credentialSubject: { agentUsername: 'PMRBot', id: 'PMRBot', agentDid: holderDid } },
+  }
+  const run = (attributes: Record<string, unknown>) =>
+    subscribeAndIssue(
+      {
+        mbi: { applyChallenge: vi.fn(), applySettle: vi.fn() },
+        sign: vi.fn(),
+        pay: vi.fn(),
+        holderDid,
+        cache: { get: vi.fn().mockResolvedValue(held), set: vi.fn(), list: vi.fn() },
+      },
+      { ...opts, attributes },
+    )
+
+  it('says issued: false and alreadyHeld: true, and that nothing new was issued or paid', async () => {
+    const out = await run({ agentUsername: 'PMRBot' })
+    expect(out.issued).toBe(false)
+    expect(out.alreadyHeld).toBe(true)
+    expect(out.reason).toMatch(/^Already held/)
+    expect(out.reason).toMatch(/nothing was paid and no new credential was issued/i)
+    expect(out.reason).toMatch(/do not tell the user it was just issued/i)
+    expect(out.differsFromRequest).toBeUndefined()
+  })
+
+  it('names a requested value that differs from the held one, and asks the user', async () => {
+    const out = await run({ agentUsername: 'QA Basic' })
+    expect(out.differsFromRequest).toEqual([{ attribute: 'agentUsername', held: 'PMRBot', requested: 'QA Basic' }])
+    expect(out.reason).toMatch(/agentUsername "PMRBot", not the "QA Basic" asked for/)
+    expect(out.reason).toMatch(/ask the user whether to keep it or replace it/i)
+    expect(out.reason).toMatch(/forceReissue/)
+  })
+
+  it('ignores the derived id and agentDid, which the wallet fills in itself', async () => {
+    const out = await run({ agentUsername: 'PMRBot', id: 'something-else', agentDid: 'did:zid:other' })
+    expect(out.differsFromRequest).toBeUndefined()
+  })
+
+  it('ignores an attribute the caller left empty', async () => {
+    const out = await run({ agentUsername: 'PMRBot', purpose: '' })
+    expect(out.differsFromRequest).toBeUndefined()
+  })
+})
+
+// a paid subscribe_and_issue paid on the first call. Without confirm: true a chargeable issuance stops at
+// the price; a free one (MBI says paymentRequired: false) goes ahead, since nothing is paid.
+describe('subscribe_and_issue asks before it pays', () => {
+  const unconfirmed = { templateId: 'did:zid:t-1', attributes: { agentName: 'Jak Sparrow', purpose: 'x401+x402' } }
+  const paidMbi = () => ({
+    quote: vi.fn().mockResolvedValue({ accepts: [accept], paymentRequired: true }),
+    applyChallenge: vi.fn().mockResolvedValue({ x402Version: 2, accepts: [accept], paymentId: 'pid-1' }),
+    applySettle: vi.fn(),
+  })
+
+  it('a chargeable issuance without confirm: quotes, signs nothing, pays nothing, issues nothing', async () => {
+    const mbi = paidMbi()
+    const sign = vi.fn()
+    const pay = vi.fn()
+    const out = (await subscribeAndIssue({ mbi, sign, pay, holderDid, resolveSymbol: async () => 'JMYR' } as never, unconfirmed)) as unknown as Record<string, unknown>
+    expect(mbi.quote).toHaveBeenCalledTimes(1)
+    expect(mbi.applyChallenge).not.toHaveBeenCalled()
+    expect(sign).not.toHaveBeenCalled()
+    expect(pay).not.toHaveBeenCalled()
+    expect(out).toMatchObject({
+      issued: false,
+      needsConfirmation: true,
+      quote: { asset: accept.asset, assetSymbol: 'JMYR', maxAmountRequired: '1000000' },
+      nextStep: 'ask_user_to_confirm_payment',
+    })
+    expect(String(out.reason)).toMatch(/^NOT PAID YET/)
+    expect(String(out.askUser)).toMatch(/Shall I go ahead\?$/)
+  })
+
+  it('an MBI that does not say whether it charges is treated as chargeable', async () => {
+    const mbi = { ...paidMbi(), quote: vi.fn().mockResolvedValue({ accepts: [accept] }) }
+    const out = (await subscribeAndIssue({ mbi, sign: vi.fn(), pay: vi.fn(), holderDid } as never, unconfirmed)) as unknown as Record<string, unknown>
+    expect(out.needsConfirmation).toBe(true)
+    expect(mbi.applyChallenge).not.toHaveBeenCalled()
+  })
+
+  it('a free issuance goes ahead without confirm', async () => {
+    const issuedVc = { id: 'vc', validUntil: '2099-01-01T00:00:00Z' }
+    const mbi = {
+      quote: vi.fn().mockResolvedValue({ accepts: [accept], paymentRequired: false }),
+      applyChallenge: vi.fn().mockResolvedValue({ issued: { vcId: 'did:zid:vc-free', txHash: '0xfree', verifiableCredential: issuedVc } }),
+      applySettle: vi.fn(),
+    }
+    const out = (await subscribeAndIssue(
+      { mbi, sign: vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' }), pay: vi.fn(), holderDid } as never,
+      unconfirmed,
+    )) as unknown as Record<string, unknown>
+    expect(mbi.applyChallenge).toHaveBeenCalledTimes(1)
+    expect(out.issued).toBe(true)
+    expect(out.needsConfirmation).toBeUndefined()
+  })
+
+  it('without a quote client, it stops after the free payment request and before paying', async () => {
+    const mbi = { applyChallenge: vi.fn().mockResolvedValue({ x402Version: 2, accepts: [accept], paymentId: 'pid-1' }), applySettle: vi.fn() }
+    const pay = vi.fn()
+    const out = (await subscribeAndIssue(
+      { mbi, sign: vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' }), pay, holderDid } as never,
+      unconfirmed,
+    )) as unknown as Record<string, unknown>
+    expect(pay).not.toHaveBeenCalled()
+    expect(mbi.applySettle).not.toHaveBeenCalled()
+    expect(out).toMatchObject({ issued: false, needsConfirmation: true, quote: { maxAmountRequired: '1000000' } })
+  })
+
+  it('with confirm: true it pays as before, without an extra quote', async () => {
+    const mbi = {
+      ...paidMbi(),
+      applySettle: vi.fn().mockResolvedValue({ vcId: 'did:zid:vc', txHash: '0xnew', verifiableCredential: { id: 'vc', validUntil: '2099-01-01T00:00:00Z' } }),
+    }
+    const pay = vi.fn().mockResolvedValue('XPAY')
+    const out = (await subscribeAndIssue(
+      { mbi, sign: vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' }), pay, holderDid } as never,
+      { ...unconfirmed, confirm: opts.confirm },
+    )) as unknown as Record<string, unknown>
+    expect(mbi.quote).not.toHaveBeenCalled()
+    expect(pay).toHaveBeenCalledTimes(1)
+    expect(out.issued).toBe(true)
+  })
+
+  it('a credential already held needs no confirm and says to tell the user, or to ask when it differs', async () => {
+    const held = {
+      templateId: 'did:zid:t-1', vcId: 'did:zid:vc-held', issuedAt: '2026-07-01T00:00:00Z', validUntil: '2099-01-01T00:00:00Z',
+      vc: { id: 'held', credentialSubject: { agentName: 'Jak Sparrow', purpose: 'x401+x402' } },
+    }
+    const cache = { get: vi.fn().mockResolvedValue(held), set: vi.fn(), list: vi.fn() }
+    const mbi = paidMbi()
+    const same = (await subscribeAndIssue({ mbi, sign: vi.fn(), pay: vi.fn(), holderDid, cache } as never, unconfirmed)) as unknown as Record<string, unknown>
+    expect(same).toMatchObject({ alreadyHeld: true, nextStep: 'tell_user_already_held' })
+    const differs = (await subscribeAndIssue({ mbi, sign: vi.fn(), pay: vi.fn(), holderDid, cache } as never, {
+      ...unconfirmed,
+      attributes: { agentName: 'PMRBot' },
+    })) as unknown as Record<string, unknown>
+    expect(differs).toMatchObject({ alreadyHeld: true, nextStep: 'ask_user_whether_to_replace' })
+    expect(String(differs.askUser)).toMatch(/replace it\?$/)
+    expect(mbi.quote).not.toHaveBeenCalled()
+  })
+})
+
+// an older credential that does not carry the requested attribute at all, e.g. agentName
+// "PMRBot" held while agentUsername "NewBot" is asked for, was reported as plainly held with no mismatch.
+describe('a held credential missing a requested attribute', () => {
+  const old = {
+    templateId: 'did:zid:t-1', vcId: 'did:zid:vc-old', issuedAt: '2026-07-01T00:00:00Z', validUntil: '2099-01-01T00:00:00Z',
+    vc: { id: 'old', credentialSubject: { agentName: 'PMRBot', note: null } },
+  }
+  const run = (attributes: Record<string, unknown>) =>
+    subscribeAndIssue(
+      {
+        mbi: { applyChallenge: vi.fn(), applySettle: vi.fn() },
+        sign: vi.fn(),
+        pay: vi.fn(),
+        holderDid,
+        cache: { get: vi.fn().mockResolvedValue(old), set: vi.fn(), list: vi.fn() },
+      },
+      { ...opts, attributes },
+    )
+
+  it('names the attribute the held credential does not have', async () => {
+    const out = await run({ agentUsername: 'NewBot' })
+    expect(out.differsFromRequest).toEqual([{ attribute: 'agentUsername', held: undefined, requested: 'NewBot' }])
+    expect(out.reason).toMatch(/agentUsername not set, not the "NewBot" asked for/)
+  })
+
+  it('a null held value reads as not set, never as the word null', async () => {
+    const out = await run({ note: 'hello' })
+    expect(out.reason).toMatch(/note not set, not the "hello" asked for/)
+    expect(out.reason).not.toMatch(/"null"/)
+  })
+})
+
+// the user's yes is the quote they saw, echoed back, and only that price is paid.
+describe('subscribe_and_issue pays only the confirmed price', () => {
+  const base = { templateId: 'did:zid:t-1', attributes: { agentName: 'Jak Sparrow', purpose: 'x401+x402' } }
+  const QUOTE = { asset: accept.asset, maxAmountRequired: '1000000', payTo: 'ZTXissuer', gasModel: 'self' as const }
+  const settled = { vcId: 'did:zid:vc', txHash: '0xnew', verifiableCredential: { id: 'vc', validUntil: '2099-01-01T00:00:00Z' } }
+  const harness = (challengeAccept: unknown = accept, quoteResult: unknown = { accepts: [accept], paymentRequired: true }) => {
+    const mbi = {
+      quote: vi.fn().mockResolvedValue(quoteResult),
+      applyChallenge: vi.fn().mockResolvedValue({ x402Version: 2, accepts: [challengeAccept], paymentId: 'pid-1' }),
+      applySettle: vi.fn().mockResolvedValue(settled),
+    }
+    const pay = vi.fn().mockResolvedValue('XPAY')
+    const deps = { mbi, sign: vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' }), pay, holderDid, resolveSymbol: async () => 'JMYR' }
+    return { mbi, pay, deps }
+  }
+
+  it('confirm: true is not a confirmation: stops at the price', async () => {
+    const { deps, pay } = harness()
+    const out = (await subscribeAndIssue(deps as never, { ...base, confirm: true })) as unknown as Record<string, unknown>
+    expect(pay).not.toHaveBeenCalled()
+    expect(out).toMatchObject({ needsConfirmation: true, quote: QUOTE })
+    expect(String(out.reason)).toMatch(/confirm: true is not accepted/)
+  })
+
+  it('the confirmed quote, naming the raw token address, is paid without another /quote call', async () => {
+    const { deps, pay, mbi } = harness()
+    const out = (await subscribeAndIssue(deps as never, { ...base, confirm: QUOTE })) as unknown as Record<string, unknown>
+    expect(mbi.quote).not.toHaveBeenCalled()
+    expect(pay).toHaveBeenCalledTimes(1)
+    expect(out.issued).toBe(true)
+  })
+
+  it.each([
+    ['amount', { maxAmountRequired: '2000000' }, /the amount is 2000000, not 1000000/],
+    ['payee', { payTo: 'ZTXother' }, /the payee is ZTXother, not ZTXissuer/],
+  ])('an issuer payment request whose %s differs from the confirmed quote is not paid', async (_n, change, why) => {
+    const { deps, pay, mbi } = harness({ ...accept, ...change })
+    const out = (await subscribeAndIssue(deps as never, { ...base, confirm: QUOTE })) as unknown as Record<string, unknown>
+    expect(pay).not.toHaveBeenCalled()
+    expect(mbi.applySettle).not.toHaveBeenCalled()
+    expect(out).toMatchObject({ issued: false, needsConfirmation: true, nextStep: 'ask_user_to_confirm_payment' })
+    expect(String(out.reason)).toMatch(/not what the user agreed to/)
+    expect(String(out.reason)).toMatch(why)
+  })
+
+  it('/quote said free but the issuer asks for payment: stops before paying', async () => {
+    const { deps, pay } = harness(accept, { accepts: [accept], paymentRequired: false })
+    const out = (await subscribeAndIssue(deps as never, base)) as unknown as Record<string, unknown>
+    expect(pay).not.toHaveBeenCalled()
+    expect(out).toMatchObject({ needsConfirmation: true, quote: QUOTE })
+  })
+
+  it('/quote failing is relayed, and nothing is signed', async () => {
+    const { deps, mbi } = harness()
+    mbi.quote.mockRejectedValue(new MbiError('MBI quote failed: 404 Template not found', 404))
+    const out = (await subscribeAndIssue(deps as never, base)) as unknown as Record<string, unknown>
+    expect(mbi.applyChallenge).not.toHaveBeenCalled()
+    expect(deps.sign).not.toHaveBeenCalled()
+    expect(out).toMatchObject({ issued: false, nextStep: 'follow_message' })
+    expect(String(out.reason)).toMatch(/Template not found/)
+  })
+
+  it('an issuer that does not say whether it charges: the question says it may cost up to the amount', async () => {
+    const { deps } = harness(accept, { accepts: [accept] })
+    const out = (await subscribeAndIssue(deps as never, base)) as unknown as Record<string, unknown>
+    expect(String(out.askUser)).toMatch(/may cost up to .*does not say whether it charges/)
+  })
+
+  it('a quote with no amount says so, never "costs  base units"', async () => {
+    const { deps } = harness(accept, { accepts: [{ ...accept, maxAmountRequired: '' }], paymentRequired: true })
+    const out = (await subscribeAndIssue(deps as never, base)) as unknown as Record<string, unknown>
+    expect(String(out.askUser)).toMatch(/an amount the issuer did not state/)
+    expect(String(out.askUser)).not.toMatch(/costs\s+base units/)
+  })
+
+  it('replacing a held credential: the price stop says to keep forceReissue and confirmReplaceExistingVc', async () => {
+    const { deps } = harness()
+    const held = { templateId: 'did:zid:t-1', vc: { id: 'old' }, vcId: 'did:zid:vc-old', issuedAt: '2026-01-01T00:00:00Z', validUntil: '2099-01-01T00:00:00Z' }
+    const cache = { get: vi.fn().mockResolvedValue(held), set: vi.fn(), list: vi.fn() }
+    const out = (await subscribeAndIssue({ ...deps, cache } as never, { ...base, forceReissue: true, confirmReplaceExistingVc: 'did:zid:vc-old' })) as unknown as Record<
+      string,
+      unknown
+    >
+    expect(out.needsConfirmation).toBe(true)
+    expect(String(out.reason)).toMatch(/forceReissue and confirmReplaceExistingVc too/)
+  })
+
+  it('forceReissue without the exact id: shows the held one and asks whether to replace it', async () => {
+    const { deps } = harness()
+    const held = { templateId: 'did:zid:t-1', vc: { id: 'old' }, vcId: 'did:zid:vc-old', issuedAt: '2026-01-01T00:00:00Z', validUntil: '2099-01-01T00:00:00Z' }
+    const cache = { get: vi.fn().mockResolvedValue(held), set: vi.fn(), list: vi.fn() }
+    const out = (await subscribeAndIssue({ ...deps, cache } as never, { ...base, forceReissue: true })) as unknown as Record<string, unknown>
+    expect(out).toMatchObject({ issued: false, nextStep: 'ask_user_whether_to_replace' })
+  })
+})
+
+describe('subscribe_and_issue R2', () => {
+  const base = { templateId: 'did:zid:t-1', attributes: { agentName: 'Jak Sparrow', purpose: 'x401+x402' } }
+  const settled = { vcId: 'did:zid:vc', txHash: '0xnew', verifiableCredential: { id: 'vc', validUntil: '2099-01-01T00:00:00Z' } }
+  const harness = (challengeAccept: unknown = accept) => {
+    const mbi = {
+      quote: vi.fn().mockResolvedValue({ accepts: [accept], paymentRequired: true }),
+      applyChallenge: vi.fn().mockResolvedValue({ x402Version: 2, accepts: [challengeAccept], paymentId: 'pid-1' }),
+      applySettle: vi.fn().mockResolvedValue(settled),
+    }
+    const pay = vi.fn().mockResolvedValue('XPAY')
+    const deps = { mbi, sign: vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' }), pay, holderDid, resolveSymbol: async () => 'JMYR' }
+    return { mbi, pay, deps }
+  }
+
+  // Low 3: the symbol alone bound the token, so a different contract with the same symbol was paid.
+  it('the quote carries the raw token address, with the symbol only for display', async () => {
+    const { deps } = harness()
+    const out = (await subscribeAndIssue(deps as never, base)) as unknown as Record<string, unknown>
+    expect(out.quote).toMatchObject({ asset: accept.asset, assetSymbol: 'JMYR' })
+  })
+
+  it('a different token contract with the same symbol, amount and payee is not paid', async () => {
+    const { deps, pay } = harness({ ...accept, asset: 'ZTX3othercontract000000000000000000' })
+    const confirmed = { asset: accept.asset, maxAmountRequired: '1000000', payTo: 'ZTXissuer', gasModel: 'self' }
+    const out = (await subscribeAndIssue(deps as never, { ...base, confirm: confirmed })) as unknown as Record<string, unknown>
+    expect(pay).not.toHaveBeenCalled()
+    expect(out.needsConfirmation).toBe(true)
+    expect(String(out.reason)).toMatch(/the token is ZTX3othercontract/)
+  })
+
+  it('a quote naming the token only by its symbol is not enough to pay', async () => {
+    const { deps, pay } = harness()
+    const bySymbol = { asset: 'JMYR', maxAmountRequired: '1000000', payTo: 'ZTXissuer', gasModel: 'self' }
+    const out = (await subscribeAndIssue(deps as never, { ...base, confirm: bySymbol })) as unknown as Record<string, unknown>
+    expect(pay).not.toHaveBeenCalled()
+    expect(out.needsConfirmation).toBe(true)
+  })
+
+  it('the self-pay question says ZTX network gas is paid on top', async () => {
+    const { deps } = harness()
+    const out = (await subscribeAndIssue(deps as never, base)) as unknown as Record<string, unknown>
+    expect(String(out.askUser)).toMatch(/plus network gas paid in ZTX/)
+  })
+
+  it('a refusal says follow_message', async () => {
+    const out = await subscribeAndIssue({ mbi: { applyChallenge: vi.fn(), applySettle: vi.fn() }, sign: vi.fn(), pay: vi.fn(), holderDid } as never, {
+      templateId: 'not-a-did',
+      attributes: {},
+    })
+    expect(out.nextStep).toBe('follow_message')
   })
 })

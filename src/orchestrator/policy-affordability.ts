@@ -142,22 +142,22 @@ export async function checkAffordability(
     fee = { status: 'unknown', required }
     problems.push(`Could not read the ${asset} balance (${clip(String(feeBalance.error), 60)}) — the fee cannot be checked.`)
   } else if (BigInt(feeBalance.balance) < BigInt(required)) {
-    fee = { status: 'short', required, balance: feeBalance.balance, display: feeBalance.display }
+    fee = { status: 'short', required, balance: feeBalance.balance, display: renderAmount(feeBalance.balance, feeBalance) }
     problems.push(
       `Not enough ${clip(feeBalance.token, 40)}: the quote is ${renderAmount(required, feeBalance)}, ` +
-        `the balance is ${clip(feeBalance.display, 60)}.` +
+        `the balance is ${clip(renderAmount(feeBalance.balance, feeBalance), 60)}.` +
         (asset === NATIVE ? ' The payer needs the amount plus the network fee from this one balance.' : ''),
     )
   } else if (asset === NATIVE && BigInt(feeBalance.balance) === BigInt(required)) {
     // For ZTX the payer needs amount PLUS fee from one balance (PaymentEngine.checkBalance), and the
     // fee is never zero — so a balance equal to the quote has nothing left for it.
-    fee = { status: 'short', required, balance: feeBalance.balance, display: feeBalance.display }
+    fee = { status: 'short', required, balance: feeBalance.balance, display: renderAmount(feeBalance.balance, feeBalance) }
     problems.push(
       `Not enough ZTX: the quote is ${renderAmount(required, feeBalance)} and the balance is exactly that, ` +
         `leaving nothing for the network fee, which the payer needs on top of the amount.`,
     )
   } else {
-    fee = { status: 'enough', required, balance: feeBalance.balance, display: feeBalance.display }
+    fee = { status: 'enough', required, balance: feeBalance.balance, display: renderAmount(feeBalance.balance, feeBalance) }
   }
 
   let gas: Affordability['gas']

@@ -179,7 +179,10 @@ export async function queryTokenBalance(deps: TokenBalanceDeps, token: string): 
   const info = await fetchTokenInfo(contractAddress, deps.query)
   // Asked by address, answer by name — the caller learns which token that contract actually is.
   const label = byAddress ? info?.symbol ?? asked : symbol
-  const decimals = info?.decimals ?? null
+  // `fetchTokenInfo` reports an unreadable decimals as 0 with `decimalsReadable: false`. Treating that 0 as a
+  // genuine 0-decimal token would show the raw count as whole tokens, wrong by 10^decimals, and the null-decimals
+  // handling downstream would never fire — so only a readable value is trusted.
+  const decimals = info?.decimalsReadable ? info.decimals : null
   return { token: label, balance, decimals, display: renderDisplay(balance, decimals, label), tokenAddress: contractAddress }
 }
 

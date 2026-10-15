@@ -25,6 +25,12 @@ const walletToolNames = (() => {
   return [...src.matchAll(/^\s{6}name: '([a-z_]+)',$/gm)].map((m) => m[1])
 })()
 
+/** The `nextStep` values results carry, read from their type: the skill names them, and they are not tools. */
+const nextStepNames = (() => {
+  const src = readFileSync(join(walletRoot, 'src', 'orchestrator', 'next-step.ts'), 'utf8')
+  return [...src.matchAll(/^\s*\| '([a-z_]+)'/gm)].map((m) => m[1])
+})()
+
 describe('the wallet tool list is readable', () => {
   it('finds exactly the twenty-one tools', () => {
     expect(walletToolNames.sort()).toEqual([
@@ -292,6 +298,7 @@ describe('SKILL.md', () => {
       // Result/error codes, commands and credential identifiers the skill legitimately names, which are not tools.
       (n) =>
         !walletToolNames.includes(n) &&
+        !nextStepNames.includes(n) &&
         !['not_activated', 'resource_payment', 'export_credentials', 'query_failed', 'unknown_token', 'needs_choice', 'write_failed', 'verified_ai_birthcert'].includes(n),
     )
     expect(unknown).toEqual([])

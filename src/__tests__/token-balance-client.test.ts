@@ -98,6 +98,49 @@ describe('queryTokenBalance', () => {
     expect(out).toEqual({ token: 'JMYR', balance: '473999900', decimals: null, display: '473999900 JMYR', tokenAddress: jmyr })
   })
 
+  // fetchTokenInfo answers decimals: 0 (decimalsReadable: false) for a readable symbol whose
+  // decimals are missing or invalid. That 0 used to be taken as a real 0-decimal token, so the raw count
+  // was shown as whole tokens — wrong by 10^decimals — and the null-decimals rule never fired.
+  describe('when contractInfo has a symbol but unreadable decimals', () => {
+    const cases: Array<[string, unknown]> = [
+      ['missing', undefined],
+      ['non-numeric', 'abc'],
+      ['null', null],
+      ['empty', ''],
+      ['negative', -1],
+      ['fractional', 1.5],
+      ['above the supported bound', 37],
+      ['a long digit string', '99'],
+    ]
+    for (const [name, decimals] of cases) {
+      it(`reports decimals:null, not 0, when decimals are ${name}`, async () => {
+        const info = JSON.stringify({ contractInfo: { symbol: 'JMYR', ...(decimals === undefined ? {} : { decimals }) } })
+        const query = queryReturning({ balanceOf: balanceOk, contractInfo: info })
+        const out = await queryTokenBalance(deps({ query }), 'JMYR')
+        expect(out).toEqual({ token: 'JMYR', balance: '473999900', decimals: null, display: '473999900 JMYR', tokenAddress: jmyr })
+      })
+    }
+
+    it('still reports a genuine 0-decimal token as decimals:0 when decimals is the number 0', async () => {
+      const info = JSON.stringify({ contractInfo: { symbol: 'JMYR', decimals: 0 } })
+      const query = queryReturning({ balanceOf: balanceOk, contractInfo: info })
+      const out = await queryTokenBalance(deps({ query }), 'JMYR')
+      expect(out).toMatchObject({ decimals: 0, display: '473999900 JMYR' })
+    })
+
+    it('still reports a genuine 0-decimal token as decimals:0', async () => {
+      const info = JSON.stringify({ contractInfo: { symbol: 'JMYR', decimals: '0' } })
+      const query = queryReturning({ balanceOf: balanceOk, contractInfo: info })
+      const out = await queryTokenBalance(deps({ query }), 'JMYR')
+      expect(out).toMatchObject({ decimals: 0, display: '473999900 JMYR' })
+    })
+
+    it('still converts a readable 6-decimal token to whole tokens', async () => {
+      const out = await queryTokenBalance(deps(), 'JMYR')
+      expect(out).toMatchObject({ decimals: 6, display: '473.9999 JMYR' })
+    })
+  })
+
   it('reports unknown_token for a symbol with no registered contract on this network', async () => {
     const out = await queryTokenBalance(deps(), 'NOPE')
     expect(out).toEqual({ token: 'NOPE', error: 'unknown_token' })

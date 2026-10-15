@@ -38,6 +38,8 @@
  * must be byte-identical to MBI's `constructSignData`.
  */
 
+import type { NextStep } from './next-step.js'
+import { asPriceConfirmation, gasNote, priceMismatch, quoteOf } from '../price-confirmation.js'
 import {
   MbiError,
   MBI_SETTLEMENT_INDETERMINATE,
@@ -77,6 +79,13 @@ export interface SubscribeDeps {
    * raw `accept.asset` string is reported as-is.
    */
   resolveSymbol?: (asset: string) => Promise<string>
+  /** Renders a raw amount in whole tokens with its symbol, for the price an unconfirmed paid issuance asks about. */
+  formatAssetAmount?: (asset: string, raw: string) => Promise<string>
+  /**
+   * What the credential is, in words, for the price question: "Basic AI Birthcert (self-declared, not
+   * identity-verified)". A yes to "this credential" could be a yes to the wrong kind. Absent: "this credential".
+   */
+  credentialLabel?: string
   /**
    * The wallet's own resolved holder DID. Auto-filled into `attributes.agentDid` when the
    * caller omits it AND `resolveTemplateFields` confirms the template declares `agentDid` as a
@@ -153,6 +162,14 @@ export interface SubscribeOpts {
    * unnecessary) when nothing valid is cached, or when `forceReissue` is not set.
    */
   confirmReplaceExistingVc?: string
+  /**
+   * The user's explicit yes to the price: the `quote` object a `needsConfirmation` result returned, echoed back
+   * unchanged (review R1, option A). Anything else (absent, `true`, a partial object) stops a chargeable issuance at the
+   * price with nothing signed, paid or issued. A confirmed call pays only if the issuer's payment request matches the
+   * quote field for field (token, amount, payee, gas model); otherwise it stops and returns the new price. Not needed
+   * for a free issuance or a credential already held, which pay nothing.
+   */
+  confirm?: unknown
 }
 
 export interface Quote {
@@ -192,6 +209,23 @@ export interface SubscribeResult {
   amountPaid?: string
   /** True when this VC was served from the local cache — no payment was made on this call. */
   fromCache?: boolean
+  /**
+   * A chargeable issuance asked for without `confirm: true`: nothing was signed, paid or issued, and `quote`
+   * carries the price to ask the user about.
+   */
+  needsConfirmation?: true
+  /** What to do next, as a field. See next-step.ts. */
+  nextStep?: NextStep
+  /** The question to put to the user, when there is one. */
+  askUser?: string
+  /**
+   * Set on a plain cache hit: the wallet already holds a valid one, so nothing was paid and nothing new was
+   * issued — `issued` is false. Before this the hit said `issued: true`, and in QA the agent told the user a new
+   * credential had been issued under a username they had just given, while the one returned carried the old username.
+   */
+  alreadyHeld?: true
+  /** On a cache hit: the requested attribute values the held credential does not carry. Absent when none differ. */
+  differsFromRequest?: { attribute: string; held: unknown; requested: unknown }[]
   /**
    * What the *original* issuance of a cached VC cost, when known. Only set alongside
    * `fromCache` — deliberately kept out of `txHash`/`paidAsset`/`amountPaid` so a free cache
@@ -364,7 +398,95 @@ async function resolveVcPassImagePaths(deps: SubscribeDeps, vcId: string): Promi
   }
 }
 
+/**
+ * The requested attribute values a held credential does not carry, including an attribute it does not have
+ * at all (an older credential with agentName where agentUsername is asked for; review R1). Only plain values the caller
+ * actually gave are compared; `id` and `agentDid` are skipped because the wallet fills them in itself.
+ */
+function differsFromRequest(vc: unknown, requested: Record<string, unknown> | undefined): SubscribeResult['differsFromRequest'] {
+  const subject = (vc as { credentialSubject?: unknown } | null)?.credentialSubject
+  if (!requested || typeof subject !== 'object' || subject === null) return undefined
+  const held = subject as Record<string, unknown>
+  const out: { attribute: string; held: unknown; requested: unknown }[] = []
+  for (const [attribute, value] of Object.entries(requested)) {
+    if (attribute === 'id' || attribute === 'agentDid') continue
+    if (value === undefined || value === null || value === '' || typeof value === 'object') continue
+    const current = held[attribute]
+    if (current === undefined || current === null || String(current) !== String(value)) {
+      out.push({ attribute, held: current ?? undefined, requested: value })
+    }
+  }
+  return out.length > 0 ? out : undefined
+}
+
+/** A price in whole tokens when the wallet can resolve decimals; never a bare base-unit number presented as tokens. */
+async function renderPrice(deps: SubscribeDeps, asset: string, raw: string, symbol: string): Promise<string> {
+  if (raw === '') return `an amount the issuer did not state (${symbol})`
+  if (deps.formatAssetAmount) {
+    try {
+      return await deps.formatAssetAmount(asset, raw)
+    } catch {
+      // Falls through to the raw form below, which says what it is.
+    }
+  }
+  return `${raw} base units of ${symbol}`
+}
+
+/**
+ * The price, and the question to ask, for a chargeable issuance asked for without `confirm: true`. Nothing has
+ * been signed, paid or issued when this is returned.
+ */
+async function askToConfirmPayment(
+  deps: SubscribeDeps,
+  accepted: PayRequirement,
+  schema: TemplateSchema | undefined,
+  options: { lead?: string; chargeUnknown?: boolean } = {},
+): Promise<SubscribeResult> {
+  const raw = String(accepted.asset ?? '')
+  const symbol = deps.resolveSymbol ? await deps.resolveSymbol(raw) : raw
+  // The raw asset is what confirm echoes and what is compared: two contracts can share a symbol (review R2). The symbol
+  // rides along for display only.
+  const quote = { ...quoteOf(accepted), assetSymbol: symbol }
+  const display = (await renderPrice(deps, raw, quote.maxAmountRequired, symbol)) + gasNote(quote)
+  // An older MBI does not say whether it charges at all, so the question names the most it may cost (review R1 nit).
+  const price = options.chargeUnknown ? `may cost up to ${display} (this issuer does not say whether it charges)` : `costs ${display}`
+  return {
+    issued: false,
+    needsConfirmation: true,
+    quote,
+    nextStep: 'ask_user_to_confirm_payment',
+    askUser: `Issuing this ${deps.credentialLabel ?? 'credential'} ${price}. Shall I go ahead?`,
+    reason:
+      `NOT PAID YET: ${options.lead ?? ''}issuing this ${deps.credentialLabel ?? 'credential'} ${price}, and nothing has been paid or issued. Tell the user ` +
+      `the price and ask. Only after their explicit yes to this payment, call again with confirm set to this exact quote ` +
+      `object (asset, maxAmountRequired, payTo, gasModel, unchanged), keeping every other argument the same (forceReissue and ` +
+      `confirmReplaceExistingVc too, if you sent them). confirm: true is not accepted.`,
+    ...(schema ? { schema } : {}),
+  }
+}
+
+/** A held value in words: missing or empty reads as "not set", never as "undefined" or "null". */
+function describeHeld(d: { attribute: string; held: unknown }): string {
+  return d.held === undefined || d.held === null ? `${d.attribute} not set` : `${d.attribute} "${String(d.held)}"`
+}
+
+/** One difference, in words. */
+function describeDifference(d: { attribute: string; held: unknown; requested: unknown }): string {
+  return `${describeHeld(d)}, not the "${String(d.requested)}" asked for`
+}
+
+/**
+ * The next step for every result: an issued credential is shown; a result that did not go ahead is relayed.
+ * A result that already says (a price stop, a credential already held) keeps its own, and a dry run carries none: the
+ * caller asked only for the price.
+ */
 export async function subscribeAndIssue(deps: SubscribeDeps, opts: SubscribeOpts): Promise<SubscribeResult> {
+  const result = await subscribeAndIssueInner(deps, opts)
+  if (result.nextStep || (opts.dryRun && result.quote)) return result
+  return { ...result, nextStep: result.issued ? 'show_credential' : 'follow_message' }
+}
+
+async function subscribeAndIssueInner(deps: SubscribeDeps, opts: SubscribeOpts): Promise<SubscribeResult> {
   // MBI settles payment in applySettle *before* checking the template exists, so a bad
   // templateId (e.g. a DCQL requirementsId label like "agent-identity" instead of the real
   // credential-definition DID) burns real x402 funds for a guaranteed failure. Every real MBI
@@ -456,6 +578,8 @@ export async function subscribeAndIssue(deps: SubscribeDeps, opts: SubscribeOpts
               `Show this to the user before doing anything else. Call subscribe_and_issue again with ` +
               `forceReissue set to true AND confirmReplaceExistingVc set to exactly "${confirmableVcId}" ` +
               `only if the user explicitly wants to replace it.`,
+            nextStep: 'ask_user_whether_to_replace',
+            askUser: 'You already have this credential, and it is still valid. Do you want to replace it?',
             ...cacheHitFields,
             // Overrides cacheHitFields.vcId (which may be absent/non-string on the fallback path
             // above) with the exact id the message just told the caller to echo back.
@@ -464,7 +588,32 @@ export async function subscribeAndIssue(deps: SubscribeDeps, opts: SubscribeOpts
         }
         // else: confirmed — fall through to pay + issue fresh.
       } else {
-        return { issued: true, ...cacheHitFields }
+        const differs = differsFromRequest(cached.vc, opts.attributes)
+        const until = cached.validUntil ? ` until ${cached.validUntil}` : ''
+        const id = typeof cached.vcId === 'string' && cached.vcId ? ` (credential id ${cached.vcId})` : ''
+        return {
+          issued: false,
+          alreadyHeld: true,
+          reason:
+            `Already held: this wallet already has a valid credential for this template${until}${id}. Nothing was paid and no ` +
+            `new credential was issued. Tell the user they already have it; do not tell the user it was just issued.` +
+            (differs
+              ? ` It differs from what was asked for: it has ${differs.map(describeDifference).join('; ')}. ` +
+                `Ask the user whether to keep it or replace it. Replacing it is a new issuance at the current price (credential_preflight ` +
+                `with replacing: true shows it): call again with forceReissue set to true to see what would be replaced, and confirm ` +
+                `only on the user's explicit yes.`
+              : ''),
+          ...(differs ? { differsFromRequest: differs } : {}),
+          ...(differs
+            ? {
+                nextStep: 'ask_user_whether_to_replace' as const,
+                askUser:
+                  `You already have this credential, with ${differs.map(describeHeld).join(', ')}. ` +
+                  `Do you want to keep it, or replace it?`,
+              }
+            : { nextStep: 'tell_user_already_held' as const }),
+          ...cacheHitFields,
+        }
       }
     }
   }
@@ -566,6 +715,28 @@ export async function subscribeAndIssue(deps: SubscribeDeps, opts: SubscribeOpts
     }
   }
 
+  // a chargeable issuance stops at the price unless the user has said yes. Asked of /quote, which cannot issue
+  // and needs no signature, so an unconfirmed call signs nothing. A free one goes ahead: nothing is paid. Absent
+  // paymentRequired (an older MBI) counts as chargeable. Without a quote client the check happens after the free payment
+  // request below instead, still before anything is paid.
+  const confirmed = asPriceConfirmation(opts.confirm)
+  if (!confirmed && deps.mbi.quote) {
+    let quoted
+    try {
+      quoted = await deps.mbi.quote(opts.templateId, attributes as Record<string, unknown>)
+    } catch (err) {
+      if (err instanceof MbiError) {
+        return { issued: false, reason: err.message, httpStatus: err.httpStatus, ...(schema ? { schema } : {}) }
+      }
+      throw err
+    }
+    if (quoted.paymentRequired !== false) {
+      const quotedAccept = quoted.accepts?.[0]
+      if (!quotedAccept) return { issued: false, reason: 'MBI quoted no payment options', ...(schema ? { schema } : {}) }
+      return askToConfirmPayment(deps, quotedAccept, schema, { chargeUnknown: quoted.paymentRequired === undefined })
+    }
+  }
+
   // `data` on the wire is the raw canonical JSON (MBI JSON-parses it during issuance).
   // passDesignId sits between templateId and metadata only when configured — key order here must
   // match MBI's own constructSignData exactly, and omitting the key (rather than sending it as
@@ -632,6 +803,16 @@ export async function subscribeAndIssue(deps: SubscribeDeps, opts: SubscribeOpts
 
   const accept = challenge.accepts[0]
   if (!accept) return { issued: false, reason: 'MBI 402 returned no payment options', ...(schema ? { schema } : {}) }
+  // the last point before money moves. Reached unconfirmed without a quote client, or when /quote said free and
+  // the issuer asked for payment anyway.
+  if (!confirmed) return askToConfirmPayment(deps, accept, schema)
+  // Option A (review R1): pay only the price the user agreed to, compared on the raw asset (review R2).
+  const difference = priceMismatch(confirmed, quoteOf(accept))
+  if (difference) {
+    return askToConfirmPayment(deps, accept, schema, {
+      lead: `the issuer's payment request is not what the user agreed to (${difference}), so nothing was paid. The new price: `,
+    })
+  }
 
   let xPayment: string
   try {

@@ -223,3 +223,182 @@ describe('the user answers with a short phrase when asked for a name', () => {
     expect(text).toMatch(/unless it was refused/i)
   })
 })
+
+// Links 2 and 3 replayed the first payment, but the agent told the user it had paid three times:
+// the description said the tool spends "per call" and nothing said a new link after an expired one is free.
+describe('a new link after an expired one is not another fee', () => {
+  it('request_ai_birthcert_verification says a new link after an expired one reuses the earlier payment', () => {
+    const d = tool('request_ai_birthcert_verification').description
+    expect(d).toMatch(/new link after an expired one/i)
+    expect(d).toMatch(/reuses the payment already made/i)
+    expect(d).toMatch(/only used up once the credential is issued/i)
+  })
+
+  it('request_ai_birthcert_verification tells the agent to count a fee only when paidThisCall is true', () => {
+    const d = tool('request_ai_birthcert_verification').description
+    expect(d).toMatch(/paidThisCall/)
+    expect(d).toMatch(/count a fee only when paidThisCall is true/i)
+  })
+
+  it('no request_ai_birthcert_verification text says every call pays', () => {
+    expect(tool('request_ai_birthcert_verification').description).not.toMatch(/per call/i)
+  })
+
+  it('the skill and the README say the same', () => {
+    expect(SKILL).toMatch(/new link after an expired one/i)
+    expect(SKILL).toMatch(/paidThisCall/)
+    expect(README).toMatch(/paidThisCall/)
+  })
+})
+
+describe('credential_preflight on an earlier payment not used yet', () => {
+  it('names unusedPayment and says not to ask the user to agree to a fee for the next link', () => {
+    const d = tool('credential_preflight').description
+    expect(d).toMatch(/unusedPayment/)
+    expect(d).toMatch(/do not ask the user to agree to a fee/i)
+  })
+})
+
+describe('subscribe_and_issue on a credential already held', () => {
+  it('says a cache hit is issued: false with alreadyHeld, and is not to be reported as just issued', () => {
+    const d = tool('subscribe_and_issue').description
+    expect(d).toMatch(/issued: false, alreadyHeld: true/)
+    expect(d).toMatch(/never tell the user it was just issued/i)
+    expect(d).toMatch(/differsFromRequest/)
+  })
+})
+
+// the paid issuance tools ask before they pay, and say what to do next as a field.
+describe('confirm before paying, and nextStep', () => {
+  it.each(['request_ai_birthcert_verification', 'subscribe_and_issue'])('%s has a confirm input that is the user\'s explicit yes', (name) => {
+    const confirm = tool(name).inputSchema.properties.confirm
+    expect(confirm, 'confirm input').toBeDefined()
+    expect(confirm.description).toMatch(/explicit yes/i)
+    expect(confirm.description).toMatch(/never on your own judgement/i)
+  })
+
+  it.each(['request_ai_birthcert_verification', 'subscribe_and_issue'])('%s says an unconfirmed paid call stops at the price and pays nothing', (name) => {
+    const d = tool(name).description
+    expect(d).toMatch(/needsConfirmation/)
+    expect(d).toMatch(/without a confirmed price/i)
+    expect(d).toMatch(/askUser/)
+  })
+
+  it('request_ai_birthcert_verification says a call that pays nothing needs no confirm', () => {
+    expect(tool('request_ai_birthcert_verification').description).toMatch(/needs no confirm/i)
+  })
+
+  it.each(['request_ai_birthcert_verification', 'subscribe_and_issue', 'credential_preflight'])('%s names nextStep', (name) => {
+    expect(tool(name).description).toMatch(/nextStep/)
+  })
+
+  it('the skill says both paid tools need confirm: true after the user\'s yes', () => {
+    expect(SKILL).toMatch(/confirm: true/)
+    expect(SKILL).toMatch(/needsConfirmation/)
+    expect(SKILL).toMatch(/nextStep/)
+  })
+})
+
+describe('no text contradicts the new contracts', () => {
+  // M1: a plain cache hit is issued: false, alreadyHeld: true now.
+  it('no subscribe_and_issue text says a cache hit is issued: true', () => {
+    const t = tool('subscribe_and_issue')
+    const all = [t.description, ...Object.values(t.inputSchema.properties).map((p) => p.description ?? '')].join(' ')
+    expect(all).not.toMatch(/issued: true/)
+  })
+
+  // L1: a loose Verified name is priced as the Verified one now.
+  it('credential_preflight does not say every "birthcert" name is priced as the Basic one', () => {
+    const text = tool('credential_preflight').inputSchema.properties.credential.description as string
+    expect(text).not.toMatch(/any name containing "birthcert" is priced as the Basic one/i)
+    expect(text).toMatch(/a name that says verified/i)
+  })
+
+  // M2: the Doc1 failure was quoting a fee for a link that reuses an earlier payment.
+  it('the skill makes the fee exception for unusedPayment, and the README lists the field', () => {
+    expect(SKILL).toMatch(/unusedPayment/)
+    expect(SKILL).toMatch(/do not quote the fee as a charge/i)
+    expect(README).toMatch(/unusedPayment\?/)
+  })
+})
+
+describe('balances are quoted as display, with the null-decimals exception', () => {
+  it('SKILL.md says display is not whole tokens when decimals is null', () => {
+    expect(SKILL).toMatch(/If `decimals` is `null`, `display` is not whole tokens/)
+    expect(SKILL).toMatch(/could not be converted to whole tokens/)
+  })
+
+  it('the README tells the reader to quote display, and says what null decimals means, in both places it describes balances', () => {
+    expect(README).toMatch(/tokenBalance: { token, balance, decimals, display }/)
+    expect(README).toMatch(/Quote `display`, the same amount in whole tokens/)
+    expect(README.match(/could not be converted/g)?.length ?? 0).toBeGreaterThanOrEqual(2)
+  })
+
+  it('neither document brings back the instruction to divide by 10^decimals', () => {
+    for (const doc of [SKILL, README]) {
+      expect(doc).not.toMatch(/Divide by `10^decimals`/i)
+      expect(doc).not.toMatch(/divide `balance` by `10^decimals`/i)
+    }
+  })
+})
+
+describe('confirm is the quote echoed back, and an expired credential still stops at the price', () => {
+  it.each(['request_ai_birthcert_verification', 'subscribe_and_issue'])('%s: confirm is the quote object, unchanged, and true is not accepted', (name) => {
+    const t = tool(name)
+    const all = [t.description, t.inputSchema.properties.confirm.description ?? ''].join(' ')
+    expect(all).toMatch(/quote object/i)
+    expect(all).toMatch(/unchanged/i)
+    expect(all).toMatch(/confirm: true is not accepted|including true/i)
+    expect(t.description).toMatch(/token, amount, payee or gas model/i)
+    expect(t.description).not.toMatch(/call again with confirm: true/i)
+  })
+
+  it('request_ai_birthcert_verification says a refused sponsored option is offered as a new price, never switched silently', () => {
+    expect(tool('request_ai_birthcert_verification').description).toMatch(/self-pay price/i)
+  })
+
+  it('no text says replacing an expired Verified credential needs no confirmation at all', () => {
+    expect(tool('request_ai_birthcert_verification').description).not.toMatch(/proceeds automatically/i)
+    expect(SKILL).not.toMatch(/replaced automatically, no confirmation needed/i)
+    expect(README).not.toMatch(/replaced automatically, no confirmation needed/i)
+    expect(tool('request_ai_birthcert_verification').description).toMatch(/still stops at the price/i)
+  })
+
+  it('credential_preflight lists confirm_kind_then_collect_details', () => {
+    expect(tool('credential_preflight').description).toMatch(/confirm_kind_then_collect_details/)
+  })
+
+  it('the skill says to echo the quote, not confirm: true, for the two issuance tools', () => {
+    expect(SKILL).toMatch(/confirm` set to that exact `quote`/i)
+  })
+})
+
+// the published schema is the only type contract the host and model see. Declared boolean,
+// a model following it could only send true, which is refused, so paid issuance could never complete.
+describe('confirm is declared as the quote object in the schema', () => {
+  it.each(['request_ai_birthcert_verification', 'subscribe_and_issue'])('%s declares confirm as an object with the quote fields', (name) => {
+    const confirm = tool(name).inputSchema.properties.confirm as unknown as {
+      type: string
+      properties: Record<string, { type: string; enum?: string[] }>
+      required: string[]
+    }
+    expect(confirm.type).toBe('object')
+    expect(Object.keys(confirm.properties).sort()).toEqual(['asset', 'assetSymbol', 'gasModel', 'maxAmountRequired', 'payTo'])
+    expect(confirm.properties.gasModel.enum).toEqual(['sponsored', 'self'])
+    expect(confirm.required.sort()).toEqual(['asset', 'gasModel', 'maxAmountRequired'])
+  })
+
+  it('every next step a result can carry is named for the agent', () => {
+    for (const step of ['show_credential', 'follow_message', 'ask_user_to_confirm_payment', 'show_link_and_wait', 'wait_then_check']) {
+      expect(SKILL, step).toContain(step)
+    }
+    expect(SKILL).not.toMatch(/relay_and_stop/)
+  })
+})
+
+describe('docs match the behaviour', () => {
+  it('the README does not say a refused sponsored option falls back to self-pay on its own', () => {
+    expect(README).not.toMatch(/automatically falls back to paying gas itself/i)
+    expect(README).toMatch(/self-pay price/i)
+  })
+})

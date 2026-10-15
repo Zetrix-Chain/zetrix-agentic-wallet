@@ -89,6 +89,9 @@ and **no payment made**, instead of paying and issuing again. Passing `forceReis
 own does **not** pay for a fresh one — it returns that same cached VC as `{ issued: false,
 fromCache: true, reason }` instead, so it can be shown to you first. Only calling again with
 `confirmReplaceExistingVc` also set to the exact `vcId` you were shown actually pays and reissues.
+A chargeable issuance also stops at the price first: without `confirm` it returns `needsConfirmation: true`
+with a `quote`, and pays only when called again with `confirm` set to that same `quote`, after the user
+has said yes to it.
 You can still hold onto `vc` from the response yourself and pass it explicitly on future
 `prove_identity` calls if you prefer not to rely on the cache (e.g. presenting a credential
 obtained elsewhere).

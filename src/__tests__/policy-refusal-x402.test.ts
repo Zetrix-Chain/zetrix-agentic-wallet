@@ -237,7 +237,7 @@ describe('pay_and_fetch (createPayer)', () => {
 
 describe('subscribe_and_issue', () => {
   const holderDid = 'did:zid:holder-self-1'
-  const opts = { templateId: 'did:zid:t-1', attributes: { agentName: 'Jak Sparrow', purpose: 'x401+x402' } }
+  const opts = { templateId: 'did:zid:t-1', attributes: { agentName: 'Jak Sparrow', purpose: 'x401+x402' }, confirm: { asset: 'ZTX3jmyrcontract0000000000000000000', maxAmountRequired: '1000000', payTo: 'ZTXissuer', gasModel: 'self' } }
   const accept = { payTo: 'ZTXissuer', asset: 'ZTX3jmyrcontract0000000000000000000', maxAmountRequired: '1000000', extra: { paymentId: 'pid-1' } }
   const fields = { required: [] as string[], allKeys: ['agentDid', 'agentName', 'purpose'] }
 
@@ -341,7 +341,7 @@ describe('Verified AI Birthcert session fee', () => {
 
   it('a denial: an error result flagged as a decision, no session, nothing stored', async () => {
     const h = harness(await DENIED())
-    const out = (await requestAiBirthcertVerification(h.deps as never, { agentName: 'Procurement Assistant' })) as Record<string, unknown>
+    const out = (await requestAiBirthcertVerification(h.deps as never, { agentName: 'Procurement Assistant', confirm: { asset: 'ZTX', maxAmountRequired: '1000', payTo: 'ZTX3Pay', gasModel: 'self' as const } })) as Record<string, unknown>
     expect(out.policyDenied).toBe(true)
     expect(out.policyCheckUnavailable).toBeUndefined()
     expect(String(out.error)).toContain('PER_TRANSACTION_EXCEEDED')
@@ -356,7 +356,7 @@ describe('Verified AI Birthcert session fee', () => {
 
   it('an unavailable check: an error result flagged transient', async () => {
     const h = harness(await UNAVAILABLE())
-    const out = (await requestAiBirthcertVerification(h.deps as never, { agentName: 'Procurement Assistant' })) as Record<string, unknown>
+    const out = (await requestAiBirthcertVerification(h.deps as never, { agentName: 'Procurement Assistant', confirm: { asset: 'ZTX', maxAmountRequired: '1000', payTo: 'ZTX3Pay', gasModel: 'self' as const } })) as Record<string, unknown>
     expect(out.policyCheckUnavailable).toBe(true)
     expect(out.policyDenied).toBeUndefined()
     expect(String(out.error)).toMatch(/trying again shortly is right/)
@@ -366,7 +366,7 @@ describe('Verified AI Birthcert session fee', () => {
   it('does NOT fall back to the other gas option after a refusal — a second signature would be a second attempt at the same spend', async () => {
     for (const e of [await DENIED(), await UNAVAILABLE()]) {
       const h = harness(e, [SPONSORED, SELF])
-      await requestAiBirthcertVerification(h.deps as never, { agentName: 'Procurement Assistant', gasPayer: 'sponsored' })
+      await requestAiBirthcertVerification(h.deps as never, { agentName: 'Procurement Assistant', gasPayer: 'sponsored', confirm: { asset: 'ZTX3jmyr', maxAmountRequired: '1000', payTo: 'ZTX3Pay', gasModel: 'sponsored' as const } })
       expect(h.pay).toHaveBeenCalledTimes(1)
       expect(h.createSessionSettle).not.toHaveBeenCalled()
     }
@@ -374,14 +374,14 @@ describe('Verified AI Birthcert session fee', () => {
 
   it('any other failure from pay still throws', async () => {
     const e = new Error('boom')
-    await expect(requestAiBirthcertVerification(harness(e).deps as never, { agentName: 'Procurement Assistant' })).rejects.toBe(e)
+    await expect(requestAiBirthcertVerification(harness(e).deps as never, { agentName: 'Procurement Assistant', confirm: { asset: 'ZTX', maxAmountRequired: '1000', payTo: 'ZTX3Pay', gasModel: 'self' as const } })).rejects.toBe(e)
   })
 
   it('insufficient funds is unchanged', async () => {
     const shortfall = { asset: 'ZTX', required: '100', available: '10', reason: 'gas' as const }
     const out = (await requestAiBirthcertVerification(
       harness(new PaymentReadinessError('short', shortfall)).deps as never,
-      { agentName: 'Procurement Assistant' },
+      { agentName: 'Procurement Assistant', confirm: { asset: 'ZTX', maxAmountRequired: '1000', payTo: 'ZTX3Pay', gasModel: 'self' as const } },
     )) as Record<string, unknown>
     expect(out.insufficientFunds).toEqual(shortfall)
     expect(out.policyDenied).toBeUndefined()

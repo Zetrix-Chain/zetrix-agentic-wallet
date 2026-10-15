@@ -33,12 +33,42 @@ import type { X401Wallet } from 'x401-zetrix-client'
 import type { VcPresentInput } from './clients/mbi-vp-adapter.js'
 import { proveIdentity } from './orchestrator/prove.js'
 import { payAndFetch, type PayFetch, type PayRequest } from './orchestrator/pay.js'
-import { subscribeAndIssue, type SubscribeDeps, type SubscribeOpts } from './orchestrator/subscribe.js'
+import { subscribeAndIssue, type SubscribeDeps, type SubscribeOpts, type SubscribeResult } from './orchestrator/subscribe.js'
 import type { TokenBalanceResult } from './clients/token-balance-client.js'
 import { createHolderAccount, type CreateAccount, type CreateHolderAccountInput, type ExistingAccount } from './orchestrator/onboard.js'
 import type { CheckActivationStatus } from './orchestrator/wait-for-activation.js'
 import { type VcCacheStore, isVcValid } from './clients/vc-cache.js'
-import { resolveTemplateAlias, deriveTemplateAttributes, validateTemplateAttributes, derivedAttributeKeys, resolvePassDesignId } from './template-aliases.js'
+import {
+  resolveTemplateAlias,
+  deriveTemplateAttributes,
+  validateTemplateAttributes,
+  derivedAttributeKeys,
+  resolvePassDesignId,
+  isVerifiedAiBirthcertName,
+  aiBirthcertKindOfName,
+} from './template-aliases.js'
+
+/**
+ * A name that mixes Basic and Verified wording ("Verified AI Birthcert, not the basic one"). Guessing either
+ * kind could issue the wrong credential, so it is asked about, with nothing priced, signed or paid.
+ */
+function unclearBirthcertKind(name: string): string {
+  return (
+    `"${name}" does not say clearly which AI Birthcert it means: it has both Basic and Verified wording. Ask the user ` +
+    `whether they want the Basic (self-declared) one or the Verified (MyDigital ID) one, then use "AI Birthcert" or ` +
+    `"verified_ai_birthcert".`
+  )
+}
+
+/** subscribe_and_issue's answer to an unclear name: nothing priced, signed or paid. */
+function unclearBirthcertIssue(name: string): SubscribeResult {
+  return { issued: false, reason: `${unclearBirthcertKind(name)} Nothing was paid.`, nextStep: 'follow_message' }
+}
+
+/** credential_preflight's answer to an unclear name: a blocker, nothing priced. */
+function unclearBirthcertPreflight(name: string): PreflightResult {
+  return { credential: name, ready: false, balances: [], blockers: [unclearBirthcertKind(name)], notChecked: [], nextStep: 'resolve_blockers' }
+}
 import type { ContractQueryInput, ContractQueryResult } from './clients/contract-query-client.js'
 import type {
   RequestAiBirthcertVerificationInput,
@@ -47,7 +77,7 @@ import type {
   ClearStuckPaymentReceiptInput,
   ClearStuckPaymentReceiptResult,
 } from './orchestrator/verify-ai-birthcert.js'
-import { credentialPreflight, VERIFIED_AI_BIRTHCERT, type PreflightInput } from './orchestrator/preflight.js'
+import { credentialPreflight, VERIFIED_AI_BIRTHCERT, type PreflightInput, type PreflightResult } from './orchestrator/preflight.js'
 import { isSponsored } from './accept-selection.js'
 import type { ContractQuery } from './clients/token-info-client.js'
 import {
@@ -195,6 +225,8 @@ export interface ToolDeps {
     request: (input: RequestAiBirthcertVerificationInput) => Promise<RequestVerificationResult>
     check: () => Promise<CheckVerificationResult>
     clearStuckReceipt: (input: ClearStuckPaymentReceiptInput) => Promise<ClearStuckPaymentReceiptResult>
+    /** An earlier payment the next request would reuse, for credential_preflight. Optional so tests can omit it. */
+    findUnusedPayment?: () => Promise<{ agentName: string; linkOpen: boolean } | undefined>
   }
 }
 
@@ -405,6 +437,16 @@ export function createTools(deps: ToolDeps) {
     },
 
     async subscribe_and_issue(input: SubscribeOpts) {
+      if (aiBirthcertKindOfName(input.templateId) === 'unclear') return unclearBirthcertIssue(input.templateId)
+      if (isVerifiedAiBirthcertName(input.templateId)) {
+        // never issued from a template, and never quietly downgraded to the Basic one.
+        return {
+          issued: false,
+          reason:
+            `"${input.templateId}" is the Verified AI Birthcert, which this tool cannot issue: nothing was paid. Use ` +
+            'request_ai_birthcert_verification for it. For the self-declared Basic AI Birthcert, use the name "AI Birthcert".',
+        }
+      }
       const resolved = resolveTemplateAlias(input.templateId, deps.config.network)
       const templateId = resolved ?? input.templateId
       const attributes = deriveTemplateAttributes(templateId, deps.config.network, input.attributes ?? {})
@@ -419,8 +461,11 @@ export function createTools(deps: ToolDeps) {
       // carries an inherited value of its own — a spread can only add the key, never clear it —
       // which would otherwise let a stale id leak into the signed data payload.
       const passDesignId = resolvePassDesignId(templateId, deps.config.network)
+      // Named in the price question, so the user's yes is to the kind they meant.
+      const basicId = resolveTemplateAlias('ai birthcert', deps.config.network)
+      const credentialLabel = basicId !== undefined && templateId === basicId ? 'Basic AI Birthcert (self-declared, not identity-verified)' : undefined
       const result = await subscribeAndIssue(
-        { ...deps.subscribeDeps, passDesignId },
+        { ...deps.subscribeDeps, passDesignId, ...(credentialLabel ? { credentialLabel } : {}) },
         { ...input, templateId, attributes },
       )
       if (!result.schema) return result
@@ -507,7 +552,10 @@ export function createTools(deps: ToolDeps) {
      * balances, the spending cap — into a single verdict, so the balance and the cap stop being two
      * sequential dead ends.
      */
-    async credential_preflight(input: PreflightInput) {
+    async credential_preflight(rawInput: PreflightInput) {
+      if (aiBirthcertKindOfName(rawInput.credential) === 'unclear') return unclearBirthcertPreflight(rawInput.credential)
+      // a loose name for the Verified one ("Verified AI Birthcert") is the Verified one, never the Basic template.
+      const input = isVerifiedAiBirthcertName(rawInput.credential) ? { ...rawInput, credential: VERIFIED_AI_BIRTHCERT } : rawInput
       if (input.credential === VERIFIED_AI_BIRTHCERT && !deps.verifyAiBirthcert) {
         // Not available here (mainnet, say): the agent must offer the Basic one only, not the Verified one it cannot issue.
         return {
@@ -543,6 +591,7 @@ export function createTools(deps: ToolDeps) {
           caps: deps.paymentCaps,
           policyGoverns: deps.policyGoverns,
           ...(deps.findHeldCredential ? { findHeld: deps.findHeldCredential } : {}),
+          ...(deps.verifyAiBirthcert?.findUnusedPayment ? { findUnusedPayment: deps.verifyAiBirthcert.findUnusedPayment } : {}),
         },
         input,
       )

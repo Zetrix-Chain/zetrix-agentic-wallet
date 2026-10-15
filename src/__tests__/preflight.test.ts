@@ -175,6 +175,58 @@ describe('credentialPreflight — know before you pay (R1)', () => {
     expect(out.fee?.paymentRequired).toBeUndefined()
   })
 
+  // with decimals unreadable, a bare raw count beside a ticker reads as whole tokens and is
+  // off by 10^decimals ("the balance is 473999900 JMYR" for 473.9999). Every amount must say it is
+  // in base units instead.
+  describe('when the fee asset decimals could not be read', () => {
+    const nullDecimals = vi.fn(async (token: string) => {
+      const symbol = token === JMYR ? 'JMYR' : token.toUpperCase()
+      const raw = token === JMYR ? '473' : '2000000'
+      return { token: symbol, balance: raw, decimals: null, display: `${raw} ${symbol}` }
+    })
+
+    it('labels the fee and the balance as base units in the blocker, never as whole tokens', async () => {
+      const out = await credentialPreflight(deps({ queryTokenBalance: nullDecimals }) as never, { credential: VERIFIED_AI_BIRTHCERT })
+
+      expect(out.ready).toBe(false)
+      const blocker = out.blockers.join(' ')
+      expect(blocker).toContain('the fee is 1000000 base units of JMYR')
+      expect(blocker).toContain('the balance is 473 base units of JMYR')
+      expect(blocker).not.toMatch(/the (fee|balance) is \d+ JMYR/)
+    })
+
+    it('labels fee.display as base units instead of returning a bare number', async () => {
+      const out = await credentialPreflight(deps({ queryTokenBalance: nullDecimals }) as never, { credential: VERIFIED_AI_BIRTHCERT })
+
+      expect(out.fee?.display).toBe('1000000 base units of JMYR')
+      expect(out.fee?.maxAmountRequired).toBe('1000000')
+    })
+
+    it('still renders whole tokens when decimals are known', async () => {
+      const out = await credentialPreflight(deps() as never, { credential: VERIFIED_AI_BIRTHCERT })
+
+      expect(out.fee?.display).toBe('1 JMYR')
+    })
+
+    it('labels both amounts in the cap blocker as base units too', async () => {
+      const funded = vi.fn(async (token: string) => ({
+        token: token === JMYR ? 'JMYR' : token.toUpperCase(),
+        balance: '5000000',
+        decimals: null,
+        display: '5000000 JMYR',
+      }))
+      const out = await credentialPreflight(
+        deps({ queryTokenBalance: funded, caps: { [JMYR]: '300000', '*': '0' } }) as never,
+        { credential: VERIFIED_AI_BIRTHCERT },
+      )
+
+      const blocker = out.blockers.join(' ')
+      expect(blocker).toContain('300000 base units of JMYR')
+      expect(blocker).toContain('1000000 base units of JMYR')
+      expect(blocker).not.toMatch(/(300000|1000000) JMYR/)
+    })
+  })
+
   it('still blocks on an insufficient balance when MBI says payment IS required', async () => {
     const d = deps({
       quoteTemplate: vi.fn().mockResolvedValue({
@@ -433,5 +485,117 @@ describe('credentialPreflight: the Basic-or-Verified note on an AI Birthcert', (
     expect(rest.ready).toBe(true)
     expect(rest.blockers).toEqual([])
     expect(rest.fee).toMatchObject({ maxAmountRequired: '1000000' })
+  })
+})
+
+// after a link expired, preflight quoted 1 JMYR again and the agent asked the user to agree to a
+// "second" and "third" payment that the wallet never made, because a new link reuses the earlier, unused payment.
+describe('credentialPreflight: an earlier Verified payment not used yet', () => {
+  it('reports it, and does not block on balance or cap, because the next link reuses it', async () => {
+    const d = deps({
+      queryTokenBalance: balances({ [JMYR]: '0', ZTX: '2000000' }),
+      caps: { [JMYR]: '0', '*': '0' },
+      findUnusedPayment: vi.fn().mockResolvedValue({ agentName: 'PMRBot', linkOpen: false }),
+    })
+    const out = await credentialPreflight(d as never, { credential: VERIFIED_AI_BIRTHCERT })
+    expect(out.unusedPayment).toMatchObject({ agentName: 'PMRBot', linkOpen: false })
+    expect(out.unusedPayment?.note).toMatch(/^No new payment is needed/)
+    expect(out.unusedPayment?.note).toMatch(/do not ask the user to agree to a fee/i)
+    expect(out.blockers).toEqual([])
+    expect(out.ready).toBe(true)
+  })
+
+  it('says a still-open link comes back only under the same name', async () => {
+    const d = deps({ findUnusedPayment: vi.fn().mockResolvedValue({ agentName: 'PMRBot', linkOpen: true }) })
+    const out = await credentialPreflight(d as never, { credential: VERIFIED_AI_BIRTHCERT })
+    expect(out.unusedPayment?.note).toMatch(/still open/i)
+    expect(out.unusedPayment?.note).toMatch(/same name, "PMRBot"/)
+  })
+
+  it('says that if the service refuses the earlier payment, a new link costs the fee again and the wallet says so first', async () => {
+    const d = deps({ findUnusedPayment: vi.fn().mockResolvedValue({ agentName: 'PMRBot', linkOpen: false }) })
+    const out = await credentialPreflight(d as never, { credential: VERIFIED_AI_BIRTHCERT })
+    expect(out.notChecked.join(' ')).toMatch(/refuses the earlier payment/i)
+  })
+
+  it('does nothing when there is no earlier payment', async () => {
+    const d = deps({ findUnusedPayment: vi.fn().mockResolvedValue(undefined) })
+    const out = await credentialPreflight(d as never, { credential: VERIFIED_AI_BIRTHCERT })
+    expect(out.unusedPayment).toBeUndefined()
+  })
+
+  it('a failed lookup is reported as not checked, and the fee still gates as normal', async () => {
+    const d = deps({
+      queryTokenBalance: balances({ [JMYR]: '0', ZTX: '2000000' }),
+      findUnusedPayment: vi.fn().mockRejectedValue(new Error('ssivc 503')),
+    })
+    const out = await credentialPreflight(d as never, { credential: VERIFIED_AI_BIRTHCERT })
+    expect(out.unusedPayment).toBeUndefined()
+    expect(out.notChecked.join(' ')).toMatch(/earlier payment.*could not be checked.*ssivc 503/i)
+    expect(out.blockers.join(' ')).toMatch(/Not enough JMYR/)
+  })
+
+  it('is not consulted for a template credential', async () => {
+    const find = vi.fn().mockResolvedValue({ agentName: 'PMRBot', linkOpen: false })
+    const out = await credentialPreflight(deps({ findUnusedPayment: find }) as never, { credential: 'did:zid:t-basic' })
+    expect(find).not.toHaveBeenCalled()
+    expect(out.unusedPayment).toBeUndefined()
+  })
+})
+
+// what to do next, as a field, so a weaker model does not have to dig it out of the prose.
+describe('credentialPreflight nextStep', () => {
+  // Review R1 (M3): an AI Birthcert carries the Basic-or-Verified question, so ready is not straight to collecting.
+  it('ready, an AI Birthcert: ask which kind unless the user said, then collect the details', async () => {
+    const out = await credentialPreflight(deps() as never, { credential: VERIFIED_AI_BIRTHCERT })
+    expect(out.nextStep).toBe('confirm_kind_then_collect_details')
+  })
+
+  it('ready, any other credential: collect the details next', async () => {
+    const out = await credentialPreflight(deps() as never, { credential: 'did:zid:t-other' })
+    expect(out.nextStep).toBe('collect_details')
+  })
+
+  it('blocked: resolve the blockers next', async () => {
+    const out = await credentialPreflight(deps({ queryTokenBalance: balances({ [JMYR]: '0', ZTX: '2000000' }) }) as never, {
+      credential: VERIFIED_AI_BIRTHCERT,
+    })
+    expect(out.nextStep).toBe('resolve_blockers')
+  })
+
+  it('already held: tell the user', async () => {
+    const d = deps({ findHeld: vi.fn().mockResolvedValue({ label: 'Verified AI Birthcert', vcId: 'did:zid:held' }) })
+    const out = await credentialPreflight(d as never, { credential: VERIFIED_AI_BIRTHCERT })
+    expect(out.nextStep).toBe('tell_user_already_held')
+  })
+
+  it('could not be priced: resolve the blockers', async () => {
+    const out = await credentialPreflight(deps({ quoteVerified: vi.fn().mockResolvedValue({ error: 'down' }) }) as never, {
+      credential: VERIFIED_AI_BIRTHCERT,
+    })
+    expect(out.nextStep).toBe('resolve_blockers')
+  })
+})
+
+describe('credentialPreflight: an earlier payment, when the price cannot be read or the payment is still settling', () => {
+  it('a failed price read does not block when the next link reuses an earlier payment', async () => {
+    const d = deps({
+      quoteVerified: vi.fn().mockResolvedValue({ error: 'ssivc down' }),
+      findUnusedPayment: vi.fn().mockResolvedValue({ agentName: 'PMRBot', linkOpen: false }),
+    })
+    const out = await credentialPreflight(d as never, { credential: VERIFIED_AI_BIRTHCERT })
+    expect(out.unusedPayment).toMatchObject({ agentName: 'PMRBot' })
+    expect(out.blockers).toEqual([])
+    expect(out.ready).toBe(true)
+    expect(out.notChecked.join(' ')).toMatch(/price could not be read.*ssivc down/i)
+  })
+
+  it('a payment still settling is reported, and points at check_ai_birthcert_verification', async () => {
+    const d = deps({ findUnusedPayment: vi.fn().mockResolvedValue({ agentName: 'PMRBot', linkOpen: false, settling: true }) })
+    const out = await credentialPreflight(d as never, { credential: VERIFIED_AI_BIRTHCERT })
+    expect(out.unusedPayment).toMatchObject({ settling: true })
+    expect(out.unusedPayment?.note).toMatch(/^No new payment is needed/)
+    expect(out.unusedPayment?.note).toMatch(/still being settled/i)
+    expect(out.unusedPayment?.note).toMatch(/check_ai_birthcert_verification/)
   })
 })

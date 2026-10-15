@@ -75,6 +75,9 @@ bait-and-switch.
 State the whole picture in one message: the fee (`fee.display`), which side pays gas
 (`fee.gasModel`), the balances, whether the wallet is ready, and — for a template credential — the
 attributes it will need. Then either collect the details, or say exactly what to fix and stop.
+One exception: when a Verified result has `unusedPayment`, an earlier payment has not been used yet
+and the next link reuses it, so do not quote the fee as a charge and do not ask the user to agree to
+one. Follow its `note` instead.
 
 **Relay `notChecked` as well.** A ready result is not a guarantee. In particular preflight cannot
 tell you whether an agent name is free — myid decides that at issuance, after payment — so never
@@ -108,22 +111,38 @@ spend from the user's wallet. Every time:
 
 1. Say what is being bought and the amount, in the asset the challenge quotes.
 2. Say whether the wallet is on testnet or mainnet.
-3. Get the user's agreement.
+3. Get the user's agreement. `subscribe_and_issue` and `request_ai_birthcert_verification` enforce
+   this: called without a confirmed price, a call that would pay returns `needsConfirmation: true`
+   with a `quote` and an `askUser` question, and pays nothing. Ask that question, and only after the
+   user's explicit yes call again with `confirm` set to that exact `quote` object, unchanged
+   (`confirm: true` is not accepted for these two). If the payment request has changed since
+   (token, amount, payee or gas model), nothing is paid and you get the new price to ask about.
+   Results also carry `nextStep`, the one thing to do next: `ask_user_to_confirm_payment`,
+   `show_link_and_wait`, `wait_then_check`, `ask_user_whether_to_replace`, `tell_user_already_held`,
+   `show_credential`, `collect_details`, `confirm_kind_then_collect_details`, `resolve_blockers`, or
+   `follow_message` (tell the user what the text says and take only the next step it names; never
+   retry a payment on your own).
 4. For a credential via `subscribe_and_issue`, call `get_template_schema` **first** — it is free, and
    it tells you which attributes are required. Paying before checking risks paying for an issuance
    that then fails.
 5. For `request_ai_birthcert_verification`, get `agentName` from the user directly — never invent it
    — and tell them it must be unique. Payment happens at session creation, and myid checks the name only afterwards, at issuance; a duplicate name is refused then, and whether the fee was spent cannot be confirmed, so never tell the user they were or were not charged for it. Calling this
    tool again with the SAME name while a session is still pending does not pay again — it returns
-   that same session.
+   that same session. A new link after an expired one does not pay again either: it reuses the
+   payment already made, which is only used up once the credential is issued. Each result says
+   whether that call paid in `paidThisCall`; count a fee only when it is `true`, and never tell the
+   user they paid once per link.
 6. Before it pays, `request_ai_birthcert_verification` checks whether this holder already has a
    Verified AI Birthcert. If one is found and still valid, nothing is paid — show it to the user and
    only call the tool again with `confirmReplaceExistingVc` if they explicitly ask to replace it. An
-   already-expired one is replaced automatically, no confirmation needed. It can also refuse with
+   already-expired one needs no `confirmReplaceExistingVc`, but the payment still stops at the
+   price like any other. It can also refuse with
    `{ error }` when an already-issued credential exists but could not be confirmed — relay that error
    as given rather than retrying blindly.
 7. `subscribe_and_issue` has the same check, its own way: a still-valid cached credential is always
-   returned for free with no confirmation needed (`fromCache: true`). `forceReissue: true` on its own
+   returned for free with no confirmation needed (`issued: false, alreadyHeld: true, fromCache: true`):
+   tell the user they already have it, never that it was just issued. If `differsFromRequest` is set
+   (a different username, say), tell the user and ask whether to keep it or replace it. `forceReissue: true` on its own
    does **not** pay either — it only returns that same existing credential (`issued: false, reason`)
    so it can be shown to the user first. Only call it again with `forceReissue: true` **and**
    `confirmReplaceExistingVc` set to the exact `vcId` you were shown if the user explicitly asks to
@@ -363,6 +382,11 @@ same amount in whole tokens with its symbol. **Quote `display`.** A raw count be
 as whole tokens and is wrong by orders of magnitude: `1000000` of a 6-decimal token is one, not a
 million. Ask for several tokens at once with `tokens` when you need to know whether a payment is
 affordable — the fee and the ZTX for gas are separate balances.
+
+**If `decimals` is `null`, `display` is not whole tokens.** The token's decimals could not be read, so
+`display` carries the raw base-unit count beside the symbol (or the amount is labelled "base units").
+Do not quote it as a balance: say the amount could not be converted to whole tokens. The same goes
+for each entry of `tokens` and for the amounts in `credential_preflight`.
 
 **A balance you did not read is not a balance.** If a lookup returns `query_failed` or
 `unknown_token`, say the read failed and offer to retry. Never infer, compute or reconstruct a

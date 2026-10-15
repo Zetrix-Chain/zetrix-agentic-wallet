@@ -72,6 +72,79 @@ function normalize(s: string): string {
 }
 
 /**
+ * A word that says Verified. Matched inside the word, not as a whole word, so a name written without separators
+ * ("VerifiedAIBirthcert", "MyIDverified") still counts (review R3: whole-word matching sent those to Basic).
+ * "verifiable" is not one (every credential is verifiable), and "unverified" / "nonverified" / "notverified" say Basic.
+ */
+function saysVerified(word: string): boolean {
+  if (/^(un|non|not)verif/.test(word)) return false
+  return (word.includes('verif') && !word.includes('verifiable')) || word.includes('mydigital') || word === 'myid'
+}
+
+/** A word that says Basic: self-declared, or not verified. */
+function saysBasic(word: string): boolean {
+  return ['basic', 'self', 'selfdeclared', 'declared'].includes(word) || /^(un|non|not)verif/.test(word)
+}
+
+/** Words that cancel the Verified or Basic word right after them ("not verified", "not the basic one"). */
+const NEGATORS = new Set(['not', 'non', 'no', 'un', 'without'])
+/** "self" also cancels a Verified word: "self-verified" is self-declared. */
+const VERIFIED_NEGATORS = new Set([...NEGATORS, 'self'])
+/** A negation never reaches across these: in "not self-declared but verified" the "not" belongs to "self-declared". */
+const CLAUSE_BREAKS = new Set(['but', 'and', 'or'])
+
+/** Whether a negator stands up to three words before `i`, within the same clause. */
+function negated(words: string[], i: number, negators: Set<string>): boolean {
+  for (let j = i - 1; j >= 0 && j >= i - 3; j--) {
+    if (CLAUSE_BREAKS.has(words[j])) return false
+    if (negators.has(words[j])) return true
+  }
+  return false
+}
+
+/**
+ * Which AI Birthcert a loose name means: 'verified', 'basic', 'unclear' when it carries both kinds of wording ("Verified
+ * basic AI Birthcert"), or undefined when it is not an AI Birthcert name at all. An unclear name resolves to
+ * no template, so it is asked about rather than issued or priced as either kind.
+ *
+ * A negated word counts for the other side (review R3): "not yet verified" says Basic, and "not the basic one" or
+ * "not self-declared" says Verified, so "Verified AI Birthcert, not the basic one" is plainly Verified.
+ */
+export function aiBirthcertKindOfName(input: string): 'verified' | 'basic' | 'unclear' | undefined {
+  if (/^did:zid:/.test(input)) return undefined
+  if (!normalize(input).includes('birthcert')) return undefined
+  const words = input.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean)
+  let verified = false
+  let basic = false
+  words.forEach((w, i) => {
+    if (saysVerified(w)) {
+      if (negated(words, i, VERIFIED_NEGATORS)) basic = true
+      else verified = true
+    } else if (saysBasic(w)) {
+      if (negated(words, i, NEGATORS)) verified = true
+      else basic = true
+    }
+  })
+  if (verified && basic) return 'unclear'
+  return verified ? 'verified' : 'basic'
+}
+
+/**
+ * True for a loose name of the VERIFIED AI Birthcert ("Verified AI Birthcert", "verified birthcert",
+ * "verified_ai_birthcert", "birthcert verification", "MyDigital ID AI Birthcert"), which no template alias may
+ * resolve. Every such name also contains "birthcert", so before this it resolved to the BASIC template:
+ * in the Doc1 QA run a user who chose Verified was priced, and could have been issued, the Basic one.
+ *
+ * Verification wording (verified / verify / verification, MyDigital ID, MyID) means Verified; a negating or
+ * self-declared word ("not yet verified", "non-verified", "self-verified", "without verification", "basic") means
+ * Basic. A guess either way costs nothing: subscribe_and_issue refuses a Verified name, and the paid tools ask before
+ * paying.
+ */
+export function isVerifiedAiBirthcertName(input: string): boolean {
+  return aiBirthcertKindOfName(input) === 'verified'
+}
+
+/**
  * Find the registry entry for a caller-supplied templateId — either a natural-language alias
  * (matched by normalized substring) or an already-resolved raw did:zid:... id (matched by
  * equality against the entry's id for the active network). Shared by resolveTemplateAlias and
@@ -83,6 +156,8 @@ function findEntry(templateId: string, network: string): TemplateAliasEntry | un
     const key = network.includes('testnet') ? 'testnet' : 'mainnet'
     return TEMPLATE_ALIASES.find((e) => e[key] === templateId)
   }
+  const kind = aiBirthcertKindOfName(templateId)
+  if (kind === 'verified' || kind === 'unclear') return undefined
   const normalized = normalize(templateId)
   return TEMPLATE_ALIASES.find((e) => normalized.includes(e.match))
 }
