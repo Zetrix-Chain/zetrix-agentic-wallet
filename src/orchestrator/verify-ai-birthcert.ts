@@ -24,7 +24,19 @@ import {
   type SsivcSessionOutcome,
 } from '../clients/ssivc-client.js'
 import { orderAccepts, isSponsored, type GasPreference } from '../accept-selection.js'
-import { asPriceConfirmation, gasNote, priceMismatch, quoteOf, type PriceConfirmation } from '../price-confirmation.js'
+import {
+  asPriceConfirmation,
+  defaultQuoteBook,
+  gasNote,
+  priceMismatch,
+  quoteOf,
+  quoteVerdictLead,
+  QUOTE_TERMS,
+  type ConfirmedQuote,
+  type QuoteBinding,
+  type QuoteBook,
+  type QuoteVerdict,
+} from '../price-confirmation.js'
 import type { PayRequirement } from '../clients/mbi-client.js'
 import type { SsivcSessionStore, StoredSsivcSession } from '../clients/ssivc-session-store.js'
 import type { DownloadQuarantineStore } from '../clients/ssivc-download-quarantine-store.js'
@@ -94,6 +106,8 @@ export interface VerifyAiBirthcertDeps {
    * fallback, same as before this existed.
    */
   formatAssetAmount?: (asset: string, raw: string) => Promise<string>
+  /** The quotes this wallet has given. Absent: the process-wide book. */
+  quoteBook?: QuoteBook
   /**
    * Directory to write the MBI pass-design PNG(s) into, decoded from `extraData.vcPassBase64` on
    * the matched download entry. Optional — when unset, the pass image is simply not written
@@ -1317,6 +1331,7 @@ async function attemptCandidate(
   accept: PayRequirement,
   buildBody: () => Promise<SsivcSessionRequestBody>,
   onQueued: (receipt: string) => Promise<void>,
+  onSigned: () => void = () => {},
 ): Promise<{ session: SsivcSessionCreated; paymentReceipt: string }> {
   let xPayment: string
   try {
@@ -1324,6 +1339,7 @@ async function attemptCandidate(
   } catch (err) {
     throw new PrepareStageError(err)
   }
+  onSigned()
   const initialOutcome = await deps.ssivc.createSessionSettle(await buildBody(), xPayment)
   return resolveSettlement(deps, buildBody, initialOutcome, onQueued)
 }
@@ -1335,7 +1351,8 @@ async function payAndCreateSession(
   >,
   buildBody: () => Promise<SsivcSessionRequestBody>,
   onQueued: (receipt: string) => Promise<void>,
-  confirmed: PriceConfirmation,
+  confirmed: ConfirmedQuote,
+  book: QuoteBook,
 ): Promise<{ session: SsivcSessionCreated; paymentReceipt: string }> {
   const challenge = await deps.ssivc.createSessionChallenge(await buildBody())
   // The confirmed gas model picks the option (review R1): the user agreed to that option's price, not the other's.
@@ -1344,9 +1361,10 @@ async function payAndCreateSession(
   if (!primary) throw new NoPaymentOptionsError('SSIVC 402 returned no usable payment options')
   const difference = priceMismatch(confirmed, quoteOf(primary))
   if (difference) throw new PriceChangedError(verificationQuoteOf(primary), difference)
-
   try {
-    return await attemptCandidate(deps, primary, buildBody, onQueued)
+    // The quote is spent once the payment is signed: from then on money can move, so it is never paid twice. A
+    // refusal before that (funds, cap, spending policy) leaves it usable, so the user need not be asked again.
+    return await attemptCandidate(deps, primary, buildBody, onQueued, () => book.consume(confirmed.quoteId))
   } catch (err) {
     // Sponsored refused before any money moved: self-pay is the only option left, but it is a different price (its
     // own token and amount, plus ZTX gas), so it is offered to the user rather than paid (review R1). Never the
@@ -1427,16 +1445,41 @@ async function askToConfirmPayment(
 ): Promise<RequestVerificationResult> {
   const quoted = await quoteVerification(deps, agentName, input)
   if (!('quote' in quoted)) return quoted
-  return needsConfirmationResult(deps, quoted.quote, lead)
+  return needsConfirmationResult(deps, quoted.quote, lead, verificationBinding(agentName, input))
+}
+
+/** What a Verified quote is for: this agent name, with these optional details. */
+function verificationBinding(agentName: string, input: RequestAiBirthcertVerificationInput): QuoteBinding {
+  return { tool: 'request_ai_birthcert_verification', subject: agentName, details: canonicalizeJson(optionalRequestFields(input)) }
+}
+
+/** Whether `confirm` is a quote this wallet gave for this request, unexpired, unused and unchanged. */
+function confirmationVerdict(
+  deps: VerifyAiBirthcertDeps,
+  agentName: string,
+  input: RequestAiBirthcertVerificationInput,
+): { verdict: QuoteVerdict | 'none'; confirmed?: ConfirmedQuote } {
+  const confirmed = asPriceConfirmation(input.confirm)
+  if (!confirmed) return { verdict: 'none' }
+  return { verdict: (deps.quoteBook ?? defaultQuoteBook).check(confirmed.quoteId, verificationBinding(agentName, input), confirmed), confirmed }
 }
 
 /** The price stop itself, for a quote already in hand (an unconfirmed call, or a payment request that changed). */
 async function needsConfirmationResult(
   deps: VerifyAiBirthcertDeps,
-  quote: VerificationQuote,
+  priced: VerificationQuote,
   lead: string,
+  binding: QuoteBinding,
   afterDiscard = false,
 ): Promise<RequestVerificationNeedsConfirmation> {
+  // Every price stop gives a fresh quote id, bound to this request.
+  const { quoteId } = (deps.quoteBook ?? defaultQuoteBook).issue(binding, {
+    asset: priced.asset,
+    maxAmountRequired: priced.maxAmountRequired,
+    payTo: priced.payTo ?? '',
+    gasModel: priced.gasModel,
+  })
+  const quote = { ...priced, quoteId }
   const display = (await renderPrice(deps.formatAssetAmount, quote.asset, quote.maxAmountRequired)) + gasNote(quote)
   // After a discard the receipt is gone, so repeating discardStuckReceiptAndPayFresh would be refused (review R2).
   const keep = afterDiscard
@@ -1452,8 +1495,8 @@ async function needsConfirmationResult(
     message:
       `NOT PAID YET: ${lead}starting this verification costs ${display}, and nothing has been paid. Tell the user the price ` +
       `and ask. Only after their explicit yes to this payment, call again with confirm set to this exact quote object ` +
-      `(asset, maxAmountRequired, payTo, gasModel, unchanged). ${keep} A yes to something else, such as the name, is not a ` +
-      `yes to the payment; confirm: true is not accepted.`,
+      `(asset, maxAmountRequired, payTo, gasModel, quoteId, unchanged). ${QUOTE_TERMS} ${keep} A yes to something else, such ` +
+      `as the name, is not a yes to the payment; confirm: true is not accepted.`,
   }
 }
 
@@ -1879,14 +1922,18 @@ async function requestAiBirthcertVerificationLockedInner(
   }
   // Paying again is a payment like any other, so it stops at the price first (review R1). Checked before anything is
   // discarded, so an unconfirmed call leaves the receipt where it was; the same refusals as the real discard apply.
-  if (!asPriceConfirmation(input.confirm)) {
+  // a quote that is not valid for this request is caught here too, before the receipt is thrown away.
+  const discardVerdict = confirmationVerdict(deps, agentName, input).verdict
+  if (discardVerdict !== 'ok') {
     const check = await discardStuckReceiptBeforePaying(deps, input.discardStuckReceiptAndPayFresh, { checkOnly: true })
     if ('refusal' in check) return check.refusal
     return askToConfirmPayment(
       deps,
       agentName,
       input,
-      `receipt ${input.discardStuckReceiptAndPayFresh} has NOT been discarded yet. Starting over forfeits it and `,
+      `receipt ${input.discardStuckReceiptAndPayFresh} has NOT been discarded yet. ` +
+        (discardVerdict === 'none' ? '' : quoteVerdictLead(discardVerdict)) +
+        `Starting over forfeits it and `,
     )
   }
   const outcome = await discardStuckReceiptBeforePaying(deps, input.discardStuckReceiptAndPayFresh)
@@ -1944,8 +1991,11 @@ async function payOrReplayLocked(
   // a call that would pay stops at the price unless the user has said yes. Not a replay (it pays nothing), and
   // not discardStuckReceiptAndPayFresh: its exact receipt id is the user's agreement to pay again, and by now it has
   // already discarded that receipt, so stopping here would strand them.
-  const confirmed = asPriceConfirmation(input.confirm)
-  if (decision.kind === 'pay_fresh' && !confirmed) return askToConfirmPayment(deps, agentName, input)
+  const { verdict, confirmed } = confirmationVerdict(deps, agentName, input)
+  if (decision.kind === 'pay_fresh' && verdict !== 'ok') {
+    // only a quote this wallet gave, for this request, unexpired, unused and unchanged.
+    return askToConfirmPayment(deps, agentName, input, verdict === 'none' ? '' : quoteVerdictLead(verdict))
+  }
 
   /**
    * The optional fields this request should carry: what was already paid for, with an explicit
@@ -2043,7 +2093,8 @@ async function payOrReplayLocked(
         buildBody,
         persistQueuedReceipt,
         // Set on this path: the gate above returned for an unconfirmed fresh payment.
-        confirmed as PriceConfirmation,
+        confirmed as ConfirmedQuote,
+        deps.quoteBook ?? defaultQuoteBook,
       )
     }
   } catch (rawErr) {
@@ -2069,6 +2120,7 @@ async function payOrReplayLocked(
         deps,
         err.quote,
         `the payment request is not what the user agreed to (${err.difference}), so nothing was paid. The new price: `,
+        verificationBinding(agentName, input),
         // payOrReplayLocked runs with this set only after the receipt has been discarded (requestAiBirthcertVerificationLockedInner).
         input.discardStuckReceiptAndPayFresh !== undefined,
       )

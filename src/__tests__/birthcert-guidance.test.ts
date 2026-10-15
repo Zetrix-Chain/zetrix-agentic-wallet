@@ -383,9 +383,9 @@ describe('confirm is declared as the quote object in the schema', () => {
       required: string[]
     }
     expect(confirm.type).toBe('object')
-    expect(Object.keys(confirm.properties).sort()).toEqual(['asset', 'assetSymbol', 'gasModel', 'maxAmountRequired', 'payTo'])
+    expect(Object.keys(confirm.properties).sort()).toEqual(['asset', 'assetSymbol', 'gasModel', 'maxAmountRequired', 'payTo', 'quoteId'])
     expect(confirm.properties.gasModel.enum).toEqual(['sponsored', 'self'])
-    expect(confirm.required.sort()).toEqual(['asset', 'gasModel', 'maxAmountRequired'])
+    expect(confirm.required.sort()).toEqual(['asset', 'gasModel', 'maxAmountRequired', 'quoteId'])
   })
 
   it('every next step a result can carry is named for the agent', () => {
@@ -400,5 +400,46 @@ describe('docs match the behaviour', () => {
   it('the README does not say a refused sponsored option falls back to self-pay on its own', () => {
     expect(README).not.toMatch(/automatically falls back to paying gas itself/i)
     expect(README).toMatch(/self-pay price/i)
+  })
+})
+
+// a confirmation is the quote the wallet gave, for this request, within 10 minutes, once.
+describe('the quote id rule is stated wherever confirm is', () => {
+  it.each(['request_ai_birthcert_verification', 'subscribe_and_issue'])('%s says the quote has a quoteId, is good for 10 minutes, for this request, once', (name) => {
+    const t = tool(name)
+    const all = [t.description, t.inputSchema.properties.confirm.description ?? ''].join(' ')
+    expect(all).toMatch(/quoteId/)
+    expect(all).toMatch(/10 minutes/)
+    expect(all).toMatch(/only for (this|that) request/i)
+    expect(all).toMatch(/once/i)
+  })
+
+  it('the skill and README say the same', () => {
+    expect(SKILL).toMatch(/quoteId/)
+    expect(SKILL).toMatch(/10 minutes/)
+    expect(README).toMatch(/quoteId/)
+  })
+})
+
+// Two different apps: the Verified AI Birthcert OWNER check is done in the MyDigital ID app; the link and QR
+// from create_verification_qr open in the MyID wallet. The wallet's own text used to say the owner check happens
+// in "the MyID app", and the agent repeated it to the user.
+describe('the MyDigital ID app (owner check) and the MyID wallet (QR) are never swapped', () => {
+  const USER_GUIDE = readDoc('openclaw-plugin', 'USER_GUIDE.md')
+  const CHOICE = readDoc('src', 'orchestrator', 'birthcert-choice.ts')
+  const QR = readDoc('src', 'orchestrator', 'verification-qr.ts')
+
+  it('every place that describes the Verified owner check says the MyDigital ID app, never the MyID app', () => {
+    for (const [name, text] of [['SKILL.md', SKILL], ['USER_GUIDE.md', USER_GUIDE], ['birthcert-choice.ts', CHOICE]] as const) {
+      expect(text, name).toMatch(/owner completes a check in the MyDigital ID app/)
+      expect(text, name).not.toMatch(/MyID app/)
+    }
+  })
+
+  it('every place that describes the verification QR says the MyID wallet, never the MyID app', () => {
+    for (const [name, text] of [['README.md', README], ['SKILL.md', SKILL], ['USER_GUIDE.md', USER_GUIDE], ['verification-qr.ts', QR]] as const) {
+      expect(text, name).toMatch(/MyID wallet/)
+      expect(text, name).not.toMatch(/in the MyID app|MyID app/)
+    }
   })
 })

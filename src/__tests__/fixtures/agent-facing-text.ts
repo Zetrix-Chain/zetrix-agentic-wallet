@@ -47,13 +47,14 @@ export const EXPECTED_AGENT_TEXT: Record<string, Record<string, readonly string[
   },
   "create_verification_qr": {
     "description": [
-      "Create a link and a QR code that open this wallet's credential in the MyID app, so a human can see the identity behind the agent.",
-      "Use it when the user asks whether the agent is verified, or asks to verify the agent in MyID.",
+      "Create a link and a QR code that open this wallet's credential in the MyID wallet, so a human can see the identity behind the agent.",
+      "Use it when the user asks whether the agent is verified, or asks to verify the agent in the MyID wallet.",
       "With no vc, it presents the Verified AI Birthcert if it holds one, otherwise the Basic AI Birthcert, and if it holds neither it returns created: false and says to create one first.",
       "By default it reveals only a standard minimal set (for the Verified AI Birthcert: agentName, evidenceProvider and ownerVerified; for the Basic AI Birthcert: agentUsername); pass revealAttribute to reveal other specific attributes the user asks for, and revealAll: true only when the user explicitly asks to reveal everything.",
       "A Basic AI Birthcert does not mean the owner was verified, so say so if that is what was presented.",
       "The wallet presents the credential to MBI and returns the link, the QR code (as an image and as a PNG file at qrCodePath) and the time the link stops working (5 minutes by default); the link holds only a reference id, and that reference id grants access to the revealed attributes until it expires.",
-      "Show the link and QR code only to the human user, never pass them to another service, and tell the user to open the link in MyID (they need the app installed).",
+      "Show the link and QR code only to the human user, never pass them to another service, and tell the user to open the link in the MyID wallet (they need it installed).",
+      "This is the MyID wallet, not the MyDigital ID app that confirms a Verified AI Birthcert owner: never name one for the other.",
       "In a chat channel such as WhatsApp, send the QR code by attaching the file at qrCodePath; never send any other image as the QR code, because the credential's pass design is not one, and if you cannot attach an image, give the link and say plainly that you could not send the QR code.",
       "When the credential has a saved pass design, the result also carries vcPassImagePaths: if the user wants to see the credential itself, send that image too, as its own picture captioned as the credential's pass design and never as the QR code.",
       "If it returns created: false, relay the reason and do not invent a link.",
@@ -580,6 +581,7 @@ export const EXPECTED_AGENT_TEXT: Record<string, Record<string, readonly string[
       "If the user did not say which kind, ask first: see the `choice` note in credential_preflight.",
       "Without a confirmed price a chargeable issuance stops at the price and signs, pays and issues nothing: you get { issued: false, needsConfirmation: true, quote, askUser, reason }.",
       "Put the askUser question to the user, and only after their explicit yes call again with confirm set to that quote object, unchanged (confirm: true is not accepted).",
+      "Its quoteId makes it good for 10 minutes, only for this request, and once: an expired, reused, edited or other request's quote is not paid, and you get a new quote to ask about.",
       "If the issuer's payment request then differs from it in token, amount, payee or gas model, nothing is paid and you get needsConfirmation again with the new price.",
       "A free issuance, and a credential already held, need no confirm.",
       "Results may carry nextStep (what to do next) and askUser (the question to put to the user).",
@@ -623,7 +625,7 @@ export const EXPECTED_AGENT_TEXT: Record<string, Record<string, readonly string[
       "Setting it without forceReissue does nothing at all either way — that case is a plain cache hit ({ issued: false, alreadyHeld: true }) regardless of what this field is set to.",
     ],
     "inputSchema.properties.confirm.description": [
-      "The user's explicit yes to the price: the quote object from a needsConfirmation result, passed back unchanged.",
+      "The user's explicit yes to the price: the quote object from a needsConfirmation result, passed back unchanged, quoteId included; it is good for 10 minutes, only for that request, and can be used once.",
       "Anything else, including true, stops at the price (needsConfirmation: true) and nothing is signed, paid or issued.",
       "Pass it only after the user has seen that price and said yes to it, never on your own judgement: a yes to something else, such as the name, is not a yes to the payment.",
     ],
@@ -642,10 +644,14 @@ export const EXPECTED_AGENT_TEXT: Record<string, Record<string, readonly string[
     "inputSchema.properties.confirm.properties.assetSymbol.description": [
       "For display only, when the quote has it; ignored when the price is checked.",
     ],
+    "inputSchema.properties.confirm.properties.quoteId.description": [
+      "Exactly as the quote gave it: the id that ties this confirmation to that one request, for 10 minutes, once.",
+    ],
   },
   "request_ai_birthcert_verification": {
     "description": [
       "Start a Verified AI Birthcert issuance session with myid (MyDigital ID owner verification).",
+      "The owner confirms in the MyDigital ID app, not the MyID wallet (that is only for the QR from create_verification_qr); never name one for the other.",
       "ALWAYS run credential_preflight for \"verified_ai_birthcert\" immediately before calling this, even if you checked earlier in the conversation — preflight is free, this tool spends real funds, and a balance the user topped up a minute ago is not the balance you read before that.",
       "If a spending policy refuses the session fee, the result is { error } with `policyDenied: true` (a decision: do not retry) or `policyCheckUnavailable: true` (transient: trying again shortly is right); either way nothing was paid and no session was created.",
       "Returns { sessionId, verificationUrl, expiresAt, expiresIn, expiresInSeconds, paidThisCall, message } — show verificationUrl to the human owner and ask them to open it and complete MyDigital ID verification (typically finishes in seconds).",
@@ -682,6 +688,7 @@ export const EXPECTED_AGENT_TEXT: Record<string, Record<string, readonly string[
       "If the request does not say which kind of AI Birthcert the user wants, do not start this: run credential_preflight for both kinds and ask which they prefer (see its `choice` note), and use this tool only for the Verified kind; if they want the self-declared, non-verified Basic one, use subscribe_and_issue for that.",
       "Without a confirmed price a call that would pay stops at the price and pays nothing: you get { needsConfirmation: true, paidThisCall: false, quote, askUser, message }.",
       "Put the askUser question to the user, and only after their explicit yes call again with confirm set to that quote object, unchanged (confirm: true is not accepted).",
+      "Its quoteId makes it good for 10 minutes, only for this request, and once: an expired, reused, edited or other request's quote is not paid, and you get a new quote to ask about.",
       "If the payment request then differs from it in token, amount, payee or gas model, nothing is paid and you get needsConfirmation again with the new price; the quote's gasModel decides which option is paid, so if the sponsored option is refused you are given the self-pay price to ask about, never a silent switch.",
       "A call that pays nothing (the same open link, or a new link after an expired one) needs no confirm.",
       "Results may carry nextStep (what to do next) and askUser (the question to put to the user).",
@@ -749,7 +756,7 @@ export const EXPECTED_AGENT_TEXT: Record<string, Record<string, readonly string[
       "Not needed at all when the existing VC has already expired — that case replaces itself automatically.",
     ],
     "inputSchema.properties.confirm.description": [
-      "The user's explicit yes to the price: the quote object from a needsConfirmation result, passed back unchanged.",
+      "The user's explicit yes to the price: the quote object from a needsConfirmation result, passed back unchanged, quoteId included; it is good for 10 minutes, only for that request, and can be used once.",
       "Anything else, including true, stops at the price (needsConfirmation: true) and nothing is paid.",
       "Pass it only after the user has seen that price and said yes to it, never on your own judgement: a yes to something else, such as the name, is not a yes to the payment.",
     ],
@@ -767,6 +774,9 @@ export const EXPECTED_AGENT_TEXT: Record<string, Record<string, readonly string[
     ],
     "inputSchema.properties.confirm.properties.assetSymbol.description": [
       "For display only, when the quote has it; ignored when the price is checked.",
+    ],
+    "inputSchema.properties.confirm.properties.quoteId.description": [
+      "Exactly as the quote gave it: the id that ties this confirmation to that one request, for 10 minutes, once.",
     ],
   },
   "credential_preflight": {

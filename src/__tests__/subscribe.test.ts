@@ -3,10 +3,19 @@ import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { subscribeAndIssue } from '../orchestrator/subscribe'
+import { QuoteBook } from '../price-confirmation'
+import { confirmedInput, subscribeBindingFor } from './helpers/confirmed-quote'
 import { zetrixHexStringToBytes } from '../zetrix-hex'
 import { PaymentReadinessError } from '../payment-readiness'
 import { MbiError } from '../clients/mbi-client'
 import type { DownloadQuarantineStore } from '../clients/ssivc-download-quarantine-store'
+
+/** Calls the tool with its echoed quote registered for this request, as the wallet's price stop would have. */
+async function subscribeConfirmed(deps: unknown, opts: unknown) {
+  const o = opts as Record<string, unknown>
+  const book = (deps as { quoteBook?: QuoteBook }).quoteBook
+  return subscribeAndIssue(deps as never, confirmedInput(o, subscribeBindingFor(o), book) as never)
+}
 
 const holderDid = 'did:zid:holder-self-1'
 // confirm: true, so the tests below reach the payment they are about.
@@ -41,7 +50,7 @@ describe('subscribeAndIssue', () => {
     const resolveSymbol = vi.fn().mockResolvedValue('JMYR')
     const resolveTemplateFields = vi.fn().mockResolvedValue(fieldsWithAgentDid)
 
-    const out = await subscribeAndIssue({ mbi, sign, pay, resolveSymbol, holderDid, resolveTemplateFields }, opts)
+    const out = await subscribeConfirmed({ mbi, sign, pay, resolveSymbol, holderDid, resolveTemplateFields }, opts)
 
     expect(sign).toHaveBeenCalledWith(expectedBlob)
     expect(mbi.applyChallenge).toHaveBeenCalledWith({ data: expectedData, signData: 'sig', publicKey: 'pk' })
@@ -70,7 +79,7 @@ describe('subscribeAndIssue', () => {
       { templateId: 'did:zid:t-1', passDesignId: 'pd-123', metadata: { agentDid: holderDid, agentName: 'Jak Sparrow', purpose: 'x401+x402' } },
     ])
 
-    await subscribeAndIssue({ mbi, sign, pay, holderDid, resolveTemplateFields, passDesignId: 'pd-123' }, opts)
+    await subscribeConfirmed({ mbi, sign, pay, holderDid, resolveTemplateFields, passDesignId: 'pd-123' }, opts)
 
     expect(mbi.applyChallenge).toHaveBeenCalledWith({ data: dataWithPassDesignId, signData: 'sig', publicKey: 'pk' })
     expect(sign).toHaveBeenCalledWith(zetrixHexStringToBytes(dataWithPassDesignId).toString('hex'))
@@ -85,7 +94,7 @@ describe('subscribeAndIssue', () => {
     const pay = vi.fn().mockResolvedValue('X-PAYMENT-B64')
     const resolveTemplateFields = vi.fn().mockResolvedValue(fieldsWithAgentDid)
 
-    await subscribeAndIssue({ mbi, sign, pay, holderDid, resolveTemplateFields }, opts)
+    await subscribeConfirmed({ mbi, sign, pay, holderDid, resolveTemplateFields }, opts)
 
     expect(mbi.applyChallenge).toHaveBeenCalledWith({ data: expectedData, signData: 'sig', publicKey: 'pk' })
   })
@@ -95,7 +104,7 @@ describe('subscribeAndIssue', () => {
       applyChallenge: vi.fn().mockResolvedValue({ x402Version: 2, accepts: [accept], paymentId: 'pid-1' }),
       applySettle: vi.fn().mockResolvedValue({ vcId: 'did:zid:vc', paymentId: 'pid-1', txHash: '0xabc', verifiableCredential: { id: 'vc' } }),
     }
-    const out = await subscribeAndIssue(
+    const out = await subscribeConfirmed(
       { mbi, sign: vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' }), pay: vi.fn().mockResolvedValue('X'), holderDid },
       opts,
     )
@@ -112,7 +121,7 @@ describe('subscribeAndIssue', () => {
     const pay = vi.fn().mockResolvedValue('X-PAYMENT-B64')
     const resolveTemplateFields = vi.fn().mockResolvedValue(fieldsWithAgentDid)
 
-    await subscribeAndIssue({ mbi, sign, pay, holderDid, resolveTemplateFields }, opts)
+    await subscribeConfirmed({ mbi, sign, pay, holderDid, resolveTemplateFields }, opts)
 
     expect(mbi.applyChallenge).toHaveBeenCalledWith(expect.objectContaining({ data: expectedData }))
   })
@@ -127,7 +136,7 @@ describe('subscribeAndIssue', () => {
     // AI Birthcert-shaped template: declares ownerName/purpose, NOT agentDid.
     const resolveTemplateFields = vi.fn().mockResolvedValue({ required: ['ownerName', 'purpose'], allKeys: ['ownerName', 'purpose'] })
 
-    await subscribeAndIssue(
+    await subscribeConfirmed(
       { mbi, sign, pay, holderDid, resolveTemplateFields },
       { templateId: 'did:zid:t-1', attributes: { ownerName: 'izzatur', purpose: 'testing' } },
     )
@@ -146,7 +155,7 @@ describe('subscribeAndIssue', () => {
     const pay = vi.fn().mockResolvedValue('X-PAYMENT-B64')
     const resolveTemplateFields = vi.fn().mockResolvedValue(null)
 
-    await subscribeAndIssue({ mbi, sign, pay, holderDid, resolveTemplateFields }, opts)
+    await subscribeConfirmed({ mbi, sign, pay, holderDid, resolveTemplateFields }, opts)
 
     const dataSent = JSON.parse((mbi.applyChallenge.mock.calls[0][0] as { data: string }).data)
     expect(dataSent[0].metadata).not.toHaveProperty('agentDid')
@@ -164,7 +173,7 @@ describe('subscribeAndIssue', () => {
     // Template doesn't declare agentDid at all — still must not strip a caller-supplied one.
     const resolveTemplateFields = vi.fn().mockResolvedValue({ required: [], allKeys: ['agentName', 'purpose'] })
 
-    await subscribeAndIssue(
+    await subscribeConfirmed(
       { mbi, sign, pay, holderDid, resolveTemplateFields },
       { ...opts, attributes: { agentDid: explicitAgentDid, ...opts.attributes } },
     )
@@ -184,7 +193,7 @@ describe('subscribeAndIssue', () => {
     const pay = vi.fn().mockResolvedValue('X-PAYMENT-B64')
     const resolveTemplateFields = vi.fn().mockResolvedValue(fieldsWithAgentDid)
 
-    const out = await subscribeAndIssue(
+    const out = await subscribeConfirmed(
       { mbi, sign, pay, holderDid, resolveTemplateFields },
       { templateId: 'did:zid:t-1', attributes: undefined as unknown as Record<string, unknown>, confirm: opts.confirm },
     )
@@ -203,7 +212,7 @@ describe('subscribeAndIssue', () => {
     const pay = vi.fn().mockResolvedValue('X-PAYMENT-B64')
     const resolveTemplateFields = vi.fn().mockResolvedValue(fieldsWithAgentDid)
 
-    await subscribeAndIssue(
+    await subscribeConfirmed(
       { mbi, sign, pay, holderDid, resolveTemplateFields },
       { ...opts, attributes: { agentDid: '', ...opts.attributes } },
     )
@@ -216,7 +225,7 @@ describe('subscribeAndIssue', () => {
       applyChallenge: vi.fn().mockResolvedValue({ x402Version: 2, accepts: [], paymentId: undefined }),
       applySettle: vi.fn(),
     }
-    const out = await subscribeAndIssue(
+    const out = await subscribeConfirmed(
       { mbi, sign: vi.fn().mockResolvedValue({ signBlob: 's', publicKey: 'p' }), pay: vi.fn(), holderDid },
       opts,
     )
@@ -230,7 +239,7 @@ describe('subscribeAndIssue', () => {
     const sign = vi.fn()
     const pay = vi.fn()
 
-    const out = await subscribeAndIssue({ mbi, sign, pay, holderDid }, { ...opts, templateId: 'agent-identity' })
+    const out = await subscribeConfirmed({ mbi, sign, pay, holderDid }, { ...opts, templateId: 'agent-identity' })
 
     expect(out).toEqual({ nextStep: 'follow_message',
       issued: false,
@@ -255,7 +264,7 @@ describe('subscribeAndIssue', () => {
     const pay = vi.fn()
     const resolveSymbol = vi.fn().mockResolvedValue('JMYR')
 
-    const out = await subscribeAndIssue({ mbi, sign, pay, resolveSymbol, holderDid }, { ...opts, dryRun: true })
+    const out = await subscribeConfirmed({ mbi, sign, pay, resolveSymbol, holderDid }, { ...opts, dryRun: true })
 
     expect(mbi.quote).toHaveBeenCalled()
     expect(mbi.applyChallenge).not.toHaveBeenCalled()
@@ -289,7 +298,7 @@ describe('subscribeAndIssue', () => {
     const pay = vi.fn()
     const resolveSymbol = vi.fn().mockResolvedValue('JMYR')
 
-    const out = await subscribeAndIssue({ mbi, sign, pay, resolveSymbol, holderDid }, { ...opts, dryRun: true })
+    const out = await subscribeConfirmed({ mbi, sign, pay, resolveSymbol, holderDid }, { ...opts, dryRun: true })
 
     expect(mbi.applyChallenge).not.toHaveBeenCalled()
     expect(pay).not.toHaveBeenCalled()
@@ -314,7 +323,7 @@ describe('subscribeAndIssue', () => {
       applySettle: vi.fn(),
       quote: vi.fn().mockResolvedValue({ accepts: [accept] }),
     }
-    const out = await subscribeAndIssue(
+    const out = await subscribeConfirmed(
       { mbi, sign: vi.fn(), pay: vi.fn(), resolveSymbol: vi.fn().mockResolvedValue('JMYR'), holderDid },
       { ...opts, dryRun: true },
     )
@@ -335,7 +344,7 @@ describe('subscribeAndIssue', () => {
     const sign = vi.fn()
     const pay = vi.fn()
 
-    const out = await subscribeAndIssue({ mbi, sign, pay, holderDid }, { ...opts, dryRun: true })
+    const out = await subscribeConfirmed({ mbi, sign, pay, holderDid }, { ...opts, dryRun: true })
 
     expect(mbi.applyChallenge).not.toHaveBeenCalled()
     expect(sign).not.toHaveBeenCalled()
@@ -365,7 +374,7 @@ describe('subscribeAndIssue', () => {
     const pay = vi.fn()
     const resolveSymbol = vi.fn().mockResolvedValue('JMYR')
 
-    const out = await subscribeAndIssue({ mbi, sign, pay, resolveSymbol, holderDid }, { ...opts, dryRun: true })
+    const out = await subscribeConfirmed({ mbi, sign, pay, resolveSymbol, holderDid }, { ...opts, dryRun: true })
 
     expect(out).toEqual({
       issued: false,
@@ -391,7 +400,7 @@ describe('subscribeAndIssue', () => {
       allKeys: ['agentName', 'purpose', 'controllerDid'],
     })
 
-    const out = await subscribeAndIssue({ mbi, sign, pay, holderDid, resolveTemplateFields }, opts)
+    const out = await subscribeConfirmed({ mbi, sign, pay, holderDid, resolveTemplateFields }, opts)
 
     expect(out).toEqual({ nextStep: 'follow_message',
       issued: false,
@@ -416,7 +425,7 @@ describe('subscribeAndIssue', () => {
       allKeys: ['agentDid', 'agentName', 'purpose'],
     })
 
-    const out = await subscribeAndIssue({ mbi, sign, pay, holderDid, resolveTemplateFields }, opts)
+    const out = await subscribeConfirmed({ mbi, sign, pay, holderDid, resolveTemplateFields }, opts)
 
     expect(resolveTemplateFields).toHaveBeenCalledWith('did:zid:t-1')
     expect(pay).toHaveBeenCalled()
@@ -436,7 +445,7 @@ describe('subscribeAndIssue', () => {
     })
 
     // opts has no agentDid — auto-fill runs before the required-fields check, so it must not block.
-    await subscribeAndIssue({ mbi, sign, pay, holderDid, resolveTemplateFields }, opts)
+    await subscribeConfirmed({ mbi, sign, pay, holderDid, resolveTemplateFields }, opts)
 
     expect(mbi.applyChallenge).toHaveBeenCalledWith(expect.objectContaining({ data: expectedData }))
     expect(pay).toHaveBeenCalled()
@@ -451,7 +460,7 @@ describe('subscribeAndIssue', () => {
     const pay = vi.fn().mockResolvedValue('X-PAYMENT-B64')
     const resolveTemplateFields = vi.fn().mockResolvedValue(null)
 
-    const out = await subscribeAndIssue({ mbi, sign, pay, holderDid, resolveTemplateFields }, opts)
+    const out = await subscribeConfirmed({ mbi, sign, pay, holderDid, resolveTemplateFields }, opts)
 
     expect(pay).toHaveBeenCalled()
     expect(out.issued).toBe(true)
@@ -465,7 +474,7 @@ describe('subscribeAndIssue', () => {
     const sign = vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' })
     const pay = vi.fn().mockResolvedValue('X-PAYMENT-B64')
 
-    const out = await subscribeAndIssue({ mbi, sign, pay, holderDid }, opts)
+    const out = await subscribeConfirmed({ mbi, sign, pay, holderDid }, opts)
 
     expect(pay).toHaveBeenCalled()
     expect(out.issued).toBe(true)
@@ -485,7 +494,7 @@ describe('subscribeAndIssue', () => {
       allKeys: ['agentDid', 'agentName', 'purpose', 'controllerDid'],
     })
 
-    const out = await subscribeAndIssue(
+    const out = await subscribeConfirmed(
       { mbi, sign, pay, holderDid, resolveTemplateFields },
       { ...opts, dryRun: true },
     )
@@ -515,7 +524,7 @@ describe('subscribeAndIssue', () => {
       allKeys: ['agentDid', 'agentName', 'purpose', 'nickname'],
     })
 
-    const out = await subscribeAndIssue(
+    const out = await subscribeConfirmed(
       { mbi, sign, pay, resolveSymbol, holderDid, resolveTemplateFields },
       { ...opts, dryRun: true },
     )
@@ -545,7 +554,7 @@ describe('subscribeAndIssue', () => {
     const sign = vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' })
     const pay = vi.fn()
 
-    const out = await subscribeAndIssue({ mbi, sign, pay, holderDid }, opts)
+    const out = await subscribeConfirmed({ mbi, sign, pay, holderDid }, opts)
 
     expect(out).toEqual({ nextStep: 'follow_message',
       issued: false,
@@ -566,7 +575,7 @@ describe('subscribeAndIssue', () => {
     const pay = vi.fn().mockResolvedValue('X-PAYMENT-B64')
     const resolveTemplateFields = vi.fn().mockResolvedValue(fieldsWithAgentDid)
 
-    const out = await subscribeAndIssue({ mbi, sign, pay, holderDid, resolveTemplateFields }, opts)
+    const out = await subscribeConfirmed({ mbi, sign, pay, holderDid, resolveTemplateFields }, opts)
 
     expect(out).toEqual({ nextStep: 'follow_message',
       issued: false,
@@ -590,7 +599,7 @@ describe('subscribeAndIssue', () => {
     const pay = vi.fn().mockResolvedValue('X-PAYMENT-B64')
     const resolveSymbol = vi.fn().mockResolvedValue('JMYR')
 
-    const out = await subscribeAndIssue(
+    const out = await subscribeConfirmed(
       { mbi, sign: vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' }), pay, resolveSymbol, holderDid },
       opts,
     )
@@ -608,7 +617,7 @@ describe('subscribeAndIssue', () => {
     }
     const pay = vi.fn()
 
-    const out = await subscribeAndIssue(
+    const out = await subscribeConfirmed(
       { mbi, sign: vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' }), pay, holderDid },
       opts,
     )
@@ -627,7 +636,7 @@ describe('subscribeAndIssue', () => {
     }
     const cache = { get: vi.fn().mockResolvedValue(cached), set: vi.fn(), list: vi.fn() }
 
-    const out = await subscribeAndIssue({ mbi, sign, pay, holderDid, cache }, opts)
+    const out = await subscribeConfirmed({ mbi, sign, pay, holderDid, cache }, opts)
 
     expect(cache.get).toHaveBeenCalledWith('did:zid:t-1')
     expect(sign).not.toHaveBeenCalled()
@@ -651,7 +660,7 @@ describe('subscribeAndIssue', () => {
     }
     const cache = { get: vi.fn().mockResolvedValue(cached), set: vi.fn(), list: vi.fn() }
 
-    const out = await subscribeAndIssue(
+    const out = await subscribeConfirmed(
       { mbi: { applyChallenge: vi.fn(), applySettle: vi.fn() }, sign: vi.fn(), pay: vi.fn(), holderDid, cache },
       opts,
     )
@@ -675,7 +684,7 @@ describe('subscribeAndIssue', () => {
     }
     const cache = { get: vi.fn().mockResolvedValue(cached), set: vi.fn(), list: vi.fn() }
 
-    const out = await subscribeAndIssue(
+    const out = await subscribeConfirmed(
       { mbi: { applyChallenge: vi.fn(), applySettle: vi.fn() }, sign: vi.fn(), pay: vi.fn(), holderDid, cache },
       opts,
     )
@@ -698,7 +707,7 @@ describe('subscribeAndIssue', () => {
     }
     const cache = { get: vi.fn().mockResolvedValue(expiredCached), set: vi.fn().mockResolvedValue(undefined), list: vi.fn() }
 
-    const out = await subscribeAndIssue({ mbi, sign, pay, resolveSymbol, holderDid, cache }, opts)
+    const out = await subscribeConfirmed({ mbi, sign, pay, resolveSymbol, holderDid, cache }, opts)
 
     expect(pay).toHaveBeenCalled()
     expect(out.issued).toBe(true)
@@ -724,7 +733,7 @@ describe('subscribeAndIssue', () => {
     const resolveSymbol = vi.fn().mockResolvedValue('JMYR')
     const cache = { get: vi.fn().mockResolvedValue(null), set: vi.fn().mockResolvedValue(undefined), list: vi.fn() }
 
-    await subscribeAndIssue({ mbi, sign, pay, resolveSymbol, holderDid, cache }, { ...opts, expirationDate: '2027-05-01T00:00:00Z' })
+    await subscribeConfirmed({ mbi, sign, pay, resolveSymbol, holderDid, cache }, { ...opts, expirationDate: '2027-05-01T00:00:00Z' })
 
     // The freshly issued VC carries no validUntil of its own, so the cache falls back to
     // the expirationDate that was requested at issuance.
@@ -748,7 +757,7 @@ describe('subscribeAndIssue', () => {
     }
     const cache = { get: vi.fn().mockResolvedValue(validCached), set: vi.fn().mockResolvedValue(undefined), list: vi.fn() }
 
-    const out = await subscribeAndIssue({ mbi, sign, pay, resolveSymbol, holderDid, cache }, { ...opts, forceReissue: true })
+    const out = await subscribeConfirmed({ mbi, sign, pay, resolveSymbol, holderDid, cache }, { ...opts, forceReissue: true })
 
     expect(pay).not.toHaveBeenCalled()
     expect(mbi.applyChallenge).not.toHaveBeenCalled()
@@ -771,7 +780,7 @@ describe('subscribeAndIssue', () => {
     }
     const cache = { get: vi.fn().mockResolvedValue(validCached), set: vi.fn().mockResolvedValue(undefined), list: vi.fn() }
 
-    const out = await subscribeAndIssue(
+    const out = await subscribeConfirmed(
       { mbi, sign, pay, resolveSymbol, holderDid, cache },
       { ...opts, forceReissue: true, confirmReplaceExistingVc: 'did:zid:vc-old' },
     )
@@ -794,7 +803,7 @@ describe('subscribeAndIssue', () => {
     }
     const cache = { get: vi.fn().mockResolvedValue(validCached), set: vi.fn().mockResolvedValue(undefined), list: vi.fn() }
 
-    const out = await subscribeAndIssue(
+    const out = await subscribeConfirmed(
       { mbi, sign, pay, holderDid, cache },
       { ...opts, forceReissue: true, confirmReplaceExistingVc: 'did:zid:some-other-vc' },
     )
@@ -813,7 +822,7 @@ describe('subscribeAndIssue', () => {
     }
     const cache = { get: vi.fn().mockResolvedValue(validCached), set: vi.fn().mockResolvedValue(undefined), list: vi.fn() }
 
-    const out = await subscribeAndIssue({ mbi, sign, pay, holderDid, cache }, { ...opts, confirmReplaceExistingVc: 'did:zid:vc-old' })
+    const out = await subscribeConfirmed({ mbi, sign, pay, holderDid, cache }, { ...opts, confirmReplaceExistingVc: 'did:zid:vc-old' })
 
     expect(pay).not.toHaveBeenCalled()
     expect(out).toMatchObject({ issued: false, alreadyHeld: true, vc: { id: 'old' }, vcId: 'did:zid:vc-old', fromCache: true })
@@ -832,7 +841,7 @@ describe('subscribeAndIssue', () => {
     }
     const cache = { get: vi.fn().mockResolvedValue(validCachedNoVcId), set: vi.fn().mockResolvedValue(undefined), list: vi.fn() }
 
-    const out = await subscribeAndIssue({ mbi, sign, pay, holderDid, cache }, { ...opts, forceReissue: true })
+    const out = await subscribeConfirmed({ mbi, sign, pay, holderDid, cache }, { ...opts, forceReissue: true })
 
     expect(pay).not.toHaveBeenCalled()
     expect(mbi.applyChallenge).not.toHaveBeenCalled()
@@ -855,7 +864,7 @@ describe('subscribeAndIssue', () => {
     }
     const cache = { get: vi.fn().mockResolvedValue(validCachedNoVcId), set: vi.fn().mockResolvedValue(undefined), list: vi.fn() }
 
-    const out = await subscribeAndIssue(
+    const out = await subscribeConfirmed(
       { mbi, sign, pay, holderDid, cache },
       { ...opts, forceReissue: true, confirmReplaceExistingVc: 'did:zid:vc-from-body' },
     )
@@ -879,14 +888,14 @@ describe('subscribeAndIssue', () => {
     }
     const cache = { get: vi.fn().mockResolvedValue(validCachedNoUsableId), set: vi.fn().mockResolvedValue(undefined), list: vi.fn() }
 
-    const out = await subscribeAndIssue({ mbi, sign, pay, holderDid, cache }, { ...opts, forceReissue: true })
+    const out = await subscribeConfirmed({ mbi, sign, pay, holderDid, cache }, { ...opts, forceReissue: true })
 
     expect(pay).not.toHaveBeenCalled()
     expect(mbi.applyChallenge).not.toHaveBeenCalled()
     expect(out).toMatchObject({ issued: false })
     expect(out.reason).toContain('no confirmable credential id')
     // Confirming with ANY value must not bypass this — there is nothing to confirm against.
-    const outWithConfirm = await subscribeAndIssue(
+    const outWithConfirm = await subscribeConfirmed(
       { mbi, sign, pay, holderDid, cache },
       { ...opts, forceReissue: true, confirmReplaceExistingVc: 'anything' },
     )
@@ -909,7 +918,7 @@ describe('subscribeAndIssue', () => {
     }
     const cache = { get: vi.fn().mockResolvedValue(expiredCached), set: vi.fn().mockResolvedValue(undefined), list: vi.fn() }
 
-    const out = await subscribeAndIssue({ mbi, sign, pay, holderDid, cache }, { ...opts, forceReissue: true })
+    const out = await subscribeConfirmed({ mbi, sign, pay, holderDid, cache }, { ...opts, forceReissue: true })
 
     expect(pay).toHaveBeenCalled()
     expect(out).toMatchObject({ issued: true, vc: { id: 'fresh-vc' } })
@@ -925,7 +934,7 @@ describe('subscribeAndIssue', () => {
     const pay = vi.fn().mockResolvedValue('X-PAYMENT-B64')
     const cache = { get: vi.fn().mockResolvedValue(null), set: vi.fn().mockResolvedValue(undefined), list: vi.fn() }
 
-    const out = await subscribeAndIssue({ mbi, sign, pay, holderDid, cache }, { ...opts, forceReissue: true })
+    const out = await subscribeConfirmed({ mbi, sign, pay, holderDid, cache }, { ...opts, forceReissue: true })
 
     expect(pay).toHaveBeenCalled()
     expect(out).toMatchObject({ issued: true, vc: { id: 'fresh-vc' } })
@@ -945,7 +954,7 @@ describe('subscribeAndIssue', () => {
     }
     const cache = { get: vi.fn().mockResolvedValue(validCached), set: vi.fn().mockResolvedValue(undefined), list: vi.fn() }
 
-    const out = await subscribeAndIssue({ mbi, sign, pay, holderDid, cache }, opts)
+    const out = await subscribeConfirmed({ mbi, sign, pay, holderDid, cache }, opts)
 
     expect(out.vcPassImagePaths).toEqual(['/state/vc-pass/did:zid:vc-old-0.png'])
   })
@@ -961,7 +970,7 @@ describe('subscribeAndIssue', () => {
     }
     const cache = { get: vi.fn().mockResolvedValue(validCached), set: vi.fn().mockResolvedValue(undefined), list: vi.fn() }
 
-    const out = await subscribeAndIssue({ mbi, sign, pay, holderDid, cache }, { ...opts, forceReissue: true })
+    const out = await subscribeConfirmed({ mbi, sign, pay, holderDid, cache }, { ...opts, forceReissue: true })
 
     expect(out.issued).toBe(false)
     expect(out.vcPassImagePaths).toEqual(['/state/vc-pass/did:zid:vc-old-0.png'])
@@ -980,7 +989,7 @@ describe('subscribeAndIssue', () => {
     const pay = vi.fn()
     const cache = { get: vi.fn().mockResolvedValue(null), set: vi.fn().mockResolvedValue(undefined), list: vi.fn() }
 
-    const out = await subscribeAndIssue({ mbi, sign, pay, holderDid, cache }, opts)
+    const out = await subscribeConfirmed({ mbi, sign, pay, holderDid, cache }, opts)
 
     expect(pay).not.toHaveBeenCalled()
     expect(mbi.applySettle).not.toHaveBeenCalled()
@@ -1014,7 +1023,7 @@ describe('subscribeAndIssue', () => {
     const pay = vi.fn()
     const cache = { get: vi.fn(), set: vi.fn().mockResolvedValue(undefined), list: vi.fn() }
 
-    const out = await subscribeAndIssue(
+    const out = await subscribeConfirmed(
       { mbi, sign, pay, resolveSymbol: vi.fn().mockResolvedValue('JMYR'), holderDid, cache },
       { ...opts, dryRun: true },
     )
@@ -1048,7 +1057,7 @@ describe('subscribeAndIssue', () => {
     const resolveSymbol = vi.fn().mockResolvedValue('JMYR')
     const cache = { get: vi.fn(), set: vi.fn(), list: vi.fn() }
 
-    const out = await subscribeAndIssue({ mbi, sign, pay, resolveSymbol, holderDid, cache }, { ...opts, dryRun: true })
+    const out = await subscribeConfirmed({ mbi, sign, pay, resolveSymbol, holderDid, cache }, { ...opts, dryRun: true })
 
     expect(cache.get).not.toHaveBeenCalled()
     expect(cache.set).not.toHaveBeenCalled()
@@ -1065,7 +1074,7 @@ describe('subscribeAndIssue', () => {
     const pay = vi.fn().mockRejectedValue(new PaymentReadinessError('Insufficient JMYR: required 1000000, available 200000', shortfall))
     const resolveTemplateFields = vi.fn().mockResolvedValue(fieldsWithAgentDid)
 
-    const out = await subscribeAndIssue({ mbi, sign, pay, holderDid, resolveTemplateFields }, opts)
+    const out = await subscribeConfirmed({ mbi, sign, pay, holderDid, resolveTemplateFields }, opts)
 
     expect(mbi.applySettle).not.toHaveBeenCalled()
     expect(out).toEqual({ nextStep: 'follow_message',
@@ -1084,7 +1093,7 @@ describe('subscribeAndIssue', () => {
     const pay = vi.fn().mockRejectedValue(new Error('network down'))
     const resolveTemplateFields = vi.fn().mockResolvedValue(fieldsWithAgentDid)
 
-    await expect(subscribeAndIssue({ mbi, sign, pay, holderDid, resolveTemplateFields }, opts)).rejects.toThrow('network down')
+    await expect(subscribeConfirmed({ mbi, sign, pay, holderDid, resolveTemplateFields }, opts)).rejects.toThrow('network down')
   })
 })
 
@@ -1107,7 +1116,7 @@ describe('subscribeAndIssue — indeterminate settle recovery', () => {
 
   it('reports the paymentId alongside the amount so the caller can reconcile the debit', async () => {
     const mbi = settleFails(indeterminate())
-    const out = await subscribeAndIssue({ ...base, mbi }, opts)
+    const out = await subscribeConfirmed({ ...base, mbi }, opts)
     expect(out.paymentAttempted).toEqual({
       asset: 'ZTX3jmyrcontract0000000000000000000', amount: '1000000', paymentId: 'pid-1',
     })
@@ -1116,7 +1125,7 @@ describe('subscribeAndIssue — indeterminate settle recovery', () => {
   it('polls /status after an indeterminate settle and reports the VC it finds already issued', async () => {
     const mbi = { ...settleFails(indeterminate()), getStatus: vi.fn().mockResolvedValue({ paymentId: 'pid-1', status: 'ISSUED', txHash: '0xrecovered', vcId: 'did:zid:vc-recovered' }) }
 
-    const out = await subscribeAndIssue({ ...base, mbi }, opts)
+    const out = await subscribeConfirmed({ ...base, mbi }, opts)
 
     expect(mbi.getStatus).toHaveBeenCalledWith('pid-1')
     expect(out.recovery).toEqual({ status: 'ISSUED', txHash: '0xrecovered', vcId: 'did:zid:vc-recovered', polls: 1 })
@@ -1129,7 +1138,7 @@ describe('subscribeAndIssue — indeterminate settle recovery', () => {
       .mockResolvedValueOnce({ paymentId: 'pid-1', status: 'ISSUED', txHash: '0xa', vcId: 'did:zid:vc-r' })
     const mbi = { ...settleFails(indeterminate()), getStatus }
 
-    const out = await subscribeAndIssue({ ...base, mbi }, opts)
+    const out = await subscribeConfirmed({ ...base, mbi }, opts)
 
     expect(getStatus).toHaveBeenCalledTimes(3)
     expect(out.recovery).toMatchObject({ status: 'ISSUED', polls: 3 })
@@ -1139,7 +1148,7 @@ describe('subscribeAndIssue — indeterminate settle recovery', () => {
     const getStatus = vi.fn().mockResolvedValue({ paymentId: 'pid-1', status: 'FAILED' })
     const mbi = { ...settleFails(indeterminate()), getStatus }
 
-    const out = await subscribeAndIssue({ ...base, mbi }, opts)
+    const out = await subscribeConfirmed({ ...base, mbi }, opts)
 
     expect(getStatus).toHaveBeenCalledTimes(1)
     expect(out.recovery).toMatchObject({ status: 'FAILED', polls: 1 })
@@ -1149,7 +1158,7 @@ describe('subscribeAndIssue — indeterminate settle recovery', () => {
     const getStatus = vi.fn().mockResolvedValue({ paymentId: 'pid-1', status: 'REQUIRED' })
     const mbi = { ...settleFails(indeterminate()), getStatus }
 
-    const out = await subscribeAndIssue({ ...base, mbi }, opts)
+    const out = await subscribeConfirmed({ ...base, mbi }, opts)
 
     expect(getStatus.mock.calls.length).toBeGreaterThan(1)
     expect(out.recovery).toMatchObject({ status: 'REQUIRED' })
@@ -1161,7 +1170,7 @@ describe('subscribeAndIssue — indeterminate settle recovery', () => {
     err.mbiStatus = 4006
     const mbi = { ...settleFails(err), getStatus: vi.fn() }
 
-    const out = await subscribeAndIssue({ ...base, mbi }, opts)
+    const out = await subscribeConfirmed({ ...base, mbi }, opts)
 
     expect(mbi.getStatus).not.toHaveBeenCalled()
     expect(out.recovery).toBeUndefined()
@@ -1171,7 +1180,7 @@ describe('subscribeAndIssue — indeterminate settle recovery', () => {
   it('still returns the structured failure when /status itself is unreachable', async () => {
     const mbi = { ...settleFails(indeterminate()), getStatus: vi.fn().mockRejectedValue(new Error('node down')) }
 
-    const out = await subscribeAndIssue({ ...base, mbi }, opts)
+    const out = await subscribeConfirmed({ ...base, mbi }, opts)
 
     expect(out.issued).toBe(false)
     expect(out.recovery).toMatchObject({ status: 'UNKNOWN' })
@@ -1185,7 +1194,7 @@ describe('subscribeAndIssue — indeterminate settle recovery', () => {
       getStatus: vi.fn(),
     }
 
-    const out = await subscribeAndIssue({ ...base, mbi }, opts)
+    const out = await subscribeConfirmed({ ...base, mbi }, opts)
 
     expect(mbi.getStatus).not.toHaveBeenCalled()
     expect(out.paymentAttempted?.paymentId).toBeUndefined()
@@ -1213,7 +1222,7 @@ describe('subscribeAndIssue — stale cached attributes', () => {
     const cache = { get: vi.fn().mockResolvedValue(cachedWith({ agentUsername: 'jak', ownerName: 'Izzatur' })), set: vi.fn(), list: vi.fn() }
     const resolveTemplateFields = vi.fn().mockResolvedValue(newTemplate)
 
-    const out = await subscribeAndIssue({ ...idle, cache, resolveTemplateFields }, opts)
+    const out = await subscribeConfirmed({ ...idle, cache, resolveTemplateFields }, opts)
 
     expect(out.fromCache).toBe(true)
     expect(out.schema).toEqual({ required: ['agentUsername'], optional: ['ownerName', 'dob'] })
@@ -1223,7 +1232,7 @@ describe('subscribeAndIssue — stale cached attributes', () => {
     const cache = { get: vi.fn().mockResolvedValue(cachedWith({ agentName: 'jak', ownerName: 'Izzatur' })), set: vi.fn(), list: vi.fn() }
     const resolveTemplateFields = vi.fn().mockResolvedValue(newTemplate)
 
-    const out = await subscribeAndIssue({ ...idle, cache, resolveTemplateFields }, opts)
+    const out = await subscribeConfirmed({ ...idle, cache, resolveTemplateFields }, opts)
 
     expect(out.staleAttributes).toEqual({ missing: ['agentUsername'], dropped: ['agentName'] })
   })
@@ -1232,7 +1241,7 @@ describe('subscribeAndIssue — stale cached attributes', () => {
     const cache = { get: vi.fn().mockResolvedValue(cachedWith({ agentUsername: 'jak', ownerName: 'Izzatur' })), set: vi.fn(), list: vi.fn() }
     const resolveTemplateFields = vi.fn().mockResolvedValue(newTemplate)
 
-    const out = await subscribeAndIssue({ ...idle, cache, resolveTemplateFields }, opts)
+    const out = await subscribeConfirmed({ ...idle, cache, resolveTemplateFields }, opts)
 
     expect(out.staleAttributes).toBeUndefined()
   })
@@ -1241,7 +1250,7 @@ describe('subscribeAndIssue — stale cached attributes', () => {
     const cache = { get: vi.fn().mockResolvedValue(cachedWith({ agentName: 'jak' })), set: vi.fn(), list: vi.fn() }
     const resolveTemplateFields = vi.fn().mockResolvedValue(newTemplate)
 
-    const out = await subscribeAndIssue({ ...idle, cache, resolveTemplateFields }, opts)
+    const out = await subscribeConfirmed({ ...idle, cache, resolveTemplateFields }, opts)
 
     expect(out.issued).toBe(false) // already held, not issued
     expect(out.alreadyHeld).toBe(true)
@@ -1252,7 +1261,7 @@ describe('subscribeAndIssue — stale cached attributes', () => {
   it('serves the cached VC unchanged when the template lookup is unwired or fails (fail-open)', async () => {
     const cache = { get: vi.fn().mockResolvedValue(cachedWith({ agentName: 'jak' })), set: vi.fn(), list: vi.fn() }
 
-    const out = await subscribeAndIssue({ ...idle, cache }, opts)
+    const out = await subscribeConfirmed({ ...idle, cache }, opts)
 
     expect(out.fromCache).toBe(true)
     expect(out.schema).toBeUndefined()
@@ -1314,7 +1323,7 @@ describe('subscribeAndIssue — VC pass image (extraData.vcPassBase64 from /v1/v
   it('downloads and writes the pass image, returning its path, when extraData.vcPassBase64 is present', async () => {
     const deps = passImageDeps()
 
-    const out = await subscribeAndIssue(deps as never, opts)
+    const out = await subscribeConfirmed(deps as never, opts)
 
     expect(deps.mbi.downloadVcs).toHaveBeenCalledWith({ address: 'ZTX3Holder' }, deps.signRequest)
     expect(out.vcPassImagePaths).toHaveLength(1)
@@ -1325,7 +1334,7 @@ describe('subscribeAndIssue — VC pass image (extraData.vcPassBase64 from /v1/v
     const cache = { get: vi.fn().mockResolvedValue(null), set: vi.fn(), list: vi.fn() }
     const deps = passImageDeps({ cache })
 
-    await subscribeAndIssue(deps as never, opts)
+    await subscribeConfirmed(deps as never, opts)
 
     expect(cache.set).toHaveBeenCalledWith(
       'did:zid:t-1',
@@ -1342,13 +1351,13 @@ describe('subscribeAndIssue — VC pass image (extraData.vcPassBase64 from /v1/v
       },
     })
 
-    const out = await subscribeAndIssue(deps as never, opts)
+    const out = await subscribeConfirmed(deps as never, opts)
 
     expect(out.vcPassImagePaths).toBeUndefined()
   })
 
   it('skips the pass-image fetch entirely when the feature is not wired (downloadVcs unset)', async () => {
-    const out = await subscribeAndIssue(
+    const out = await subscribeConfirmed(
       { mbi: { applyChallenge: vi.fn().mockResolvedValue({ x402Version: 2, accepts: [accept], paymentId: 'pid-1' }), applySettle: vi.fn().mockResolvedValue({ vcId: 'did:zid:vc-1', verifiableCredential: { id: 'vc' } }) }, sign: vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' }), pay: vi.fn().mockResolvedValue('X'), holderDid },
       opts,
     )
@@ -1357,12 +1366,12 @@ describe('subscribeAndIssue — VC pass image (extraData.vcPassBase64 from /v1/v
 
   it('reuses a quarantined download for the same vcId instead of hitting MBI again (one-shot download)', async () => {
     const deps = passImageDeps()
-    await subscribeAndIssue(deps as never, opts)
+    await subscribeConfirmed(deps as never, opts)
     expect(deps.mbi.downloadVcs).toHaveBeenCalledTimes(1)
 
     // Second issuance of the SAME vcId (e.g. a retry) must read the quarantined copy, not re-download —
     // MBI's /v1/vc/ext/download returns 404 on a second live call for the same vcId (SEC-11/REQ-25).
-    await subscribeAndIssue(deps as never, opts)
+    await subscribeConfirmed(deps as never, opts)
     expect(deps.mbi.downloadVcs).toHaveBeenCalledTimes(1)
   })
 
@@ -1371,7 +1380,7 @@ describe('subscribeAndIssue — VC pass image (extraData.vcPassBase64 from /v1/v
   // a 404 and the wallet loses the credential body entirely on that branch. withLock serializes them.
   it('serializes two concurrent issuances of the SAME vcId so only one downloads', async () => {
     const deps = passImageDeps()
-    await Promise.all([subscribeAndIssue(deps as never, opts), subscribeAndIssue(deps as never, opts)])
+    await Promise.all([subscribeConfirmed(deps as never, opts), subscribeConfirmed(deps as never, opts)])
     expect(deps.mbi.downloadVcs).toHaveBeenCalledTimes(1)
   })
 
@@ -1384,7 +1393,7 @@ describe('subscribeAndIssue — VC pass image (extraData.vcPassBase64 from /v1/v
       },
     })
 
-    const out = await subscribeAndIssue(deps as never, opts)
+    const out = await subscribeConfirmed(deps as never, opts)
 
     expect(out.issued).toBe(true)
     expect(out.vcId).toBe('did:zid:vc-1')
@@ -1405,7 +1414,7 @@ describe('subscribeAndIssue — VC pass image (extraData.vcPassBase64 from /v1/v
       },
     })
 
-    const out = await subscribeAndIssue(deps as never, opts)
+    const out = await subscribeConfirmed(deps as never, opts)
 
     expect(out.issued).toBe(true)
     expect(out.vcId).toBe('did:zid:vc-1')
@@ -1418,7 +1427,7 @@ describe('subscribeAndIssue — VC pass image (extraData.vcPassBase64 from /v1/v
     writeFileSync(passImagesDir, 'not a directory')
     const deps = passImageDeps()
 
-    const out = await subscribeAndIssue(deps as never, opts)
+    const out = await subscribeConfirmed(deps as never, opts)
 
     expect(out.issued).toBe(true)
     expect(out.vcId).toBe('did:zid:vc-1')
@@ -1440,7 +1449,7 @@ describe('subscribeAndIssue — VC pass image (extraData.vcPassBase64 from /v1/v
       },
     })
 
-    const out = await subscribeAndIssue(deps as never, opts)
+    const out = await subscribeConfirmed(deps as never, opts)
 
     expect(out.vcPassImagePaths).toHaveLength(1)
     expect(readFileSync(out.vcPassImagePaths![0], 'utf8')).toBe('free-pass-bytes')
@@ -1455,7 +1464,7 @@ describe('a cache hit is reported as already held, not as issued', () => {
     vc: { id: 'held', credentialSubject: { agentUsername: 'PMRBot', id: 'PMRBot', agentDid: holderDid } },
   }
   const run = (attributes: Record<string, unknown>) =>
-    subscribeAndIssue(
+    subscribeConfirmed(
       {
         mbi: { applyChallenge: vi.fn(), applySettle: vi.fn() },
         sign: vi.fn(),
@@ -1509,7 +1518,7 @@ describe('subscribe_and_issue asks before it pays', () => {
     const mbi = paidMbi()
     const sign = vi.fn()
     const pay = vi.fn()
-    const out = (await subscribeAndIssue({ mbi, sign, pay, holderDid, resolveSymbol: async () => 'JMYR' } as never, unconfirmed)) as unknown as Record<string, unknown>
+    const out = (await subscribeConfirmed({ mbi, sign, pay, holderDid, resolveSymbol: async () => 'JMYR' } as never, unconfirmed)) as unknown as Record<string, unknown>
     expect(mbi.quote).toHaveBeenCalledTimes(1)
     expect(mbi.applyChallenge).not.toHaveBeenCalled()
     expect(sign).not.toHaveBeenCalled()
@@ -1526,7 +1535,7 @@ describe('subscribe_and_issue asks before it pays', () => {
 
   it('an MBI that does not say whether it charges is treated as chargeable', async () => {
     const mbi = { ...paidMbi(), quote: vi.fn().mockResolvedValue({ accepts: [accept] }) }
-    const out = (await subscribeAndIssue({ mbi, sign: vi.fn(), pay: vi.fn(), holderDid } as never, unconfirmed)) as unknown as Record<string, unknown>
+    const out = (await subscribeConfirmed({ mbi, sign: vi.fn(), pay: vi.fn(), holderDid } as never, unconfirmed)) as unknown as Record<string, unknown>
     expect(out.needsConfirmation).toBe(true)
     expect(mbi.applyChallenge).not.toHaveBeenCalled()
   })
@@ -1538,7 +1547,7 @@ describe('subscribe_and_issue asks before it pays', () => {
       applyChallenge: vi.fn().mockResolvedValue({ issued: { vcId: 'did:zid:vc-free', txHash: '0xfree', verifiableCredential: issuedVc } }),
       applySettle: vi.fn(),
     }
-    const out = (await subscribeAndIssue(
+    const out = (await subscribeConfirmed(
       { mbi, sign: vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' }), pay: vi.fn(), holderDid } as never,
       unconfirmed,
     )) as unknown as Record<string, unknown>
@@ -1550,7 +1559,7 @@ describe('subscribe_and_issue asks before it pays', () => {
   it('without a quote client, it stops after the free payment request and before paying', async () => {
     const mbi = { applyChallenge: vi.fn().mockResolvedValue({ x402Version: 2, accepts: [accept], paymentId: 'pid-1' }), applySettle: vi.fn() }
     const pay = vi.fn()
-    const out = (await subscribeAndIssue(
+    const out = (await subscribeConfirmed(
       { mbi, sign: vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' }), pay, holderDid } as never,
       unconfirmed,
     )) as unknown as Record<string, unknown>
@@ -1565,7 +1574,7 @@ describe('subscribe_and_issue asks before it pays', () => {
       applySettle: vi.fn().mockResolvedValue({ vcId: 'did:zid:vc', txHash: '0xnew', verifiableCredential: { id: 'vc', validUntil: '2099-01-01T00:00:00Z' } }),
     }
     const pay = vi.fn().mockResolvedValue('XPAY')
-    const out = (await subscribeAndIssue(
+    const out = (await subscribeConfirmed(
       { mbi, sign: vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' }), pay, holderDid } as never,
       { ...unconfirmed, confirm: opts.confirm },
     )) as unknown as Record<string, unknown>
@@ -1581,9 +1590,9 @@ describe('subscribe_and_issue asks before it pays', () => {
     }
     const cache = { get: vi.fn().mockResolvedValue(held), set: vi.fn(), list: vi.fn() }
     const mbi = paidMbi()
-    const same = (await subscribeAndIssue({ mbi, sign: vi.fn(), pay: vi.fn(), holderDid, cache } as never, unconfirmed)) as unknown as Record<string, unknown>
+    const same = (await subscribeConfirmed({ mbi, sign: vi.fn(), pay: vi.fn(), holderDid, cache } as never, unconfirmed)) as unknown as Record<string, unknown>
     expect(same).toMatchObject({ alreadyHeld: true, nextStep: 'tell_user_already_held' })
-    const differs = (await subscribeAndIssue({ mbi, sign: vi.fn(), pay: vi.fn(), holderDid, cache } as never, {
+    const differs = (await subscribeConfirmed({ mbi, sign: vi.fn(), pay: vi.fn(), holderDid, cache } as never, {
       ...unconfirmed,
       attributes: { agentName: 'PMRBot' },
     })) as unknown as Record<string, unknown>
@@ -1601,7 +1610,7 @@ describe('a held credential missing a requested attribute', () => {
     vc: { id: 'old', credentialSubject: { agentName: 'PMRBot', note: null } },
   }
   const run = (attributes: Record<string, unknown>) =>
-    subscribeAndIssue(
+    subscribeConfirmed(
       {
         mbi: { applyChallenge: vi.fn(), applySettle: vi.fn() },
         sign: vi.fn(),
@@ -1643,7 +1652,7 @@ describe('subscribe_and_issue pays only the confirmed price', () => {
 
   it('confirm: true is not a confirmation: stops at the price', async () => {
     const { deps, pay } = harness()
-    const out = (await subscribeAndIssue(deps as never, { ...base, confirm: true })) as unknown as Record<string, unknown>
+    const out = (await subscribeConfirmed(deps as never, { ...base, confirm: true })) as unknown as Record<string, unknown>
     expect(pay).not.toHaveBeenCalled()
     expect(out).toMatchObject({ needsConfirmation: true, quote: QUOTE })
     expect(String(out.reason)).toMatch(/confirm: true is not accepted/)
@@ -1651,7 +1660,7 @@ describe('subscribe_and_issue pays only the confirmed price', () => {
 
   it('the confirmed quote, naming the raw token address, is paid without another /quote call', async () => {
     const { deps, pay, mbi } = harness()
-    const out = (await subscribeAndIssue(deps as never, { ...base, confirm: QUOTE })) as unknown as Record<string, unknown>
+    const out = (await subscribeConfirmed(deps as never, { ...base, confirm: QUOTE })) as unknown as Record<string, unknown>
     expect(mbi.quote).not.toHaveBeenCalled()
     expect(pay).toHaveBeenCalledTimes(1)
     expect(out.issued).toBe(true)
@@ -1662,7 +1671,7 @@ describe('subscribe_and_issue pays only the confirmed price', () => {
     ['payee', { payTo: 'ZTXother' }, /the payee is ZTXother, not ZTXissuer/],
   ])('an issuer payment request whose %s differs from the confirmed quote is not paid', async (_n, change, why) => {
     const { deps, pay, mbi } = harness({ ...accept, ...change })
-    const out = (await subscribeAndIssue(deps as never, { ...base, confirm: QUOTE })) as unknown as Record<string, unknown>
+    const out = (await subscribeConfirmed(deps as never, { ...base, confirm: QUOTE })) as unknown as Record<string, unknown>
     expect(pay).not.toHaveBeenCalled()
     expect(mbi.applySettle).not.toHaveBeenCalled()
     expect(out).toMatchObject({ issued: false, needsConfirmation: true, nextStep: 'ask_user_to_confirm_payment' })
@@ -1672,7 +1681,7 @@ describe('subscribe_and_issue pays only the confirmed price', () => {
 
   it('/quote said free but the issuer asks for payment: stops before paying', async () => {
     const { deps, pay } = harness(accept, { accepts: [accept], paymentRequired: false })
-    const out = (await subscribeAndIssue(deps as never, base)) as unknown as Record<string, unknown>
+    const out = (await subscribeConfirmed(deps as never, base)) as unknown as Record<string, unknown>
     expect(pay).not.toHaveBeenCalled()
     expect(out).toMatchObject({ needsConfirmation: true, quote: QUOTE })
   })
@@ -1680,7 +1689,7 @@ describe('subscribe_and_issue pays only the confirmed price', () => {
   it('/quote failing is relayed, and nothing is signed', async () => {
     const { deps, mbi } = harness()
     mbi.quote.mockRejectedValue(new MbiError('MBI quote failed: 404 Template not found', 404))
-    const out = (await subscribeAndIssue(deps as never, base)) as unknown as Record<string, unknown>
+    const out = (await subscribeConfirmed(deps as never, base)) as unknown as Record<string, unknown>
     expect(mbi.applyChallenge).not.toHaveBeenCalled()
     expect(deps.sign).not.toHaveBeenCalled()
     expect(out).toMatchObject({ issued: false, nextStep: 'follow_message' })
@@ -1689,13 +1698,13 @@ describe('subscribe_and_issue pays only the confirmed price', () => {
 
   it('an issuer that does not say whether it charges: the question says it may cost up to the amount', async () => {
     const { deps } = harness(accept, { accepts: [accept] })
-    const out = (await subscribeAndIssue(deps as never, base)) as unknown as Record<string, unknown>
+    const out = (await subscribeConfirmed(deps as never, base)) as unknown as Record<string, unknown>
     expect(String(out.askUser)).toMatch(/may cost up to .*does not say whether it charges/)
   })
 
   it('a quote with no amount says so, never "costs  base units"', async () => {
     const { deps } = harness(accept, { accepts: [{ ...accept, maxAmountRequired: '' }], paymentRequired: true })
-    const out = (await subscribeAndIssue(deps as never, base)) as unknown as Record<string, unknown>
+    const out = (await subscribeConfirmed(deps as never, base)) as unknown as Record<string, unknown>
     expect(String(out.askUser)).toMatch(/an amount the issuer did not state/)
     expect(String(out.askUser)).not.toMatch(/costs\s+base units/)
   })
@@ -1704,7 +1713,7 @@ describe('subscribe_and_issue pays only the confirmed price', () => {
     const { deps } = harness()
     const held = { templateId: 'did:zid:t-1', vc: { id: 'old' }, vcId: 'did:zid:vc-old', issuedAt: '2026-01-01T00:00:00Z', validUntil: '2099-01-01T00:00:00Z' }
     const cache = { get: vi.fn().mockResolvedValue(held), set: vi.fn(), list: vi.fn() }
-    const out = (await subscribeAndIssue({ ...deps, cache } as never, { ...base, forceReissue: true, confirmReplaceExistingVc: 'did:zid:vc-old' })) as unknown as Record<
+    const out = (await subscribeConfirmed({ ...deps, cache } as never, { ...base, forceReissue: true, confirmReplaceExistingVc: 'did:zid:vc-old' })) as unknown as Record<
       string,
       unknown
     >
@@ -1716,7 +1725,7 @@ describe('subscribe_and_issue pays only the confirmed price', () => {
     const { deps } = harness()
     const held = { templateId: 'did:zid:t-1', vc: { id: 'old' }, vcId: 'did:zid:vc-old', issuedAt: '2026-01-01T00:00:00Z', validUntil: '2099-01-01T00:00:00Z' }
     const cache = { get: vi.fn().mockResolvedValue(held), set: vi.fn(), list: vi.fn() }
-    const out = (await subscribeAndIssue({ ...deps, cache } as never, { ...base, forceReissue: true })) as unknown as Record<string, unknown>
+    const out = (await subscribeConfirmed({ ...deps, cache } as never, { ...base, forceReissue: true })) as unknown as Record<string, unknown>
     expect(out).toMatchObject({ issued: false, nextStep: 'ask_user_whether_to_replace' })
   })
 })
@@ -1738,14 +1747,14 @@ describe('subscribe_and_issue R2', () => {
   // Low 3: the symbol alone bound the token, so a different contract with the same symbol was paid.
   it('the quote carries the raw token address, with the symbol only for display', async () => {
     const { deps } = harness()
-    const out = (await subscribeAndIssue(deps as never, base)) as unknown as Record<string, unknown>
+    const out = (await subscribeConfirmed(deps as never, base)) as unknown as Record<string, unknown>
     expect(out.quote).toMatchObject({ asset: accept.asset, assetSymbol: 'JMYR' })
   })
 
   it('a different token contract with the same symbol, amount and payee is not paid', async () => {
     const { deps, pay } = harness({ ...accept, asset: 'ZTX3othercontract000000000000000000' })
     const confirmed = { asset: accept.asset, maxAmountRequired: '1000000', payTo: 'ZTXissuer', gasModel: 'self' }
-    const out = (await subscribeAndIssue(deps as never, { ...base, confirm: confirmed })) as unknown as Record<string, unknown>
+    const out = (await subscribeConfirmed(deps as never, { ...base, confirm: confirmed })) as unknown as Record<string, unknown>
     expect(pay).not.toHaveBeenCalled()
     expect(out.needsConfirmation).toBe(true)
     expect(String(out.reason)).toMatch(/the token is ZTX3othercontract/)
@@ -1754,22 +1763,187 @@ describe('subscribe_and_issue R2', () => {
   it('a quote naming the token only by its symbol is not enough to pay', async () => {
     const { deps, pay } = harness()
     const bySymbol = { asset: 'JMYR', maxAmountRequired: '1000000', payTo: 'ZTXissuer', gasModel: 'self' }
-    const out = (await subscribeAndIssue(deps as never, { ...base, confirm: bySymbol })) as unknown as Record<string, unknown>
+    const out = (await subscribeConfirmed(deps as never, { ...base, confirm: bySymbol })) as unknown as Record<string, unknown>
     expect(pay).not.toHaveBeenCalled()
     expect(out.needsConfirmation).toBe(true)
   })
 
   it('the self-pay question says ZTX network gas is paid on top', async () => {
     const { deps } = harness()
-    const out = (await subscribeAndIssue(deps as never, base)) as unknown as Record<string, unknown>
+    const out = (await subscribeConfirmed(deps as never, base)) as unknown as Record<string, unknown>
     expect(String(out.askUser)).toMatch(/plus network gas paid in ZTX/)
   })
 
   it('a refusal says follow_message', async () => {
-    const out = await subscribeAndIssue({ mbi: { applyChallenge: vi.fn(), applySettle: vi.fn() }, sign: vi.fn(), pay: vi.fn(), holderDid } as never, {
+    const out = await subscribeConfirmed({ mbi: { applyChallenge: vi.fn(), applySettle: vi.fn() }, sign: vi.fn(), pay: vi.fn(), holderDid } as never, {
       templateId: 'not-a-did',
       attributes: {},
     })
     expect(out.nextStep).toBe('follow_message')
+  })
+})
+
+// the confirmation is the quote the wallet gave, for this request, within 10 minutes, once; and paid issuance of
+// one template runs one call at a time.
+describe('subscribe_and_issue binds the confirmation to its request', () => {
+  const base = { templateId: 'did:zid:t-1', attributes: { agentName: 'Jak Sparrow', purpose: 'x401+x402' } }
+  const settled = { vcId: 'did:zid:vc', txHash: '0xnew', verifiableCredential: { id: 'vc', validUntil: '2099-01-01T00:00:00Z' } }
+  const harness = () => {
+    const mbi = {
+      quote: vi.fn().mockResolvedValue({ accepts: [accept], paymentRequired: true }),
+      applyChallenge: vi.fn().mockResolvedValue({ x402Version: 2, accepts: [accept], paymentId: 'pid-1' }),
+      applySettle: vi.fn().mockResolvedValue(settled),
+    }
+    const pay = vi.fn().mockResolvedValue('XPAY')
+    const deps = { mbi, sign: vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' }), pay, holderDid, quoteBook: new QuoteBook() }
+    return { mbi, pay, deps }
+  }
+  const call = async (deps: unknown, opts: Record<string, unknown>) => (await subscribeConfirmed(deps as never, opts as never)) as unknown as Record<string, unknown>
+
+  it('the quote it gave pays', async () => {
+    const { deps, pay } = harness()
+    const first = await call(deps, base)
+    expect((first.quote as Record<string, unknown>).quoteId).toEqual(expect.any(String))
+    const out = await call(deps, { ...base, confirm: first.quote })
+    expect(pay).toHaveBeenCalledTimes(1)
+    expect(out.issued).toBe(true)
+  })
+
+  it('a quote for other attributes does not pay', async () => {
+    const { deps, pay } = harness()
+    const first = await call(deps, base)
+    const out = await call(deps, { ...base, attributes: { ...base.attributes, agentName: 'Someone Else' }, confirm: first.quote })
+    expect(pay).not.toHaveBeenCalled()
+    expect(String(out.reason)).toMatch(/for a different request/)
+  })
+
+  it('an invented quote does not pay, and nothing is signed', async () => {
+    const { deps, pay } = harness()
+    const out = await call(deps, {
+      ...base,
+      confirm: { asset: accept.asset, maxAmountRequired: '1000000', payTo: 'ZTXissuer', gasModel: 'self', quoteId: 'made-up' },
+    })
+    expect(pay).not.toHaveBeenCalled()
+    expect(deps.sign).not.toHaveBeenCalled()
+    expect(String(out.reason)).toMatch(/not one this wallet gave/)
+  })
+
+  it('a quote already used does not pay again', async () => {
+    const { deps, pay } = harness()
+    const first = await call(deps, base)
+    await call(deps, { ...base, confirm: first.quote })
+    const again = await call(deps, { ...base, confirm: first.quote })
+    expect(pay).toHaveBeenCalledTimes(1)
+    expect(String(again.reason)).toMatch(/already used/)
+  })
+
+  it('two confirmed calls at once for one template pay once; the second finds it already held', async () => {
+    const { deps, pay } = harness()
+    const stored: { value: Record<string, unknown> | null } = { value: null }
+    const cache = {
+      get: vi.fn(async () => stored.value),
+      set: vi.fn(async (_k: string, v: Record<string, unknown>) => {
+        stored.value = v
+      }),
+      list: vi.fn(),
+    }
+    const withCache = { ...deps, cache }
+    const first = await call(withCache, base)
+    const [a, b] = await Promise.all([call(withCache, { ...base, confirm: first.quote }), call(withCache, { ...base, confirm: first.quote })])
+    expect(pay).toHaveBeenCalledTimes(1)
+    expect([a.issued, b.issued].sort()).toEqual([false, true])
+    expect(a.alreadyHeld || b.alreadyHeld).toBe(true)
+  })
+})
+
+// straight to the tool, no helper: a price that matches but carries no quoteId is not a confirmation.
+it('subscribe_and_issue: a bare quote without a quoteId is refused, and nothing is signed or paid', async () => {
+  const pay = vi.fn()
+  const sign = vi.fn()
+  const mbi = {
+    quote: vi.fn().mockResolvedValue({ accepts: [accept], paymentRequired: true }),
+    applyChallenge: vi.fn(),
+    applySettle: vi.fn(),
+  }
+  const out = await subscribeAndIssue({ mbi, sign, pay, holderDid, quoteBook: new QuoteBook() } as never, {
+    templateId: 'did:zid:t-1',
+    attributes: { agentName: 'Jak Sparrow' },
+    confirm: { asset: accept.asset, maxAmountRequired: '1000000', payTo: 'ZTXissuer', gasModel: 'self' },
+  } as never)
+  expect(pay).not.toHaveBeenCalled()
+  expect(sign).not.toHaveBeenCalled()
+  expect(out.needsConfirmation).toBe(true)
+})
+
+// Review R1 (MEDIUM): every unconfirmed call gives a fresh quote, so two valid quotes for one request were easy
+// to hold. With the first one's settle failing after its payment was signed, the second call found nothing held and paid
+// again. Spending a quote now spends every other open quote for the same request.
+describe('subscribe_and_issue: two quotes for one request cannot both pay', () => {
+  const base = { templateId: 'did:zid:t-1', attributes: { agentName: 'Jak Sparrow', purpose: 'x401+x402' } }
+  const harness = (book = new QuoteBook()) => {
+    const mbi = {
+      quote: vi.fn().mockResolvedValue({ accepts: [accept], paymentRequired: true }),
+      applyChallenge: vi.fn().mockResolvedValue({ x402Version: 2, accepts: [accept], paymentId: 'pid-1' }),
+      applySettle: vi.fn().mockRejectedValue(new MbiError('MBI 4006: Facilitator settlement failed', 502)),
+    }
+    const pay = vi.fn().mockResolvedValue('XPAY')
+    const deps = { mbi, sign: vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' }), pay, holderDid, quoteBook: book }
+    return { mbi, pay, deps }
+  }
+  const call = async (deps: unknown, opts: Record<string, unknown>) =>
+    (await subscribeAndIssue(deps as never, opts as never)) as unknown as Record<string, unknown>
+
+  it('two different quotes sent at once, the first settle failing after signing: paid once', async () => {
+    const { deps, pay } = harness()
+    const q1 = (await call(deps, base)).quote
+    const q2 = (await call(deps, base)).quote
+    expect((q1 as Record<string, unknown>).quoteId).not.toBe((q2 as Record<string, unknown>).quoteId)
+    const [a, b] = await Promise.all([call(deps, { ...base, confirm: q1 }), call(deps, { ...base, confirm: q2 })])
+    expect(pay).toHaveBeenCalledTimes(1)
+    const second = [a, b].find((r) => r.needsConfirmation)
+    expect(String(second?.reason)).toMatch(/another quote for this same request/)
+  })
+
+  it('a quote for another template is not spent by this one', async () => {
+    const { deps, pay } = harness()
+    const other = (await call(deps, { ...base, templateId: 'did:zid:t-2' })).quote
+    const mine = (await call(deps, base)).quote
+    await call(deps, { ...base, confirm: mine })
+    await call(deps, { ...base, templateId: 'did:zid:t-2', confirm: other })
+    expect(pay).toHaveBeenCalledTimes(2)
+  })
+})
+
+// Review R1 (NIT): the expiry and other-template rules, through the tool, not only the quote book.
+describe('subscribe_and_issue: expired and other-template quotes, through the tool', () => {
+  const base = { templateId: 'did:zid:t-1', attributes: { agentName: 'Jak Sparrow' } }
+  const make = (book: QuoteBook) => {
+    const mbi = {
+      quote: vi.fn().mockResolvedValue({ accepts: [accept], paymentRequired: true }),
+      applyChallenge: vi.fn().mockResolvedValue({ x402Version: 2, accepts: [accept], paymentId: 'pid-1' }),
+      applySettle: vi.fn().mockResolvedValue({ vcId: 'did:zid:vc', txHash: '0x', verifiableCredential: { id: 'vc' } }),
+    }
+    const pay = vi.fn().mockResolvedValue('XPAY')
+    return { pay, deps: { mbi, sign: vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' }), pay, holderDid, quoteBook: book } }
+  }
+  const call = async (deps: unknown, opts: Record<string, unknown>) =>
+    (await subscribeAndIssue(deps as never, opts as never)) as unknown as Record<string, unknown>
+
+  it('an expired quote is not paid', async () => {
+    let t = 0
+    const { deps, pay } = make(new QuoteBook(() => t))
+    const q = (await call(deps, base)).quote
+    t += 10 * 60 * 1000
+    const out = await call(deps, { ...base, confirm: q })
+    expect(pay).not.toHaveBeenCalled()
+    expect(String(out.reason)).toMatch(/has expired/)
+  })
+
+  it('a quote given for another template is not paid', async () => {
+    const { deps, pay } = make(new QuoteBook())
+    const q = (await call(deps, { ...base, templateId: 'did:zid:t-2' })).quote
+    const out = await call(deps, { ...base, confirm: q })
+    expect(pay).not.toHaveBeenCalled()
+    expect(String(out.reason)).toMatch(/for a different request/)
   })
 })

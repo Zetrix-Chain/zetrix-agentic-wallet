@@ -8,7 +8,8 @@ import { PaymentCapError } from '../payment-guard'
 import { SsivcError } from '../clients/ssivc-client'
 import { MbiClient } from '../clients/mbi-client'
 import { orderAccepts } from '../accept-selection'
-import { quoteOf } from '../price-confirmation'
+import { quoteOf, QuoteBook } from '../price-confirmation'
+import { confirmedInput, verificationBindingFor } from './helpers/confirmed-quote'
 
 // Mirrors the (unexported) noAutoRecheckMessage() in verify-ai-birthcert.ts, whose wording depends
 // on how much time is actually left on the link.
@@ -37,6 +38,13 @@ async function confirmFor(deps: unknown, prefer?: 'sponsored' | 'self') {
   const challenge = (impl ? await impl() : { accepts: [SAMPLE_ACCEPT] }) as { accepts?: unknown[] }
   const chosen = orderAccepts((challenge.accepts ?? []) as never[], prefer ?? d.gasPreference ?? 'sponsored')[0] ?? SAMPLE_ACCEPT
   return quoteOf(chosen as never)
+}
+
+/** Calls the tool with its echoed quote registered for this request, as the wallet's price stop would have. */
+async function requestConfirmed(deps: unknown, input: unknown) {
+  const i = input as Record<string, unknown>
+  const book = (deps as { quoteBook?: QuoteBook }).quoteBook
+  return requestAiBirthcertVerification(deps as never, confirmedInput(i, verificationBindingFor(i), book) as never)
 }
 
 let passImagesDir: string
@@ -100,7 +108,7 @@ describe('requestAiBirthcertVerification', () => {
   it('with no prior session: pays fresh — challenge -> pay(accept) -> settle(body, xPayment)', async () => {
     const { deps, createSessionChallenge, createSessionSettle, createSessionWithReceipt, pay } = makeDeps()
 
-    const out = await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    const out = await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
     expect(createSessionChallenge).toHaveBeenCalledTimes(1)
     expect(pay).toHaveBeenCalledWith(SAMPLE_ACCEPT)
@@ -112,7 +120,7 @@ describe('requestAiBirthcertVerification', () => {
   it('builds the request body: id mirrors agentName, ownerReference is the holderDid, publicKey/address come from deps', async () => {
     const { deps, createSessionChallenge } = makeDeps()
 
-    await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
     const body = createSessionChallenge.mock.calls[0][0]
     expect(body.agentName).toBe('Procurement Assistant')
@@ -126,7 +134,7 @@ describe('requestAiBirthcertVerification', () => {
 
   it('omits optional fields entirely when not supplied', async () => {
     const { deps, createSessionChallenge } = makeDeps()
-    await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
     const body = createSessionChallenge.mock.calls[0][0]
     expect(body.agentPurpose).toBeUndefined()
     expect(body.evidenceAssuranceLevel).toBeUndefined()
@@ -136,7 +144,7 @@ describe('requestAiBirthcertVerification', () => {
 
   it('passes through optional fields when supplied', async () => {
     const { deps, createSessionChallenge } = makeDeps()
-    await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+    await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
       agentName: 'Procurement Assistant', agentPurpose: 'Negotiate invoices',
       evidenceAssuranceLevel: 'high', ownerType: 'Individual', ownerVerified: 'true',
     })
@@ -153,14 +161,14 @@ describe('requestAiBirthcertVerification', () => {
   // resulting bodies are byte-identical anyway, so this is invisible to every other assertion.
   it('signs the SHA-256 digest of the canonical JSON of the body (minus signedData) via signHexBlob', async () => {
     const { deps, signHexBlob } = makeDeps()
-    await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
     expect(signHexBlob).toHaveBeenCalledTimes(2)
     expect(signHexBlob.mock.calls[0][0] as string).toMatch(/^[0-9a-f]{64}$/)
   })
 
   it('persists sessionId, agentName, verificationUrl and the settlement receipt to the session store', async () => {
     const { deps, sessionStore } = makeDeps()
-    const out = await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    const out = await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
     expect(sessionStore.set).toHaveBeenCalledWith({
       sessionId: 's-1', agentName: 'Procurement Assistant', createdAt: '2026-08-17T09:00:00.000Z',
       verificationUrl: 'https://zvg.test/verify/tok', paymentReceipt: 'receipt-1', holderDid: 'did:zid:owner123',
@@ -170,7 +178,7 @@ describe('requestAiBirthcertVerification', () => {
 
   it('rejects a blank agentName before calling out', async () => {
     const { deps, createSessionChallenge, pay } = makeDeps()
-    await expect(requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: '  ' })).rejects.toThrow(/agentName/)
+    await expect(requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: '  ' })).rejects.toThrow(/agentName/)
     expect(createSessionChallenge).not.toHaveBeenCalled()
     expect(pay).not.toHaveBeenCalled()
   })
@@ -183,7 +191,7 @@ describe('requestAiBirthcertVerification', () => {
     })
     getSession.mockResolvedValue({ sessionId: 's-old', status: 'pending', expiresAt: '2026-08-17T08:30:00+00:00' })
 
-    const out = await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    const out = await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
     expect(getSession).toHaveBeenCalledWith('s-old')
     expect(pay).not.toHaveBeenCalled()
@@ -205,7 +213,7 @@ describe('requestAiBirthcertVerification', () => {
     // deps.now() is fixed at 2026-08-17T09:00:00.000Z — 2 minutes to expiry, under the 5-minute urgent threshold.
     getSession.mockResolvedValue({ sessionId: 's-old', status: 'pending', expiresAt: '2026-08-17T09:02:00+00:00' })
 
-    const out = await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    const out = await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
     expect(out.message).toMatch(/right now, not later/)
     expect(out.message).not.toMatch(/or after a few minutes/)
@@ -223,7 +231,7 @@ describe('requestAiBirthcertVerification', () => {
     })
     getSession.mockResolvedValue({ sessionId: 's-old', status: 'expired', expiresAt: '2026-08-17T08:30:00+00:00' })
 
-    await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
     expect(pay).not.toHaveBeenCalled()
     expect(createSessionChallenge).not.toHaveBeenCalled()
@@ -242,7 +250,7 @@ describe('requestAiBirthcertVerification', () => {
     })
     getSession.mockResolvedValue({ sessionId: 's-old', status: 'expired', expiresAt: '2026-08-17T08:30:00+00:00' })
 
-    await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
     expect(createSessionWithReceipt).toHaveBeenCalledWith(expect.objectContaining({ agentName: 'Procurement Assistant' }), 'receipt-old')
     expect(pay).not.toHaveBeenCalled()
@@ -258,7 +266,7 @@ describe('requestAiBirthcertVerification', () => {
     })
     getSession.mockRejectedValue(new SsivcError('SSIVC getSession failed — HTTP 404: not found', 404))
 
-    await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
     expect(pay).not.toHaveBeenCalled()
     expect(createSessionWithReceipt).toHaveBeenCalledWith(expect.objectContaining({ agentName: 'Procurement Assistant' }), 'receipt-old')
@@ -272,7 +280,7 @@ describe('requestAiBirthcertVerification', () => {
     })
     getSession.mockRejectedValue(new Error('ECONNRESET'))
 
-    await expect(requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })).rejects.toThrow(/ECONNRESET/)
+    await expect(requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })).rejects.toThrow(/ECONNRESET/)
 
     expect(createSessionWithReceipt).not.toHaveBeenCalled()
     expect(pay).not.toHaveBeenCalled()
@@ -287,7 +295,7 @@ describe('requestAiBirthcertVerification', () => {
     })
     getSession.mockRejectedValue(new SsivcError('SSIVC getSession failed — HTTP 503: unavailable', 503))
 
-    await expect(requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })).rejects.toThrow(/503/)
+    await expect(requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })).rejects.toThrow(/503/)
 
     expect(createSessionWithReceipt).not.toHaveBeenCalled()
     expect(pay).not.toHaveBeenCalled()
@@ -306,7 +314,7 @@ describe('requestAiBirthcertVerification', () => {
       { vc: { id: 'did:zid:vc-old', credentialSubject: { id: 'did:zid:owner123' }, validUntil: '2026-01-01T00:00:00Z' } },
     ])
 
-    await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
     expect(createSessionWithReceipt).not.toHaveBeenCalled()
     expect(pay).toHaveBeenCalledWith(SAMPLE_ACCEPT)
@@ -329,7 +337,7 @@ describe('requestAiBirthcertVerification', () => {
       { vc: { id: 'did:zid:vc-old', credentialSubject: { id: 'did:zid:owner123' }, validUntil: '2026-01-01T00:00:00Z' } },
     ])
 
-    await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
     expect(getSession).toHaveBeenCalledWith('s-old')
     expect(pay).toHaveBeenCalled()
@@ -347,7 +355,7 @@ describe('requestAiBirthcertVerification', () => {
     })
     getSession.mockRejectedValue(new SsivcError('SSIVC getSession failed — HTTP 404: not found', 404))
 
-    await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
     expect(createSessionWithReceipt).toHaveBeenCalledWith(expect.objectContaining({ agentName: 'Procurement Assistant' }), 'receipt-old')
     expect(pay).not.toHaveBeenCalled()
@@ -364,7 +372,7 @@ describe('requestAiBirthcertVerification', () => {
     getSession.mockResolvedValue({ sessionId: 's-old', status: 'pending', expiresAt: '2026-08-17T08:30:00+00:00' })
     sessionStore.set.mockClear() // clear the setup call above so the assertion below is about the SUT only
 
-    const out = await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    const out = await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
     expect(out).toEqual({ error: expect.stringContaining('Some Other Agent'), nextStep: 'follow_message' })
     expect(pay).not.toHaveBeenCalled()
@@ -379,7 +387,7 @@ describe('requestAiBirthcertVerification', () => {
     const err = new PaymentReadinessError('insufficient ZTX for gas', { asset: 'ZTX', required: '100', available: '10', reason: 'gas' })
     const { deps } = makeDeps({ pay: vi.fn().mockRejectedValue(err) })
 
-    const out = await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    const out = await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
     expect(out).toEqual({
       error: expect.stringContaining('insufficient funds'),
@@ -392,7 +400,7 @@ describe('requestAiBirthcertVerification', () => {
     const err = new PaymentCapError('payment blocked: requested 1000 ZTX exceeds configured MAX_PAYMENT_AMOUNT 0')
     const { deps } = makeDeps({ pay: vi.fn().mockRejectedValue(err) })
 
-    const out = await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    const out = await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
     expect(out).toEqual({ error: expect.stringContaining('MAX_PAYMENT_AMOUNT'), nextStep: 'follow_message' })
   })
@@ -410,7 +418,7 @@ describe('requestAiBirthcertVerification', () => {
       },
     })
 
-    const out = await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    const out = await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
     expect(out).toEqual({ error: expect.stringContaining('already settled'), nextStep: 'follow_message' })
     // R8-M03: the fee was most likely taken, so this must warn against a retry that pays again.
@@ -430,7 +438,7 @@ describe('requestAiBirthcertVerification', () => {
     }
     const { deps, pay } = makeDeps({ ssivc: noAcceptSsivc })
 
-    const out = await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    const out = await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
     expect(out).toEqual({ error: expect.stringContaining('payment options'), nextStep: 'follow_message' })
     expect(pay).not.toHaveBeenCalled()
@@ -449,9 +457,9 @@ describe('requestAiBirthcertVerification', () => {
     // what call1 will actually create (createSessionSettle's default mock), so out1/out2 line up.
     getSession.mockResolvedValue({ sessionId: 's-1', status: 'pending', expiresAt: '2026-08-17T09:30:00+00:00' })
 
-    const call1 = requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    const call1 = requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
     await Promise.resolve().then(() => Promise.resolve()) // let call1 progress up to its await on pay()
-    const call2 = requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    const call2 = requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
     await Promise.resolve().then(() => Promise.resolve())
 
     releasePay('BASE64PAYMENT')
@@ -535,7 +543,7 @@ async function runRequestRaw(overrides: Partial<Record<string, unknown>> = {}, i
     },
     ...overrides,
   }
-  return (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant', ...input })) as Record<
+  return (await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant', ...input })) as Record<
     string,
     unknown
   >
@@ -561,7 +569,7 @@ describe('session expiry is worked out by the wallet, across timezones', () => {
         getSession: vi.fn(),
       },
     })
-    const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
+    const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
     expect(out.expiresAt).toBe('2026-09-24T16:11:24+08:00')
     expect(out.expiresInSeconds).toBe(900)
     expect(out.expiresIn).toBe('about 15 minutes')
@@ -586,7 +594,7 @@ describe('session expiry is worked out by the wallet, across timezones', () => {
       sessionId: 's-tz', agentName: 'Procurement Assistant', createdAt: '2026-09-24T07:56:00.000Z',
       verificationUrl: 'https://zvg.test/verify/tz', paymentReceipt: 'r-tz',
     })
-    const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
+    const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
     expect(out.expiresIn).toBe('about 15 minutes')
   })
 
@@ -612,7 +620,7 @@ describe('structured payment failures, matching subscribe_and_issue (R11)', () =
       getSession: vi.fn(),
     }
     const sessionStore = { get: vi.fn().mockResolvedValue(null), set: vi.fn().mockResolvedValue(undefined) }
-    return (await requestAiBirthcertVerification(
+    return (await requestConfirmed(
       {
         ssivc,
         signHexBlob: vi.fn().mockResolvedValue({ signBlob: 'sig', publicKey: 'pk' }),
@@ -650,7 +658,7 @@ describe('structured payment failures, matching subscribe_and_issue (R11)', () =
 describe('dryRun: quote without paying (R2)', () => {
   it('returns the quote and never calls pay', async () => {
     const { deps } = makeDeps()
-    const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+    const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
       agentName: 'Quote Probe',
       dryRun: true,
     })) as Record<string, unknown>
@@ -662,7 +670,7 @@ describe('dryRun: quote without paying (R2)', () => {
 
   it('creates no session and writes nothing to the session store', async () => {
     const { deps } = makeDeps()
-    await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Quote Probe', dryRun: true })
+    await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Quote Probe', dryRun: true })
     expect(deps.sessionStore.set).not.toHaveBeenCalled()
   })
 
@@ -671,7 +679,7 @@ describe('dryRun: quote without paying (R2)', () => {
     await sessionStore.set({ sessionId: 's-live', agentName: 'Someone Else', createdAt: 'x', verificationUrl: 'u', paymentReceipt: 'r' })
     sessionStore.get.mockClear()
 
-    const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+    const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
       agentName: 'Quote Probe',
       dryRun: true,
     })) as Record<string, unknown>
@@ -685,21 +693,21 @@ describe('dryRun: quote without paying (R2)', () => {
   it('reports the gas model as sponsored when the server offers a facilitator option (R12)', async () => {
     const { deps } = makeDeps()
     deps.ssivc.createSessionChallenge.mockResolvedValue({ x402Version: 2, accepts: [selfPayAccept, sponsoredAccept] })
-    const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Q', dryRun: true })) as Record<string, unknown>
+    const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Q', dryRun: true })) as Record<string, unknown>
     expect(out.quote).toMatchObject({ gasModel: 'sponsored', asset: 'ZTXtoken', maxAmountRequired: '5000' })
   })
 
   it('reports the gas model as self when only a self-pay option is quoted (R12)', async () => {
     const { deps } = makeDeps()
     deps.ssivc.createSessionChallenge.mockResolvedValue({ x402Version: 2, accepts: [selfPayAccept] })
-    const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Q', dryRun: true })) as Record<string, unknown>
+    const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Q', dryRun: true })) as Record<string, unknown>
     expect(out.quote).toMatchObject({ gasModel: 'self' })
   })
 
   it('honours a gasPayer override when quoting, so the quote matches what would actually be paid', async () => {
     const { deps } = makeDeps()
     deps.ssivc.createSessionChallenge.mockResolvedValue({ x402Version: 2, accepts: [selfPayAccept, sponsoredAccept] })
-    const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+    const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
       agentName: 'Q',
       dryRun: true,
       gasPayer: 'self',
@@ -710,7 +718,7 @@ describe('dryRun: quote without paying (R2)', () => {
   it('reports an error rather than a quote when the server offers nothing usable', async () => {
     const { deps } = makeDeps()
     deps.ssivc.createSessionChallenge.mockResolvedValue({ x402Version: 2, accepts: [] })
-    const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Q', dryRun: true })) as Record<string, unknown>
+    const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Q', dryRun: true })) as Record<string, unknown>
     expect(out.error).toMatch(/no usable payment options/i)
     expect(out.quote).toBeUndefined()
   })
@@ -721,7 +729,7 @@ describe('an existing Verified Birthcert VC is checked before paying for a new o
     const { deps, pay } = makeDeps()
     deps.cache.get.mockResolvedValue(null)
 
-    const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
+    const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
 
     expect(pay).toHaveBeenCalledTimes(1)
     expect(out.sessionId).toBe('s-1')
@@ -737,7 +745,7 @@ describe('an existing Verified Birthcert VC is checked before paying for a new o
       validUntil: '2027-01-01T00:00:00Z',
     })
 
-    const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
+    const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
 
     expect(pay).not.toHaveBeenCalled()
     expect(deps.ssivc.createSessionChallenge).not.toHaveBeenCalled()
@@ -760,7 +768,7 @@ describe('an existing Verified Birthcert VC is checked before paying for a new o
       validUntil: '2027-01-01T00:00:00Z',
     })
 
-    const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+    const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
       agentName: 'Procurement Assistant',
       confirmReplaceExistingVc: 'did:zid:existing-vc-1',
     })) as Record<string, unknown>
@@ -780,7 +788,7 @@ describe('an existing Verified Birthcert VC is checked before paying for a new o
       validUntil: '2026-01-01T00:00:00Z', // before makeDeps' now() of 2026-08-17
     })
 
-    const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
+    const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
 
     expect(pay).toHaveBeenCalledTimes(1)
     expect(out.sessionId).toBe('s-1')
@@ -797,7 +805,7 @@ describe('an existing Verified Birthcert VC is checked before paying for a new o
       validUntil: '2027-01-01T00:00:00Z',
     })
 
-    const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+    const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
       agentName: 'Procurement Assistant',
       confirmReplaceExistingVc: 'did:zid:some-other-vc',
     })) as Record<string, unknown>
@@ -810,7 +818,7 @@ describe('an existing Verified Birthcert VC is checked before paying for a new o
   it('verifiedTemplateId is not configured: skips the check entirely and pays as before (APP-L03)', async () => {
     const { deps, pay } = makeDeps({ verifiedTemplateId: undefined })
 
-    const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
+    const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
 
     expect(deps.cache.get).not.toHaveBeenCalled()
     expect(pay).toHaveBeenCalledTimes(1)
@@ -821,7 +829,7 @@ describe('an existing Verified Birthcert VC is checked before paying for a new o
     const { deps, pay } = makeDeps()
     deps.cache.get.mockResolvedValue({ templateId: 'did:zid:verified-template', vc: {}, issuedAt: '2026-01-01T00:00:00Z' })
 
-    const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
+    const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
 
     expect(pay).toHaveBeenCalledTimes(1)
     expect(out.sessionId).toBe('s-1')
@@ -832,7 +840,7 @@ describe('an existing Verified Birthcert VC is checked before paying for a new o
     const { deps } = makeDeps()
     deps.cache.get.mockResolvedValue(null)
 
-    await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
     expect(deps.cache.get).toHaveBeenCalledWith('did:zid:verified-template')
   })
@@ -846,7 +854,7 @@ describe('an existing Verified Birthcert VC is checked before paying for a new o
       const vc = { id: 'did:zid:issued-not-cached', credentialSubject: { id: 'did:zid:owner123' }, validUntil: '2027-06-01T00:00:00Z' }
       deps.mbi.downloadVcs.mockResolvedValue([{ vc }])
 
-      const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
+      const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
 
       expect(pay).not.toHaveBeenCalled()
       expect(createSessionChallenge).not.toHaveBeenCalled()
@@ -863,7 +871,7 @@ describe('an existing Verified Birthcert VC is checked before paying for a new o
       const vc = { id: 'did:zid:issued-expired', credentialSubject: { id: 'did:zid:owner123' }, validUntil: '2026-01-01T00:00:00Z' }
       deps.mbi.downloadVcs.mockResolvedValue([{ vc }])
 
-      const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
+      const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
 
       expect(pay).toHaveBeenCalledTimes(1)
       expect(out.sessionId).toBe('s-1')
@@ -877,7 +885,7 @@ describe('an existing Verified Birthcert VC is checked before paying for a new o
       getSession.mockResolvedValue({ sessionId: 's-prior', status: 'issued', expiresAt: '2026-01-01T00:30:00Z', vcId: 'did:zid:unresolvable' })
       deps.mbi.downloadVcs.mockRejectedValue(new Error('MBI unavailable'))
 
-      const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
+      const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
 
       expect(pay).not.toHaveBeenCalled()
       expect(createSessionChallenge).not.toHaveBeenCalled()
@@ -891,7 +899,7 @@ describe('an existing Verified Birthcert VC is checked before paying for a new o
       await sessionStore.set({ sessionId: 's-prior', agentName: 'Procurement Assistant', createdAt: '2026-01-01T00:00:00Z', verificationUrl: 'u', paymentReceipt: 'r' })
       getSession.mockResolvedValue({ sessionId: 's-prior', status: 'pending', expiresAt: '2026-01-01T00:30:00Z' })
 
-      const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
+      const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
 
       expect(pay).not.toHaveBeenCalled()
       expect(deps.mbi.downloadVcs).not.toHaveBeenCalled()
@@ -913,7 +921,7 @@ describe('an existing Verified Birthcert VC is checked before paying for a new o
       const vc = { id: 'did:zid:newer-vc-b', credentialSubject: { id: 'did:zid:owner123' }, validUntil: '2027-06-01T00:00:00Z' }
       deps.mbi.downloadVcs.mockResolvedValue([{ vc }])
 
-      const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
+      const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
 
       expect(pay).not.toHaveBeenCalled()
       expect(createSessionChallenge).not.toHaveBeenCalled()
@@ -932,7 +940,7 @@ describe('an existing Verified Birthcert VC is checked before paying for a new o
       const vc = { id: 'did:zid:newer-vc-b', credentialSubject: { id: 'did:zid:owner123' }, validUntil: '2027-06-01T00:00:00Z' }
       deps.mbi.downloadVcs.mockResolvedValue([{ vc }])
 
-      const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+      const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
         agentName: 'Procurement Assistant',
         confirmReplaceExistingVc: 'did:zid:stale-vc-a', // the OLD id, not the one actually shown
       })) as Record<string, unknown>
@@ -953,7 +961,7 @@ describe('an existing Verified Birthcert VC is checked before paying for a new o
       const vc = { id: 'did:zid:newer-vc-b', credentialSubject: { id: 'did:zid:owner123' }, validUntil: '2027-06-01T00:00:00Z' }
       deps.mbi.downloadVcs.mockResolvedValue([{ vc }])
 
-      const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+      const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
         agentName: 'Procurement Assistant',
         confirmReplaceExistingVc: 'did:zid:newer-vc-b',
       })) as Record<string, unknown>
@@ -971,7 +979,7 @@ describe('an existing Verified Birthcert VC is checked before paying for a new o
       await sessionStore.set({ sessionId: 's-x', agentName: 'Procurement Assistant', createdAt: '2026-01-01T00:00:00Z', verificationUrl: 'u', paymentReceipt: 'r', holderDid: 'did:zid:owner123' })
       getSession.mockResolvedValue({ sessionId: 's-x', status: 'issued', expiresAt: '2026-01-01T00:30:00Z', vcId: 'did:zid:in-sync-vc' })
 
-      await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+      await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
       expect(deps.mbi.downloadVcs).not.toHaveBeenCalled()
     })
@@ -993,7 +1001,7 @@ describe('an existing Verified Birthcert VC is checked before paying for a new o
       })
       getSession.mockResolvedValue({ sessionId: 's-foreign', status: 'issued', expiresAt: '2026-01-01T00:30:00Z', vcId: 'did:zid:foreign-vc' })
 
-      const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
+      const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
 
       expect(deps.mbi.downloadVcs).not.toHaveBeenCalled()
       expect(pay).toHaveBeenCalledTimes(1)
@@ -1017,7 +1025,7 @@ describe('an existing Verified Birthcert VC is checked before paying for a new o
       const vc = { id: 'did:zid:foreign-vc', credentialSubject: { id: 'did:zid:someone-else' }, validUntil: '2027-06-01T00:00:00Z' }
       deps.mbi.downloadVcs.mockResolvedValue([{ vc }])
 
-      const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
+      const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
 
       expect(pay).toHaveBeenCalledTimes(1)
       expect(createSessionChallenge).toHaveBeenCalledTimes(1)
@@ -1034,7 +1042,7 @@ describe('an existing Verified Birthcert VC is checked before paying for a new o
       await sessionStore.set({ sessionId: 's-legacy', agentName: 'Some Agent', createdAt: '2026-01-01T00:00:00Z', verificationUrl: 'u', paymentReceipt: 'r' })
       getSession.mockResolvedValue({ sessionId: 's-legacy', status: 'issued', expiresAt: '2026-01-01T00:30:00Z', vcId: 'did:zid:legacy-vc' })
 
-      const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
+      const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
 
       expect(deps.mbi.downloadVcs).not.toHaveBeenCalled()
       expect(pay).toHaveBeenCalledTimes(1)
@@ -1051,7 +1059,7 @@ describe('an existing Verified Birthcert VC is checked before paying for a new o
       })
       deps.sessionStore.get.mockRejectedValue(new Error('disk read failed'))
 
-      const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
+      const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
 
       expect(pay).not.toHaveBeenCalled()
       expect(out.existingVerifiedVc).toEqual({ vcId: 'did:zid:existing-vc-1', validUntil: '2027-01-01T00:00:00Z' })
@@ -1066,7 +1074,7 @@ describe('an existing Verified Birthcert VC is checked before paying for a new o
       await sessionStore.set({ sessionId: 's-x', agentName: 'Procurement Assistant', createdAt: '2026-01-01T00:00:00Z', verificationUrl: 'u', paymentReceipt: 'r', holderDid: 'did:zid:owner123' })
       getSession.mockRejectedValue(new Error('SSIVC unavailable'))
 
-      const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
+      const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
 
       expect(pay).not.toHaveBeenCalled()
       expect(out.existingVerifiedVc).toEqual({ vcId: 'did:zid:existing-vc-1', validUntil: '2027-01-01T00:00:00Z' })
@@ -1081,7 +1089,7 @@ describe('an existing Verified Birthcert VC is checked before paying for a new o
       getSession.mockResolvedValue({ sessionId: 's-prior', status: 'issued', expiresAt: '2026-01-01T00:30:00Z', vcId: 'did:zid:no-match' })
       deps.mbi.downloadVcs.mockResolvedValue([])
 
-      const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
+      const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
 
       expect(out.error).toContain('Nothing was paid')
     })
@@ -1096,7 +1104,7 @@ describe('an existing Verified Birthcert VC is checked before paying for a new o
       })
       pay.mockRejectedValue(new PaymentReadinessError('insufficient ZTX for gas', { asset: 'ZTX', required: '100', available: '10', reason: 'gas' }))
 
-      const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
+      const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
 
       expect(out.error).toBeDefined()
       expect(out.replacedExpiredVc).toBeUndefined()
@@ -1111,7 +1119,7 @@ describe('an existing Verified Birthcert VC is checked before paying for a new o
       deps.cache.get.mockResolvedValue(null)
       deps.sessionStore.get.mockRejectedValue(new Error('disk read failed'))
 
-      await expect(requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })).rejects.toThrow(/disk read failed/)
+      await expect(requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })).rejects.toThrow(/disk read failed/)
       expect(pay).not.toHaveBeenCalled()
     })
 
@@ -1123,7 +1131,7 @@ describe('an existing Verified Birthcert VC is checked before paying for a new o
       })
       deps.sessionStore.get.mockRejectedValue(new Error('disk read failed'))
 
-      await expect(requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })).rejects.toThrow(/disk read failed/)
+      await expect(requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })).rejects.toThrow(/disk read failed/)
       expect(pay).not.toHaveBeenCalled()
     })
 
@@ -1133,7 +1141,7 @@ describe('an existing Verified Birthcert VC is checked before paying for a new o
       await sessionStore.set({ sessionId: 's-x', agentName: 'Procurement Assistant', createdAt: '2026-01-01T00:00:00Z', verificationUrl: 'u', paymentReceipt: 'r', holderDid: 'did:zid:owner123' })
       getSession.mockRejectedValue(new Error('SSIVC unavailable'))
 
-      await expect(requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })).rejects.toThrow(/SSIVC unavailable/)
+      await expect(requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })).rejects.toThrow(/SSIVC unavailable/)
       expect(pay).not.toHaveBeenCalled()
     })
 
@@ -1150,7 +1158,7 @@ describe('an existing Verified Birthcert VC is checked before paying for a new o
         sleep: vi.fn().mockResolvedValue(undefined),
       })
 
-      await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+      await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
       expect(sessionStore.set).toHaveBeenCalledWith(expect.objectContaining({ sessionId: '', paymentReceipt: 'r-queued', holderDid: 'did:zid:owner123' }))
     })
@@ -1217,7 +1225,7 @@ describe('an existing Verified Birthcert VC is checked before paying for a new o
       getSession.mockResolvedValue({ sessionId: 's-prior', status: 'issued', expiresAt: '2026-01-01T00:30:00Z', vcId: 'did:zid:no-match-anywhere' })
       deps.mbi.downloadVcs.mockResolvedValue([]) // no matching entry — deterministic, not transient
 
-      const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
+      const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<string, unknown>
 
       expect(pay).not.toHaveBeenCalled()
       expect(out.error).toMatch(/receipt-stuck-1/)
@@ -1371,7 +1379,7 @@ describe('sponsored settlement retry', () => {
         verificationUrl: '', paymentReceipt: 'r-queued',
       })
 
-      const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+      const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
         agentName: 'Procurement Assistant',
       })) as unknown as { settlementPending?: boolean; issuerRejected?: boolean; message?: string; paymentReceipt?: string }
 
@@ -1407,7 +1415,7 @@ describe('sponsored settlement retry', () => {
         verificationUrl: '', paymentReceipt: 'r-queued',
       })
 
-      const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+      const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
         agentName: 'Procurement Assistant',
       })) as unknown as { settlementPending?: boolean; issuerRejected?: boolean; message?: string; error?: string }
 
@@ -1441,7 +1449,7 @@ describe('sponsored settlement retry', () => {
         verificationUrl: '', paymentReceipt: 'r-queued',
       })
 
-      const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+      const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
         agentName: 'Procurement Assistant',
       })) as unknown as {
         settlementPending?: boolean
@@ -1485,7 +1493,7 @@ describe('sponsored settlement retry', () => {
         verificationUrl: '', paymentReceipt: 'r-queued',
       })
 
-      const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+      const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
         agentName: 'Procurement Assistant',
       })) as unknown as {
         settlementPending?: boolean
@@ -1635,7 +1643,7 @@ describe('sponsored settlement retry', () => {
     })
     sessionStore.set.mockClear()
 
-    const out = await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    const out = await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
     // One hour old, so still within the window where it may genuinely settle.
     expect(out).toMatchObject({ settlementPending: true })
@@ -1711,7 +1719,7 @@ describe('sponsored settlement retry', () => {
       createSessionWithReceipt: vi.fn().mockResolvedValue({ kind: 'queued', paymentReceipt: 'r-opt', retryAfterSeconds: 1 }),
     }
 
-    await requestAiBirthcertVerification(
+    await requestConfirmed(
       { ...makeDeps().deps, ssivc, sessionStore: store, sleep: vi.fn().mockResolvedValue(undefined) } as never,
       {
         confirm: await confirmFor({ ssivc }),
@@ -1762,7 +1770,7 @@ describe('sponsored settlement retry', () => {
       verificationUrl: '', paymentReceipt: 'receipt-queued',
     })
 
-    await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
     expect(getSession).not.toHaveBeenCalled()
     expect(pay).not.toHaveBeenCalled()
@@ -1781,7 +1789,7 @@ describe('sponsored settlement retry', () => {
       verificationUrl: '', paymentReceipt: 'receipt-queued-other',
     })
 
-    await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
     expect(getSession).not.toHaveBeenCalled()
     expect(pay).not.toHaveBeenCalled()
@@ -1936,7 +1944,7 @@ describe('R10: the paid-this-call wording is pinned on every half of every branc
         sessionId: '', agentName: 'Procurement Assistant', createdAt,
         verificationUrl: '', paymentReceipt: 'r-stored',
       })
-      return (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<
+      return (await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })) as Record<
         string,
         unknown
       >
@@ -2001,7 +2009,7 @@ describe('R10: the paid-this-call wording is pinned on every half of every branc
       sessionId: '', agentName: 'Procurement Assistant', createdAt: '2026-08-01T08:00:00.000Z',
       verificationUrl: '', paymentReceipt: 'r-stuck',
     })
-    const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+    const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
       agentName: 'Procurement Assistant',
       discardStuckReceiptAndPayFresh: 'r-stuck',
     })) as Record<string, unknown>
@@ -2432,7 +2440,7 @@ describe('terminal messages survive summarisation, and the receipt is a field', 
       verificationUrl: '', paymentReceipt: 'r-unknown',
     })
 
-    const out = await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    const out = await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
     // The verdict has to be the FIRST thing, not buried after two clauses of explanation — a
     // summariser keeps the opening and discards the tail.
@@ -2474,7 +2482,7 @@ describe('terminal messages survive summarisation, and the receipt is a field', 
       verificationUrl: '', paymentReceipt: 'r-void',
     })
 
-    const out = await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    const out = await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
     expect(out.error).toMatch(/^RECEIPT VOID/)
     expect(out.error).toContain('r-void')
@@ -2509,7 +2517,7 @@ describe('terminal messages survive summarisation, and the receipt is a field', 
       sleep: vi.fn().mockResolvedValue(undefined),
     })
 
-    const out = await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    const out = await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
     expect(pay).toHaveBeenCalledTimes(1)
     expect(out.error).toMatch(/^RECEIPT VOID/)
@@ -2521,7 +2529,7 @@ describe('terminal messages survive summarisation, and the receipt is a field', 
   it('lets the very next request pay fresh, with no confirmation flag needed', async () => {
     const { deps, sessionStore, pay, createSessionWithReceipt } = makeDeps()
     // Store already empty, as the void path leaves it.
-    const out = await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    const out = await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
     expect(out.sessionId).toBeDefined()
     expect(pay).toHaveBeenCalledTimes(1)
@@ -2543,7 +2551,7 @@ describe('terminal messages survive summarisation, and the receipt is a field', 
       verificationUrl: '', paymentReceipt: 'r-stranded',
     })
 
-    const out = await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    const out = await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
     expect(out.error).toMatch(/clear_stuck_payment_receipt/)
     expect(out.error).toMatch(/SECOND fee/)
@@ -2640,7 +2648,7 @@ describe('APP-M01: the mutating tools serialize against request_', () => {
 
     await Promise.all([
       checkAiBirthcertVerification(deps as never),
-      requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' }),
+      requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' }),
     ])
 
     // The critical section must never overlap — whoever goes second re-reads the store and sees the
@@ -2683,7 +2691,7 @@ describe('APP-M01: the mutating tools serialize against request_', () => {
     const deps = { ...makeDeps().deps, ssivc, sessionStore, sleep: vi.fn().mockResolvedValue(undefined) }
 
     const [, cleared] = await Promise.all([
-      requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' }),
+      requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' }),
       clearStuckPaymentReceipt(deps as never, { confirmReceiptId: 'r-race' }),
     ])
 
@@ -2719,7 +2727,7 @@ describe('discarding a stuck receipt and paying fresh, in one call', () => {
     const { deps, sessionStore, pay, createSessionWithReceipt } = makeStuckDeps()
     await sessionStore.set(stuck)
 
-    const out = await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+    const out = await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
       agentName: 'Procurement Assistant',
       discardStuckReceiptAndPayFresh: 'r-stuck',
     })
@@ -2736,7 +2744,7 @@ describe('discarding a stuck receipt and paying fresh, in one call', () => {
     const { deps, sessionStore } = makeStuckDeps()
     await sessionStore.set(stuck)
 
-    const out = await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+    const out = await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
       agentName: 'Procurement Assistant',
       discardStuckReceiptAndPayFresh: 'r-stuck',
     })
@@ -2757,7 +2765,7 @@ describe('discarding a stuck receipt and paying fresh, in one call', () => {
     await sessionStore.set(stuck)
     pay.mockRejectedValue(makeErr())
 
-    const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+    const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
       agentName: 'Procurement Assistant',
       discardStuckReceiptAndPayFresh: 'r-stuck',
     })) as Record<string, unknown>
@@ -2783,7 +2791,7 @@ describe('discarding a stuck receipt and paying fresh, in one call', () => {
         maxSettlementAttempts: 2,
       })
     const ask = async (deps: unknown) =>
-      requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+      requestConfirmed(deps as never, { confirm: await confirmFor(deps),
         agentName: 'Procurement Assistant',
         discardStuckReceiptAndPayFresh: 'r-stuck',
       }) as Promise<Record<string, unknown>>
@@ -2891,7 +2899,7 @@ describe('discarding a stuck receipt and paying fresh, in one call', () => {
     const { deps, sessionStore, pay } = makeStuckDeps()
     await sessionStore.set(stuck)
 
-    const out = await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+    const out = await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
       agentName: 'Procurement Assistant',
       discardStuckReceiptAndPayFresh: 'r-wrong',
     })
@@ -2905,7 +2913,7 @@ describe('discarding a stuck receipt and paying fresh, in one call', () => {
   it('refuses when there is no receipt at all, rather than paying anyway', async () => {
     const { deps, pay } = makeStuckDeps()
 
-    const out = await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+    const out = await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
       agentName: 'Procurement Assistant',
       discardStuckReceiptAndPayFresh: 'r-imagined',
     })
@@ -2920,7 +2928,7 @@ describe('discarding a stuck receipt and paying fresh, in one call', () => {
     const { deps, sessionStore, pay } = makeStuckDeps()
     await sessionStore.set({ ...stuck, sessionId: 's-live', verificationUrl: 'https://zvg.test/link' })
 
-    const out = await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+    const out = await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
       agentName: 'Procurement Assistant',
       discardStuckReceiptAndPayFresh: 'r-stuck',
     })
@@ -2937,7 +2945,7 @@ describe('discarding a stuck receipt and paying fresh, in one call', () => {
     const { deps, sessionStore, pay, createSessionChallenge } = makeStuckDeps()
     await sessionStore.set(stuck)
 
-    const out = await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+    const out = await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
       agentName: 'Procurement Assistant',
       dryRun: true,
       discardStuckReceiptAndPayFresh: 'r-stuck',
@@ -2963,7 +2971,7 @@ describe('discarding a stuck receipt and paying fresh, in one call', () => {
       const { deps, sessionStore, pay, createSessionChallenge } = makeStuckDeps()
       await sessionStore.set({ ...stuck, createdAt: '2026-08-17T08:26:00.000Z' })
 
-      const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+      const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
         agentName: 'Procurement Assistant',
         discardStuckReceiptAndPayFresh: 'r-stuck',
       })) as Record<string, unknown>
@@ -2984,7 +2992,7 @@ describe('discarding a stuck receipt and paying fresh, in one call', () => {
     it('the refusal makes no claim about whether the fee was taken', async () => {
       const { deps, sessionStore } = makeStuckDeps()
       await sessionStore.set({ ...stuck, createdAt: '2026-08-17T08:26:00.000Z' })
-      const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+      const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
         agentName: 'Procurement Assistant',
         discardStuckReceiptAndPayFresh: 'r-stuck',
       })) as Record<string, unknown>
@@ -3023,7 +3031,7 @@ describe('discarding a stuck receipt and paying fresh, in one call', () => {
     ])('%s: discard allowed = %s', async (_label, createdAt, allowed) => {
       const { deps, sessionStore, pay } = makeStuckDeps()
       await sessionStore.set({ ...stuck, createdAt })
-      const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+      const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
         agentName: 'Procurement Assistant',
         discardStuckReceiptAndPayFresh: 'r-stuck',
       })) as Record<string, unknown>
@@ -3041,7 +3049,7 @@ describe('discarding a stuck receipt and paying fresh, in one call', () => {
       const { deps, sessionStore, pay } = makeStuckDeps()
       ;(deps as { settlementStuckAfterMs?: number }).settlementStuckAfterMs = 10 * 60_000
       await sessionStore.set({ ...stuck, createdAt: '2026-08-17T08:26:00.000Z' })
-      const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+      const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
         agentName: 'Procurement Assistant',
         discardStuckReceiptAndPayFresh: 'r-stuck',
       })) as Record<string, unknown>
@@ -3053,7 +3061,7 @@ describe('discarding a stuck receipt and paying fresh, in one call', () => {
       const { deps, sessionStore } = makeStuckDeps()
       ;(deps as { settlementStuckAfterMs?: number }).settlementStuckAfterMs = 3_600_000
       await sessionStore.set({ ...stuck, createdAt: '2026-08-17T08:46:00.000Z' })
-      const out = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+      const out = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
         agentName: 'Procurement Assistant',
         discardStuckReceiptAndPayFresh: 'r-stuck',
       })) as Record<string, unknown>
@@ -3064,14 +3072,14 @@ describe('discarding a stuck receipt and paying fresh, in one call', () => {
     it('keeps the id-mismatch and live-session refusals ahead of the age refusal (their wording is more specific)', async () => {
       const { deps, sessionStore } = makeStuckDeps()
       await sessionStore.set({ ...stuck, createdAt: '2026-08-17T08:26:00.000Z' })
-      const mismatch = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+      const mismatch = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
         agentName: 'Procurement Assistant',
         discardStuckReceiptAndPayFresh: 'r-wrong',
       })) as Record<string, unknown>
       expect(mismatch.error).toMatch(/does not match the stored receipt/)
 
       await sessionStore.set({ ...stuck, sessionId: 's-live', verificationUrl: 'https://zvg.test/v', createdAt: '2026-08-17T08:26:00.000Z' })
-      const live = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+      const live = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
         agentName: 'Procurement Assistant',
         discardStuckReceiptAndPayFresh: 'r-stuck',
       })) as Record<string, unknown>
@@ -3084,7 +3092,7 @@ describe('discarding a stuck receipt and paying fresh, in one call', () => {
     const { deps, sessionStore, pay, createSessionWithReceipt } = makeStuckDeps()
     await sessionStore.set(stuck)
 
-    const out = await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    const out = await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
     // Still replays rather than paying: the block is intact unless the caller names the receipt.
     expect(pay).not.toHaveBeenCalled()
@@ -3136,7 +3144,7 @@ describe('APP-M03: a bare replay must not erase the optional fields already paid
   it('replays with the STORED optional fields when the caller supplies none', async () => {
     const { deps, createSessionWithReceipt } = replayDeps(queued)
 
-    await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
     expect(createSessionWithReceipt.mock.calls[0][0]).toMatchObject({
       agentPurpose: 'Handles procurement negotiations',
@@ -3149,7 +3157,7 @@ describe('APP-M03: a bare replay must not erase the optional fields already paid
   it('does not erase the stored fields when re-persisting on a bare retry', async () => {
     const { deps, state } = replayDeps(queued)
 
-    await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
     expect(state.value).toMatchObject({
       paymentReceipt: 'r-stored',
@@ -3161,7 +3169,7 @@ describe('APP-M03: a bare replay must not erase the optional fields already paid
   it('lets an explicit caller value win over the stored one', async () => {
     const { deps, createSessionWithReceipt } = replayDeps(queued)
 
-    await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+    await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
       agentName: 'Procurement Assistant',
       agentPurpose: 'Updated purpose',
     })
@@ -3180,7 +3188,7 @@ describe('APP-M03: a bare replay must not erase the optional fields already paid
   it('carries the fields on the FIRST write, the one that survives a crash', async () => {
     const { deps, sessionStore } = replayDeps(queued)
 
-    await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
     expect(sessionStore.set.mock.calls.length).toBeGreaterThan(0)
     expect(sessionStore.set.mock.calls[0][0]).toMatchObject({
@@ -3196,7 +3204,7 @@ describe('APP-M03: a bare replay must not erase the optional fields already paid
   it('carries the fields onto the success write too', async () => {
     const { deps, state } = replayDeps(settled)
 
-    await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
 
     expect(state.value).toMatchObject({
       sessionId: 's-done',
@@ -3226,7 +3234,7 @@ describe('request_ -> pending -> check_ round trip', () => {
     const deps = { ...makeDeps().deps, ssivc, sessionStore, sleep: vi.fn().mockResolvedValue(undefined) }
 
     // 1. request_ pays, settlement stays queued, and it returns early rather than blocking.
-    const requested = (await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+    const requested = (await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
       agentName: 'Procurement Assistant',
       agentPurpose: 'Handles procurement negotiations',
     })) as Record<string, unknown>
@@ -4699,7 +4707,7 @@ describe('per-call gasPayer override', () => {
     }
 
     // The quote an unconfirmed gasPayer: 'self' call returns is the self-pay one, so that is what is confirmed.
-    const result = await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps, 'self'), agentName: 'Procurement Assistant', gasPayer: 'self' })
+    const result = await requestConfirmed(deps as never, { confirm: await confirmFor(deps, 'self'), agentName: 'Procurement Assistant', gasPayer: 'self' })
 
     expect('error' in (result as Record<string, unknown>)).toBe(false)
     // orderAccepts('self') puts the self-pay candidate first — attemptCandidate calls pay(candidates[0]).
@@ -4750,7 +4758,7 @@ describe('per-call gasPayer override', () => {
       gasPreference: 'sponsored' as const,
     }
 
-    const result = await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps),
+    const result = await requestConfirmed(deps as never, { confirm: await confirmFor(deps),
       agentName: 'Procurement Assistant',
       gasPayer: 'banana' as never,
     })
@@ -4770,7 +4778,7 @@ describe('every session result says whether this call paid', () => {
 
   it('a fresh payment: paidThisCall is true and the message does not claim nothing was paid', async () => {
     const { deps, pay } = makeDeps()
-    const out = await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
+    const out = await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'Procurement Assistant' })
     expect(pay).toHaveBeenCalledTimes(1)
     expect(out).toMatchObject({ sessionId: 's-1', paidThisCall: true })
     expect((out as { message: string }).message).not.toMatch(/No new payment/)
@@ -4784,7 +4792,7 @@ describe('every session result says whether this call paid', () => {
     })
     getSession.mockResolvedValue({ sessionId: 's-old', status: 'expired', expiresAt: '2026-08-17T08:30:00+00:00' })
 
-    const out = await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'PMRBot' })
+    const out = await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'PMRBot' })
 
     expect(pay).not.toHaveBeenCalled()
     expect(out).toMatchObject({ sessionId: 's-2', paidThisCall: false })
@@ -4802,7 +4810,7 @@ describe('every session result says whether this call paid', () => {
     })
     getSession.mockResolvedValue({ sessionId: 's-old', status: 'pending', expiresAt: '2026-08-17T09:30:00+00:00' })
 
-    const out = await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'PMRBot' })
+    const out = await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'PMRBot' })
 
     expect(pay).not.toHaveBeenCalled()
     expect(out).toMatchObject({ sessionId: 's-old', paidThisCall: false })
@@ -4819,7 +4827,7 @@ describe('every session result says whether this call paid', () => {
     })
     getSession.mockResolvedValue({ sessionId: 's-old', status: 'expired', expiresAt: '2026-08-17T08:30:00+00:00' })
 
-    const out = await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'PMRBot' })
+    const out = await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'PMRBot' })
 
     expect(pay).not.toHaveBeenCalled()
     expect(out).toMatchObject({ settlementPending: true, paidThisCall: false })
@@ -4831,7 +4839,7 @@ describe('every session result says whether this call paid', () => {
     ;(deps.ssivc as Record<string, unknown>).createSessionSettle = vi.fn().mockResolvedValue(queued)
     ;(deps.ssivc as Record<string, unknown>).createSessionWithReceipt = vi.fn().mockResolvedValue(queued)
 
-    const out = await requestAiBirthcertVerification(deps as never, { confirm: await confirmFor(deps), agentName: 'PMRBot' })
+    const out = await requestConfirmed(deps as never, { confirm: await confirmFor(deps), agentName: 'PMRBot' })
 
     expect(pay).toHaveBeenCalledTimes(1)
     expect(out).toMatchObject({ settlementPending: true, paidThisCall: true })
@@ -4899,7 +4907,7 @@ describe('findUnusedVerificationPayment', () => {
 describe('request_ai_birthcert_verification asks before it pays', () => {
   it('without confirm: returns the price, pays nothing, signs no payment and starts no session', async () => {
     const { deps, pay, createSessionSettle, createSessionChallenge, sessionStore } = makeDeps()
-    const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'PMRBot' })) as Record<string, unknown>
+    const out = (await requestConfirmed(deps as never, { agentName: 'PMRBot' })) as Record<string, unknown>
     expect(pay).not.toHaveBeenCalled()
     expect(createSessionSettle).not.toHaveBeenCalled()
     expect(createSessionChallenge).toHaveBeenCalledTimes(1)
@@ -4917,14 +4925,14 @@ describe('request_ai_birthcert_verification asks before it pays', () => {
 
   it('confirm: false is the same as leaving it out', async () => {
     const { deps, pay } = makeDeps()
-    const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'PMRBot', confirm: false })) as Record<string, unknown>
+    const out = (await requestConfirmed(deps as never, { agentName: 'PMRBot', confirm: false })) as Record<string, unknown>
     expect(pay).not.toHaveBeenCalled()
     expect(out.needsConfirmation).toBe(true)
   })
 
   it('with confirm: true it pays as before', async () => {
     const { deps, pay } = makeDeps()
-    const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'PMRBot', confirm: await confirmFor(deps) })) as Record<string, unknown>
+    const out = (await requestConfirmed(deps as never, { agentName: 'PMRBot', confirm: await confirmFor(deps) })) as Record<string, unknown>
     expect(pay).toHaveBeenCalledTimes(1)
     expect(out).toMatchObject({ sessionId: 's-1', paidThisCall: true, nextStep: 'show_link_and_wait' })
   })
@@ -4936,7 +4944,7 @@ describe('request_ai_birthcert_verification asks before it pays', () => {
       verificationUrl: 'https://zvg.test/verify/old-tok', paymentReceipt: 'receipt-old',
     })
     getSession.mockResolvedValue({ sessionId: 's-old', status: 'expired', expiresAt: '2026-08-17T08:30:00+00:00' })
-    const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'PMRBot' })) as Record<string, unknown>
+    const out = (await requestConfirmed(deps as never, { agentName: 'PMRBot' })) as Record<string, unknown>
     expect(pay).not.toHaveBeenCalled()
     expect(createSessionWithReceipt).toHaveBeenCalledTimes(1)
     expect(out).toMatchObject({ sessionId: 's-2', paidThisCall: false, nextStep: 'show_link_and_wait' })
@@ -4950,7 +4958,7 @@ describe('request_ai_birthcert_verification asks before it pays', () => {
       verificationUrl: 'https://zvg.test/verify/old-tok', paymentReceipt: 'receipt-old',
     })
     getSession.mockResolvedValue({ sessionId: 's-old', status: 'pending', expiresAt: '2026-08-17T09:30:00+00:00' })
-    const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'PMRBot' })) as Record<string, unknown>
+    const out = (await requestConfirmed(deps as never, { agentName: 'PMRBot' })) as Record<string, unknown>
     expect(pay).not.toHaveBeenCalled()
     expect(out).toMatchObject({ sessionId: 's-old', paidThisCall: false, nextStep: 'show_link_and_wait' })
   })
@@ -4964,7 +4972,7 @@ describe('request_ai_birthcert_verification asks before it pays', () => {
         set: vi.fn(), list: vi.fn(),
       },
     })
-    const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'PMRBot' })) as Record<string, unknown>
+    const out = (await requestConfirmed(deps as never, { agentName: 'PMRBot' })) as Record<string, unknown>
     expect(pay).not.toHaveBeenCalled()
     expect(out).toMatchObject({ existingVerifiedVc: { vcId: 'did:zid:held-1' }, nextStep: 'ask_user_whether_to_replace' })
     expect(String(out.askUser)).toMatch(/replace it\?$/)
@@ -4975,13 +4983,13 @@ describe('request_ai_birthcert_verification asks before it pays', () => {
     const { deps } = makeDeps({ sleep: vi.fn().mockResolvedValue(undefined) })
     ;(deps.ssivc as Record<string, unknown>).createSessionSettle = vi.fn().mockResolvedValue(queued)
     ;(deps.ssivc as Record<string, unknown>).createSessionWithReceipt = vi.fn().mockResolvedValue(queued)
-    const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'PMRBot', confirm: await confirmFor(deps) })) as Record<string, unknown>
+    const out = (await requestConfirmed(deps as never, { agentName: 'PMRBot', confirm: await confirmFor(deps) })) as Record<string, unknown>
     expect(out).toMatchObject({ settlementPending: true, nextStep: 'wait_then_check' })
   })
 
   it('a dry run is unchanged: a quote, no confirmation fields', async () => {
     const { deps, pay } = makeDeps()
-    const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'PMRBot', dryRun: true })) as Record<string, unknown>
+    const out = (await requestConfirmed(deps as never, { agentName: 'PMRBot', dryRun: true })) as Record<string, unknown>
     expect(pay).not.toHaveBeenCalled()
     expect(out.quote).toBeDefined()
     expect(out.needsConfirmation).toBeUndefined()
@@ -4994,7 +5002,7 @@ describe('request_ai_birthcert_verification pays only the confirmed price', () =
 
   it.each([[true], ['true'], [{ asset: 'ZTX' }], [{ ...SAMPLE_QUOTE, gasModel: 'cheap' }]])('confirm %j is not a confirmation: stops at the price, pays nothing', async (confirm) => {
     const { deps, pay } = makeDeps()
-    const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'PMRBot', confirm })) as Record<string, unknown>
+    const out = (await requestConfirmed(deps as never, { agentName: 'PMRBot', confirm })) as Record<string, unknown>
     expect(pay).not.toHaveBeenCalled()
     expect(out).toMatchObject({ needsConfirmation: true, quote: SAMPLE_QUOTE })
     expect(String(out.message)).toMatch(/confirm: true is not accepted/)
@@ -5002,7 +5010,7 @@ describe('request_ai_birthcert_verification pays only the confirmed price', () =
 
   it('the confirmed quote pays', async () => {
     const { deps, pay } = makeDeps()
-    const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'PMRBot', confirm: SAMPLE_QUOTE })) as Record<string, unknown>
+    const out = (await requestConfirmed(deps as never, { agentName: 'PMRBot', confirm: SAMPLE_QUOTE })) as Record<string, unknown>
     expect(pay).toHaveBeenCalledTimes(1)
     expect(out).toMatchObject({ sessionId: 's-1', paidThisCall: true })
   })
@@ -5013,7 +5021,7 @@ describe('request_ai_birthcert_verification pays only the confirmed price', () =
     ['token', { asset: 'ZTX3jmyr' }, /the token is ZTX, not ZTX3jmyr/],
   ])('a payment request whose %s differs from the confirmed quote is not paid, and the new price is returned', async (_name, change, why) => {
     const { deps, pay, createSessionSettle } = makeDeps()
-    const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'PMRBot', confirm: { ...SAMPLE_QUOTE, ...change } })) as Record<string, unknown>
+    const out = (await requestConfirmed(deps as never, { agentName: 'PMRBot', confirm: { ...SAMPLE_QUOTE, ...change } })) as Record<string, unknown>
     expect(pay).not.toHaveBeenCalled()
     expect(createSessionSettle).not.toHaveBeenCalled()
     expect(out).toMatchObject({ needsConfirmation: true, paidThisCall: false, quote: SAMPLE_QUOTE, nextStep: 'ask_user_to_confirm_payment' })
@@ -5031,7 +5039,7 @@ describe('request_ai_birthcert_verification pays only the confirmed price', () =
         set: vi.fn(), list: vi.fn(),
       },
     })
-    const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'PMRBot' })) as Record<string, unknown>
+    const out = (await requestConfirmed(deps as never, { agentName: 'PMRBot' })) as Record<string, unknown>
     expect(pay).not.toHaveBeenCalled()
     expect(out.needsConfirmation).toBe(true)
     expect(out.replacedExpiredVc).toBeUndefined()
@@ -5045,7 +5053,7 @@ describe('request_ai_birthcert_verification pays only the confirmed price', () =
     it('without confirm: the receipt is kept, nothing is paid, and the price is returned', async () => {
       const { deps, sessionStore, pay } = makeDeps()
       await sessionStore.set(stuck)
-      const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'PMRBot', discardStuckReceiptAndPayFresh: 'r-stuck' })) as Record<
+      const out = (await requestConfirmed(deps as never, { agentName: 'PMRBot', discardStuckReceiptAndPayFresh: 'r-stuck' })) as Record<
         string,
         unknown
       >
@@ -5059,7 +5067,7 @@ describe('request_ai_birthcert_verification pays only the confirmed price', () =
     it('without confirm, a wrong receipt id is still refused outright, before any price', async () => {
       const { deps, sessionStore, pay, createSessionChallenge } = makeDeps()
       await sessionStore.set(stuck)
-      const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'PMRBot', discardStuckReceiptAndPayFresh: 'r-other' })) as Record<
+      const out = (await requestConfirmed(deps as never, { agentName: 'PMRBot', discardStuckReceiptAndPayFresh: 'r-other' })) as Record<
         string,
         unknown
       >
@@ -5071,7 +5079,7 @@ describe('request_ai_birthcert_verification pays only the confirmed price', () =
     it('with the confirmed quote: discards and pays', async () => {
       const { deps, sessionStore, pay } = makeDeps()
       await sessionStore.set(stuck)
-      const out = (await requestAiBirthcertVerification(deps as never, {
+      const out = (await requestConfirmed(deps as never, {
         agentName: 'PMRBot',
         discardStuckReceiptAndPayFresh: 'r-stuck',
         confirm: SAMPLE_QUOTE,
@@ -5088,7 +5096,7 @@ describe('request_ai_birthcert_verification R2', () => {
 
   it('a host that sends the quote as a JSON string is understood', async () => {
     const { deps, pay } = makeDeps()
-    const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'PMRBot', confirm: JSON.stringify(SAMPLE_QUOTE) })) as Record<string, unknown>
+    const out = (await requestConfirmed(deps as never, { agentName: 'PMRBot', confirm: JSON.stringify(SAMPLE_QUOTE) })) as Record<string, unknown>
     expect(pay).toHaveBeenCalledTimes(1)
     expect(out).toMatchObject({ sessionId: 's-1' })
   })
@@ -5097,7 +5105,7 @@ describe('request_ai_birthcert_verification R2', () => {
   it('discard + a price that changed: says to call again WITHOUT discardStuckReceiptAndPayFresh, and that works', async () => {
     const { deps, sessionStore, pay } = makeDeps()
     await sessionStore.set({ sessionId: '', agentName: 'PMRBot', createdAt: '2026-08-01T00:00:00.000Z', verificationUrl: '', paymentReceipt: 'r-stuck' })
-    const first = (await requestAiBirthcertVerification(deps as never, {
+    const first = (await requestConfirmed(deps as never, {
       agentName: 'PMRBot',
       discardStuckReceiptAndPayFresh: 'r-stuck',
       confirm: { ...SAMPLE_QUOTE, maxAmountRequired: '999' },
@@ -5108,7 +5116,7 @@ describe('request_ai_birthcert_verification R2', () => {
     expect(String(first.message)).toMatch(/WITHOUT discardStuckReceiptAndPayFresh/)
     expect(String(first.message)).not.toMatch(/discardStuckReceiptAndPayFresh too/)
 
-    const second = (await requestAiBirthcertVerification(deps as never, { agentName: 'PMRBot', confirm: first.quote })) as Record<string, unknown>
+    const second = (await requestConfirmed(deps as never, { agentName: 'PMRBot', confirm: first.quote })) as Record<string, unknown>
     expect(pay).toHaveBeenCalledTimes(1)
     expect(second).toMatchObject({ sessionId: 's-1' })
   })
@@ -5116,7 +5124,7 @@ describe('request_ai_birthcert_verification R2', () => {
   // Low 2: errors often name the next step, so the field must not say "stop".
   it('an error says follow_message, never a bare stop', async () => {
     const { deps } = makeDeps({ pay: vi.fn().mockRejectedValue(new PaymentReadinessError('short', { asset: 'ZTX', required: '100', available: '10', reason: 'gas' })) })
-    const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'PMRBot', confirm: SAMPLE_QUOTE })) as Record<string, unknown>
+    const out = (await requestConfirmed(deps as never, { agentName: 'PMRBot', confirm: SAMPLE_QUOTE })) as Record<string, unknown>
     expect(out.nextStep).toBe('follow_message')
   })
 
@@ -5125,14 +5133,130 @@ describe('request_ai_birthcert_verification R2', () => {
     const tokenSelf = { scheme: 'exact', network: 'zetrix:testnet', asset: 'ZTX3jmyr', payTo: 'ZTX3Pay', maxAmountRequired: '1000', extra: { gasModel: 'client' } }
     const { deps } = makeDeps()
     ;(deps.ssivc as Record<string, unknown>).createSessionChallenge = vi.fn().mockResolvedValue({ x402Version: 2, accepts: [tokenSelf] })
-    const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'PMRBot' })) as Record<string, unknown>
+    const out = (await requestConfirmed(deps as never, { agentName: 'PMRBot' })) as Record<string, unknown>
     expect(String(out.askUser)).toMatch(/plus network gas paid in ZTX/)
   })
 
   it('a sponsored price does not mention ZTX gas', async () => {
     const { deps } = makeDeps()
     ;(deps.ssivc as Record<string, unknown>).createSessionChallenge = vi.fn().mockResolvedValue({ x402Version: 2, accepts: [sponsoredAccept] })
-    const out = (await requestAiBirthcertVerification(deps as never, { agentName: 'PMRBot' })) as Record<string, unknown>
+    const out = (await requestConfirmed(deps as never, { agentName: 'PMRBot' })) as Record<string, unknown>
     expect(String(out.askUser)).not.toMatch(/network gas/)
   })
+})
+
+// the confirmation is the quote the wallet gave, for this request, within 10 minutes, once.
+describe('request_ai_birthcert_verification binds the confirmation to its request', () => {
+  const clockedBook = () => {
+    let t = Date.parse('2026-08-17T09:00:00.000Z')
+    const book = new QuoteBook(() => t)
+    return { book, advance: (ms: number) => (t += ms) }
+  }
+  const ask = async (deps: unknown, input: Record<string, unknown>) =>
+    (await requestConfirmed(deps as never, { agentName: 'PMRBot', ...input } as never)) as Record<string, unknown>
+
+  it('the price stop carries a quoteId and says the quote is good for 10 minutes, for this request only', async () => {
+    const { book } = clockedBook()
+    const { deps } = makeDeps({ quoteBook: book })
+    const out = await ask(deps, {})
+    expect((out.quote as Record<string, unknown>).quoteId).toEqual(expect.any(String))
+    expect(String(out.message)).toMatch(/good for 10 minutes/)
+    expect(String(out.message)).toMatch(/only for this request/)
+  })
+
+  it('the quote it gave pays', async () => {
+    const { book } = clockedBook()
+    const { deps, pay } = makeDeps({ quoteBook: book })
+    const first = await ask(deps, {})
+    const out = await ask(deps, { confirm: first.quote })
+    expect(pay).toHaveBeenCalledTimes(1)
+    expect(out).toMatchObject({ sessionId: 's-1', paidThisCall: true })
+  })
+
+  it('an invented quote with the right price does not pay', async () => {
+    const { book } = clockedBook()
+    const { deps, pay } = makeDeps({ quoteBook: book })
+    const out = await ask(deps, { confirm: { asset: 'ZTX', maxAmountRequired: '1000', payTo: 'ZTX3Pay', gasModel: 'self', quoteId: 'made-up' } })
+    expect(pay).not.toHaveBeenCalled()
+    expect(out.needsConfirmation).toBe(true)
+    expect(String(out.message)).toMatch(/not one this wallet gave/)
+  })
+
+  it('an expired quote does not pay, and a new one is given', async () => {
+    const { book, advance } = clockedBook()
+    const { deps, pay } = makeDeps({ quoteBook: book })
+    const first = await ask(deps, {})
+    advance(10 * 60 * 1000 + 1)
+    const out = await ask(deps, { confirm: first.quote })
+    expect(pay).not.toHaveBeenCalled()
+    expect(String(out.message)).toMatch(/has expired/)
+    expect((out.quote as Record<string, unknown>).quoteId).not.toBe((first.quote as Record<string, unknown>).quoteId)
+  })
+
+  it('a quote for another name does not pay', async () => {
+    const { book } = clockedBook()
+    const { deps, pay } = makeDeps({ quoteBook: book })
+    const first = await ask(deps, { agentName: 'OtherBot' })
+    const out = await ask(deps, { confirm: first.quote })
+    expect(pay).not.toHaveBeenCalled()
+    expect(String(out.message)).toMatch(/for a different request/)
+  })
+
+  it('a quote whose price fields were edited does not pay', async () => {
+    const { book } = clockedBook()
+    const { deps, pay } = makeDeps({ quoteBook: book })
+    const first = await ask(deps, {})
+    const out = await ask(deps, { confirm: { ...(first.quote as object), payTo: 'ZTX3Elsewhere' } })
+    expect(pay).not.toHaveBeenCalled()
+    expect(String(out.message)).toMatch(/was changed/)
+  })
+
+  it('a quote already used for a payment does not pay again', async () => {
+    const { book } = clockedBook()
+    const { deps, pay, sessionStore } = makeDeps({ quoteBook: book })
+    const first = await ask(deps, {})
+    await ask(deps, { confirm: first.quote })
+    // Nothing stored any more (say the receipt was cleared), so the next request would be a fresh payment.
+    await sessionStore.clear()
+    const again = await ask(deps, { confirm: first.quote })
+    expect(pay).toHaveBeenCalledTimes(1)
+    expect(String(again.message)).toMatch(/already used/)
+  })
+
+  it('discarding a stuck receipt with a quote that is not valid keeps the receipt', async () => {
+    const { book } = clockedBook()
+    const { deps, sessionStore, pay } = makeDeps({ quoteBook: book })
+    await sessionStore.set({ sessionId: '', agentName: 'PMRBot', createdAt: '2026-08-01T00:00:00.000Z', verificationUrl: '', paymentReceipt: 'r-stuck' })
+    const out = await ask(deps, {
+      discardStuckReceiptAndPayFresh: 'r-stuck',
+      confirm: { asset: 'ZTX', maxAmountRequired: '1000', payTo: 'ZTX3Pay', gasModel: 'self', quoteId: 'made-up' },
+    })
+    expect(pay).not.toHaveBeenCalled()
+    expect(sessionStore.clear).not.toHaveBeenCalled()
+    expect(String(out.message)).toMatch(/r-stuck has NOT been discarded yet/)
+  })
+})
+
+// a refusal before the payment is signed leaves the quote usable, so the user is not asked again for it.
+it('a quote whose payment was refused before signing (low funds) still pays once the funds are there', async () => {
+  const book = new QuoteBook()
+  const { deps, pay } = makeDeps({ quoteBook: book })
+  pay.mockRejectedValueOnce(new PaymentReadinessError('short', { asset: 'ZTX', required: '100', available: '10', reason: 'gas' }))
+  const first = (await requestConfirmed(deps as never, { agentName: 'PMRBot' })) as Record<string, unknown>
+  const refused = (await requestConfirmed(deps as never, { agentName: 'PMRBot', confirm: first.quote })) as Record<string, unknown>
+  expect(String(refused.error)).toMatch(/insufficient funds/)
+  const out = (await requestConfirmed(deps as never, { agentName: 'PMRBot', confirm: first.quote })) as Record<string, unknown>
+  expect(out).toMatchObject({ sessionId: 's-1' })
+  expect(pay).toHaveBeenCalledTimes(2)
+})
+
+// straight to the tool, no helper: a price that matches but carries no quoteId is not a confirmation.
+it('a bare quote without a quoteId is refused, and nothing is paid', async () => {
+  const { deps, pay } = makeDeps({ quoteBook: new QuoteBook() })
+  const out = (await requestAiBirthcertVerification(deps as never, {
+    agentName: 'PMRBot',
+    confirm: { asset: 'ZTX', maxAmountRequired: '1000', payTo: 'ZTX3Pay', gasModel: 'self' },
+  })) as Record<string, unknown>
+  expect(pay).not.toHaveBeenCalled()
+  expect(out.needsConfirmation).toBe(true)
 })

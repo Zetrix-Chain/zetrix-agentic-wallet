@@ -1,5 +1,5 @@
 /**
- * create_verification_qr — hand a human a link and a QR code that opens the agent's identity in MyID.
+ * create_verification_qr — hand a human a link and a QR code that opens the agent's identity in the MyID wallet.
  *
  *   1. POST /v1/vp/ext/create   { vc, revealAttributes }                 → { blobId, blob }
  *   2. Wallet BE /sign-blob     blob                                      → { signBlob, publicKey }
@@ -292,8 +292,8 @@ export async function createVerificationLink(
     ...(qrCodePath !== undefined ? { qrCodePath } : {}),
     ...(qrFileError !== undefined ? { qrFileError } : {}),
     message:
-      `${qrGuidance(qrCodePath, qrCodePngBase64 !== undefined)} Tell them to open the link in the MyID app ` +
-      `(they need MyID installed first). It stops working at about ${expiresAt}, ` +
+      `${qrGuidance(qrCodePath, qrCodePngBase64 !== undefined)} Tell them to open the link in the MyID wallet ` +
+      `(they need it installed first). It stops working at about ${expiresAt}, ` +
       `${expiryMinutes} minute${expiryMinutes === 1 ? '' : 's'} after it was created — if it lapses, create a new one. ` +
       `This ${revealed.revealed === 'all' ? 'reveals the whole credential' : `reveals: ${revealed.revealed.map((p) => JSON.stringify(p)).join(', ')}`}. ` +
       `Show it only to the user: whoever holds the link can open what it reveals until then.`,

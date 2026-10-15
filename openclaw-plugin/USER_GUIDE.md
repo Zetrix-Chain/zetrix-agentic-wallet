@@ -61,7 +61,7 @@ Other things that work straight away, all free:
 | What a credential template requires | no |
 | Reading on-chain contract data | no |
 | Proving your identity to a service | no |
-| Showing a person a link and QR code to verify the agent in the MyID app | no |
+| Showing a person a link and QR code to verify the agent in the MyID wallet | no |
 | **Fetching a resource that charges per use** | **yes** |
 | **Obtaining a verifiable credential** | **yes** |
 | **Starting a Verified AI Birthcert check (owner identity verification via MyDigital ID)** | **yes** |
@@ -170,14 +170,16 @@ tell you so rather than retrying.
 
 ## Getting an AI Birthcert
 
-There are two kinds. **Basic** is self-declared by the agent, with no check of the owner's identity: it is quick and shows only the agent's username. **Verified** confirms the owner's identity through MyDigital ID: the fee is paid up front, the owner completes a check in the MyID app, and the agent name must be unique (it is only checked after payment, so a name that turns out to be taken is refused late).
+There are two kinds. **Basic** is self-declared by the agent, with no check of the owner's identity: it is quick and shows only the agent's username. **Verified** confirms the owner's identity through MyDigital ID: the fee is paid up front, the owner completes a check in the MyDigital ID app, and the agent name must be unique (it is only checked after payment, so a name that turns out to be taken is refused late).
 
 If you ask for an AI Birthcert without saying which, the agent first checks what the wallet already holds, explains the difference, and asks which you prefer; it offers only the kind you do not already have. If you want both, it issues them one after the other, Basic first. If you give it a name, it uses that name as you gave it and does not ask for it again (if it suggests a tidier form it waits for your yes first). Where the Verified kind is not configured (today that is mainnet, and this plugin has no setting for it), the agent says so and offers only Basic.
 
-## Verifying the agent in the MyID app
+**A paid credential asks before it pays.** When a credential costs something, the agent first tells you the price (and says when network gas is paid on top) and waits for your yes. Nothing is paid on the first request. Your yes covers only that price, for that request, for about 10 minutes, and pays once: if the price or the request changes, or the time runs out, the agent asks again. A free credential, one you already hold, and a verification link that reuses an earlier payment need no yes.
+
+## Verifying the agent in the MyID wallet
 
 Ask the agent to verify itself and it can give you a link and a QR code that open its credential in the MyID
-app. Anyone who holds the link can read what it reveals until it expires (5 minutes by default), so the agent
+wallet. Anyone who holds the link can read what it reveals until it expires (5 minutes by default), so the agent
 shows it only to you and tells you which attributes it reveals.
 
 On testnet this works out of the box: the link points at MyID's UAT address. On mainnet it needs one setting until MyID's

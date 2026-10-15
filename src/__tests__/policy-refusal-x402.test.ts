@@ -24,6 +24,23 @@ import {
 import { createPayer } from '../orchestrator/pay'
 import { subscribeAndIssue } from '../orchestrator/subscribe'
 import { requestAiBirthcertVerification } from '../orchestrator/verify-ai-birthcert'
+import type { QuoteBook } from '../price-confirmation'
+import { confirmedInput, subscribeBindingFor, verificationBindingFor } from './helpers/confirmed-quote'
+
+/** Calls the tool with its echoed quote registered for this request, as the wallet's price stop would have. */
+async function requestConfirmed(deps: unknown, input: unknown) {
+  const i = input as Record<string, unknown>
+  const book = (deps as { quoteBook?: QuoteBook }).quoteBook
+  return requestAiBirthcertVerification(deps as never, confirmedInput(i, verificationBindingFor(i), book) as never)
+}
+
+/** Calls the tool with its echoed quote registered for this request, as the wallet's price stop would have. */
+async function subscribeConfirmed(deps: unknown, opts: unknown) {
+  const o = opts as Record<string, unknown>
+  const book = (deps as { quoteBook?: QuoteBook }).quoteBook
+  return subscribeAndIssue(deps as never, confirmedInput(o, subscribeBindingFor(o), book) as never)
+}
+
 import { PolicyWriteClient, type HttpSend } from '../clients/policy-write-client'
 import type { PolicyWriteReceipt, PolicyWriteReceiptStore } from '../clients/policy-write-receipt-store'
 import { writePolicy, type WritePolicyDeps } from '../orchestrator/write-policy'
@@ -255,7 +272,7 @@ describe('subscribe_and_issue', () => {
 
   it('a denial: not issued, nothing paid, flagged as a decision, and says what DID happen', async () => {
     const h = harness(await DENIED())
-    const out = await subscribeAndIssue({ ...h, holderDid } as never, opts)
+    const out = await subscribeConfirmed({ ...h, holderDid } as never, opts)
     expect(out.issued).toBe(false)
     expect(out.policyDenied).toBe(true)
     expect(out.policyCheckUnavailable).toBeUndefined()
@@ -272,7 +289,7 @@ describe('subscribe_and_issue', () => {
 
   it('an unavailable check: not issued, flagged transient', async () => {
     const h = harness(await UNAVAILABLE())
-    const out = await subscribeAndIssue({ ...h, holderDid } as never, opts)
+    const out = await subscribeConfirmed({ ...h, holderDid } as never, opts)
     expect(out).toMatchObject({ issued: false, policyCheckUnavailable: true })
     expect(out.policyDenied).toBeUndefined()
     expect(out.reason).toMatch(/trying again shortly is right/)
@@ -280,20 +297,20 @@ describe('subscribe_and_issue', () => {
   })
 
   it('does not call it insufficient funds', async () => {
-    const out = await subscribeAndIssue({ ...harness(await DENIED()), holderDid } as never, opts)
+    const out = await subscribeConfirmed({ ...harness(await DENIED()), holderDid } as never, opts)
     expect(out.insufficientFunds).toBeUndefined()
     expect(out.reason).not.toMatch(/insufficient funds/i)
   })
 
   it('any other failure from pay still throws', async () => {
     for (const e of [new Error('boom'), await realRefusal(1000026, 'account not found')]) {
-      await expect(subscribeAndIssue({ ...harness(e), holderDid } as never, opts)).rejects.toBe(e)
+      await expect(subscribeConfirmed({ ...harness(e), holderDid } as never, opts)).rejects.toBe(e)
     }
   })
 
   it('insufficient funds is unchanged', async () => {
     const shortfall = { asset: 'JMYR', required: '1000000', available: '0', reason: 'resource_payment' as const }
-    const out = await subscribeAndIssue({ ...harness(new PaymentReadinessError('short', shortfall)), holderDid } as never, opts)
+    const out = await subscribeConfirmed({ ...harness(new PaymentReadinessError('short', shortfall)), holderDid } as never, opts)
     expect(out.insufficientFunds).toEqual(shortfall)
     expect(out.policyDenied).toBeUndefined()
   })
@@ -341,7 +358,7 @@ describe('Verified AI Birthcert session fee', () => {
 
   it('a denial: an error result flagged as a decision, no session, nothing stored', async () => {
     const h = harness(await DENIED())
-    const out = (await requestAiBirthcertVerification(h.deps as never, { agentName: 'Procurement Assistant', confirm: { asset: 'ZTX', maxAmountRequired: '1000', payTo: 'ZTX3Pay', gasModel: 'self' as const } })) as Record<string, unknown>
+    const out = (await requestConfirmed(h.deps as never, { agentName: 'Procurement Assistant', confirm: { asset: 'ZTX', maxAmountRequired: '1000', payTo: 'ZTX3Pay', gasModel: 'self' as const } })) as Record<string, unknown>
     expect(out.policyDenied).toBe(true)
     expect(out.policyCheckUnavailable).toBeUndefined()
     expect(String(out.error)).toContain('PER_TRANSACTION_EXCEEDED')
@@ -356,7 +373,7 @@ describe('Verified AI Birthcert session fee', () => {
 
   it('an unavailable check: an error result flagged transient', async () => {
     const h = harness(await UNAVAILABLE())
-    const out = (await requestAiBirthcertVerification(h.deps as never, { agentName: 'Procurement Assistant', confirm: { asset: 'ZTX', maxAmountRequired: '1000', payTo: 'ZTX3Pay', gasModel: 'self' as const } })) as Record<string, unknown>
+    const out = (await requestConfirmed(h.deps as never, { agentName: 'Procurement Assistant', confirm: { asset: 'ZTX', maxAmountRequired: '1000', payTo: 'ZTX3Pay', gasModel: 'self' as const } })) as Record<string, unknown>
     expect(out.policyCheckUnavailable).toBe(true)
     expect(out.policyDenied).toBeUndefined()
     expect(String(out.error)).toMatch(/trying again shortly is right/)
@@ -366,7 +383,7 @@ describe('Verified AI Birthcert session fee', () => {
   it('does NOT fall back to the other gas option after a refusal — a second signature would be a second attempt at the same spend', async () => {
     for (const e of [await DENIED(), await UNAVAILABLE()]) {
       const h = harness(e, [SPONSORED, SELF])
-      await requestAiBirthcertVerification(h.deps as never, { agentName: 'Procurement Assistant', gasPayer: 'sponsored', confirm: { asset: 'ZTX3jmyr', maxAmountRequired: '1000', payTo: 'ZTX3Pay', gasModel: 'sponsored' as const } })
+      await requestConfirmed(h.deps as never, { agentName: 'Procurement Assistant', gasPayer: 'sponsored', confirm: { asset: 'ZTX3jmyr', maxAmountRequired: '1000', payTo: 'ZTX3Pay', gasModel: 'sponsored' as const } })
       expect(h.pay).toHaveBeenCalledTimes(1)
       expect(h.createSessionSettle).not.toHaveBeenCalled()
     }
@@ -374,12 +391,12 @@ describe('Verified AI Birthcert session fee', () => {
 
   it('any other failure from pay still throws', async () => {
     const e = new Error('boom')
-    await expect(requestAiBirthcertVerification(harness(e).deps as never, { agentName: 'Procurement Assistant', confirm: { asset: 'ZTX', maxAmountRequired: '1000', payTo: 'ZTX3Pay', gasModel: 'self' as const } })).rejects.toBe(e)
+    await expect(requestConfirmed(harness(e).deps as never, { agentName: 'Procurement Assistant', confirm: { asset: 'ZTX', maxAmountRequired: '1000', payTo: 'ZTX3Pay', gasModel: 'self' as const } })).rejects.toBe(e)
   })
 
   it('insufficient funds is unchanged', async () => {
     const shortfall = { asset: 'ZTX', required: '100', available: '10', reason: 'gas' as const }
-    const out = (await requestAiBirthcertVerification(
+    const out = (await requestConfirmed(
       harness(new PaymentReadinessError('short', shortfall)).deps as never,
       { agentName: 'Procurement Assistant', confirm: { asset: 'ZTX', maxAmountRequired: '1000', payTo: 'ZTX3Pay', gasModel: 'self' as const } },
     )) as Record<string, unknown>

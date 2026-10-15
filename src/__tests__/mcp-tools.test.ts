@@ -1,4 +1,5 @@
 import { createVerificationLink as realCreateVerificationLink } from '../orchestrator/verification-qr'
+import { withQuoteId, subscribeBindingFor } from './helpers/confirmed-quote'
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -147,7 +148,7 @@ describe('createTools', () => {
 
   it('subscribe_and_issue runs the MBI flow and returns the issued VC', async () => {
     const { deps, mbi, pay } = makeDeps()
-    const out = await createTools(deps).subscribe_and_issue({ templateId: 'did:zid:t', attributes: { name: 'x' }, confirm: { asset: 'ZTX', maxAmountRequired: '1', payTo: 'ZTXp', gasModel: 'self' } })
+    const out = await createTools(deps).subscribe_and_issue({ templateId: 'did:zid:t', attributes: { name: 'x' }, confirm: withQuoteId({ asset: 'ZTX', maxAmountRequired: '1', payTo: 'ZTXp', gasModel: 'self' }, subscribeBindingFor({ templateId: 'did:zid:t', attributes: { name: 'x' } })) })
     expect(mbi.applyChallenge).toHaveBeenCalled()
     expect(pay).toHaveBeenCalled()
     expect(out).toEqual({ issued: true, vcId: 'vc-1', vc: { id: 'vc' }, txHash: '0x', paidAsset: 'ZTX', amountPaid: '1', nextStep: 'show_credential' })
@@ -207,7 +208,7 @@ describe('createTools', () => {
     const out = await createTools({
       ...deps,
       subscribeDeps: { ...deps.subscribeDeps, passDesignId: 'did:zid:stale-inherited-pass-design' } as never,
-    }).subscribe_and_issue({ templateId: 'did:zid:t', attributes: { name: 'x' }, confirm: { asset: 'ZTX', maxAmountRequired: '1', payTo: 'ZTXp', gasModel: 'self' } })
+    }).subscribe_and_issue({ templateId: 'did:zid:t', attributes: { name: 'x' }, confirm: withQuoteId({ asset: 'ZTX', maxAmountRequired: '1', payTo: 'ZTXp', gasModel: 'self' }, subscribeBindingFor({ templateId: 'did:zid:t', attributes: { name: 'x' } })) })
     const sentData = JSON.parse((mbi.applyChallenge.mock.calls[0][0] as { data: string }).data)
     expect(sentData[0]).not.toHaveProperty('passDesignId')
     expect(out.issued).toBe(true)

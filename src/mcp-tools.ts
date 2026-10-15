@@ -321,7 +321,7 @@ export function createTools(deps: ToolDeps) {
     },
 
     /**
-     * A link and QR that open this wallet's credential in MyID. The credential is chosen the way prove_identity
+     * A link and QR that open this wallet's credential in the MyID wallet. The credential is chosen the way prove_identity
      * chooses it, but a choice that cannot be made is an ordinary answer (`created: false` plus the reason) rather
      * than a thrown error, so the agent reads one result shape whether or not a link came back.
      */

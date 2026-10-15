@@ -226,3 +226,14 @@ describe('Verified names without separators', () => {
     expect(aiBirthcertKindOfName(name)).toBe('basic')
   })
 })
+
+// a negation written inside one word is seen too.
+describe('a negation inside one word means Basic', () => {
+  it.each(['AIBirthcertNotVerified', 'AIBirthcertUnverified', 'SelfVerifiedAIBirthcert', 'aibirthcertnonverified'])('%s is the Basic one', (name) => {
+    expect(aiBirthcertKindOfName(name)).toBe('basic')
+  })
+
+  it.each(['VerifiedAIBirthcert', 'MyIDverified birthcert', 'AIBirthcertVerified'])('%s is still the Verified one', (name) => {
+    expect(aiBirthcertKindOfName(name)).toBe('verified')
+  })
+})

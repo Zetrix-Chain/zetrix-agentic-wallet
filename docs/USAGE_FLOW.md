@@ -91,7 +91,9 @@ fromCache: true, reason }` instead, so it can be shown to you first. Only callin
 `confirmReplaceExistingVc` also set to the exact `vcId` you were shown actually pays and reissues.
 A chargeable issuance also stops at the price first: without `confirm` it returns `needsConfirmation: true`
 with a `quote`, and pays only when called again with `confirm` set to that same `quote`, after the user
-has said yes to it.
+has said yes to it. The quote carries a `quoteId`: it is good for 10 minutes, only for that request
+(the same template and attributes), and pays once. An expired, reused or edited quote pays nothing and
+returns a new quote to ask about.
 You can still hold onto `vc` from the response yourself and pass it explicitly on future
 `prove_identity` calls if you prefer not to rely on the cache (e.g. presenting a credential
 obtained elsewhere).

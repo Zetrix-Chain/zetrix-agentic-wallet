@@ -4,7 +4,7 @@
  * step in long results and asked the wrong question, or none.
  */
 export type NextStep =
-  /** Tell the user the price and ask; call again with `confirm: true` only after their explicit yes. */
+  /** Tell the user the price and ask; call again with `confirm` set to that quote (quoteId included) only after their explicit yes. */
   | 'ask_user_to_confirm_payment'
   /** Show the verification link and how long it is open; ask the user to message back once done. */
   | 'show_link_and_wait'

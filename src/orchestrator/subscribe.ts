@@ -39,7 +39,18 @@
  */
 
 import type { NextStep } from './next-step.js'
-import { asPriceConfirmation, gasNote, priceMismatch, quoteOf } from '../price-confirmation.js'
+import {
+  asPriceConfirmation,
+  defaultQuoteBook,
+  gasNote,
+  priceMismatch,
+  quoteOf,
+  quoteVerdictLead,
+  QUOTE_TERMS,
+  type QuoteBinding,
+  type QuoteBook,
+} from '../price-confirmation.js'
+import { canonicalizeJson } from '../canonical-json.js'
 import {
   MbiError,
   MBI_SETTLEMENT_INDETERMINATE,
@@ -86,6 +97,8 @@ export interface SubscribeDeps {
    * identity-verified)". A yes to "this credential" could be a yes to the wrong kind. Absent: "this credential".
    */
   credentialLabel?: string
+  /** The quotes this wallet has given. Absent: the process-wide book. */
+  quoteBook?: QuoteBook
   /**
    * The wallet's own resolved holder DID. Auto-filled into `attributes.agentDid` when the
    * caller omits it AND `resolveTemplateFields` confirms the template declares `agentDid` as a
@@ -440,27 +453,30 @@ async function askToConfirmPayment(
   deps: SubscribeDeps,
   accepted: PayRequirement,
   schema: TemplateSchema | undefined,
+  binding: QuoteBinding,
   options: { lead?: string; chargeUnknown?: boolean } = {},
 ): Promise<SubscribeResult> {
   const raw = String(accepted.asset ?? '')
   const symbol = deps.resolveSymbol ? await deps.resolveSymbol(raw) : raw
   // The raw asset is what confirm echoes and what is compared: two contracts can share a symbol (review R2). The symbol
-  // rides along for display only.
-  const quote = { ...quoteOf(accepted), assetSymbol: symbol }
+  // rides along for display only. Every price stop gives a fresh quote id, bound to this request.
+  const price = quoteOf(accepted)
+  const { quoteId } = (deps.quoteBook ?? defaultQuoteBook).issue(binding, price)
+  const quote = { ...price, assetSymbol: symbol, quoteId }
   const display = (await renderPrice(deps, raw, quote.maxAmountRequired, symbol)) + gasNote(quote)
   // An older MBI does not say whether it charges at all, so the question names the most it may cost (review R1 nit).
-  const price = options.chargeUnknown ? `may cost up to ${display} (this issuer does not say whether it charges)` : `costs ${display}`
+  const cost = options.chargeUnknown ? `may cost up to ${display} (this issuer does not say whether it charges)` : `costs ${display}`
   return {
     issued: false,
     needsConfirmation: true,
     quote,
     nextStep: 'ask_user_to_confirm_payment',
-    askUser: `Issuing this ${deps.credentialLabel ?? 'credential'} ${price}. Shall I go ahead?`,
+    askUser: `Issuing this ${deps.credentialLabel ?? 'credential'} ${cost}. Shall I go ahead?`,
     reason:
-      `NOT PAID YET: ${options.lead ?? ''}issuing this ${deps.credentialLabel ?? 'credential'} ${price}, and nothing has been paid or issued. Tell the user ` +
+      `NOT PAID YET: ${options.lead ?? ''}issuing this ${deps.credentialLabel ?? 'credential'} ${cost}, and nothing has been paid or issued. Tell the user ` +
       `the price and ask. Only after their explicit yes to this payment, call again with confirm set to this exact quote ` +
-      `object (asset, maxAmountRequired, payTo, gasModel, unchanged), keeping every other argument the same (forceReissue and ` +
-      `confirmReplaceExistingVc too, if you sent them). confirm: true is not accepted.`,
+      `object (asset, maxAmountRequired, payTo, gasModel, quoteId, unchanged), keeping every other argument the same (forceReissue ` +
+      `and confirmReplaceExistingVc too, if you sent them). ${QUOTE_TERMS} confirm: true is not accepted.`,
     ...(schema ? { schema } : {}),
   }
 }
@@ -481,9 +497,33 @@ function describeDifference(d: { attribute: string; held: unknown; requested: un
  * caller asked only for the price.
  */
 export async function subscribeAndIssue(deps: SubscribeDeps, opts: SubscribeOpts): Promise<SubscribeResult> {
-  const result = await subscribeAndIssueInner(deps, opts)
+  // One issuance of a template at a time: two confirmed calls arriving together used to both pay. The second
+  // now waits, then finds the first one's credential in the cache instead of paying again. A dry run cannot pay.
+  const result = opts.dryRun
+    ? await subscribeAndIssueInner(deps, opts)
+    : await withTemplateLock(opts.templateId, () => subscribeAndIssueInner(deps, opts))
   if (result.nextStep || (opts.dryRun && result.quote)) return result
   return { ...result, nextStep: result.issued ? 'show_credential' : 'follow_message' }
+}
+
+/** Tails of the per-template issuance chains: each call waits for the one before it on the same template. */
+const templateLocks = new Map<string, Promise<unknown>>()
+
+async function withTemplateLock<T>(templateId: string, fn: () => Promise<T>): Promise<T> {
+  const before = templateLocks.get(templateId) ?? Promise.resolve()
+  const run = before.then(fn, fn)
+  const tail = run.catch(() => undefined)
+  templateLocks.set(templateId, tail)
+  try {
+    return await run
+  } finally {
+    if (templateLocks.get(templateId) === tail) templateLocks.delete(templateId)
+  }
+}
+
+/** What a subscribe_and_issue quote is for: this template, with these attributes. */
+function subscribeBinding(opts: SubscribeOpts): QuoteBinding {
+  return { tool: 'subscribe_and_issue', subject: opts.templateId, details: canonicalizeJson(opts.attributes ?? {}) }
 }
 
 async function subscribeAndIssueInner(deps: SubscribeDeps, opts: SubscribeOpts): Promise<SubscribeResult> {
@@ -719,8 +759,13 @@ async function subscribeAndIssueInner(deps: SubscribeDeps, opts: SubscribeOpts):
   // and needs no signature, so an unconfirmed call signs nothing. A free one goes ahead: nothing is paid. Absent
   // paymentRequired (an older MBI) counts as chargeable. Without a quote client the check happens after the free payment
   // request below instead, still before anything is paid.
+  // only a quote this wallet gave, for this template and these attributes, unexpired, unused and unchanged.
+  const book = deps.quoteBook ?? defaultQuoteBook
+  const binding = subscribeBinding(opts)
   const confirmed = asPriceConfirmation(opts.confirm)
-  if (!confirmed && deps.mbi.quote) {
+  const verdict = confirmed ? book.check(confirmed.quoteId, binding, confirmed) : 'none'
+  const quoteLead = verdict === 'none' || verdict === 'ok' ? undefined : quoteVerdictLead(verdict)
+  if (verdict !== 'ok' && deps.mbi.quote) {
     let quoted
     try {
       quoted = await deps.mbi.quote(opts.templateId, attributes as Record<string, unknown>)
@@ -733,7 +778,10 @@ async function subscribeAndIssueInner(deps: SubscribeDeps, opts: SubscribeOpts):
     if (quoted.paymentRequired !== false) {
       const quotedAccept = quoted.accepts?.[0]
       if (!quotedAccept) return { issued: false, reason: 'MBI quoted no payment options', ...(schema ? { schema } : {}) }
-      return askToConfirmPayment(deps, quotedAccept, schema, { chargeUnknown: quoted.paymentRequired === undefined })
+      return askToConfirmPayment(deps, quotedAccept, schema, binding, {
+        chargeUnknown: quoted.paymentRequired === undefined,
+        ...(quoteLead ? { lead: quoteLead } : {}),
+      })
     }
   }
 
@@ -805,11 +853,11 @@ async function subscribeAndIssueInner(deps: SubscribeDeps, opts: SubscribeOpts):
   if (!accept) return { issued: false, reason: 'MBI 402 returned no payment options', ...(schema ? { schema } : {}) }
   // the last point before money moves. Reached unconfirmed without a quote client, or when /quote said free and
   // the issuer asked for payment anyway.
-  if (!confirmed) return askToConfirmPayment(deps, accept, schema)
+  if (verdict !== 'ok' || !confirmed) return askToConfirmPayment(deps, accept, schema, binding, quoteLead ? { lead: quoteLead } : {})
   // Option A (review R1): pay only the price the user agreed to, compared on the raw asset (review R2).
   const difference = priceMismatch(confirmed, quoteOf(accept))
   if (difference) {
-    return askToConfirmPayment(deps, accept, schema, {
+    return askToConfirmPayment(deps, accept, schema, binding, {
       lead: `the issuer's payment request is not what the user agreed to (${difference}), so nothing was paid. The new price: `,
     })
   }
@@ -817,6 +865,9 @@ async function subscribeAndIssueInner(deps: SubscribeDeps, opts: SubscribeOpts):
   let xPayment: string
   try {
     xPayment = await deps.pay(accept)
+    // The quote is spent once the payment is signed: from then on money can move, so it is never paid twice. A
+    // refusal before that (funds, cap, spending policy) leaves it usable, so the user need not be asked again.
+    book.consume(confirmed.quoteId)
   } catch (err) {
     if (err instanceof PaymentReadinessError) {
       return { issued: false, reason: `insufficient funds: ${err.message}`, insufficientFunds: err.shortfall }

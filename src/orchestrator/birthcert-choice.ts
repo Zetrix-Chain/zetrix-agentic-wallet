@@ -16,7 +16,7 @@ export type AiBirthcertKind = 'basic' | 'verified'
 export function aiBirthcertChoice(kind: AiBirthcertKind, opts: { unavailable?: boolean } = {}): string {
   const note =
     'AI Birthcert comes in two kinds. BASIC: self-declared by the agent, with no check of the owner\'s identity; it is quick, shows only the agent\'s username, and does not mean the owner was verified. ' +
-    'VERIFIED: the owner\'s identity is confirmed through MyDigital ID; the fee is paid up front, the owner completes a check in the MyID app, and the agent name must be unique ' +
+    'VERIFIED: the owner\'s identity is confirmed through MyDigital ID; the fee is paid up front, the owner completes a check in the MyDigital ID app (not the MyID wallet, which is only for a verification QR), and the agent name must be unique ' +
     '(the name is only checked after payment, so a name that turns out to be taken is refused late, and whether the fee was spent cannot be confirmed). ' +
     'Each kind has its own price, read from the check for that kind: never assume Basic is free. ' +
     `This result is for the ${kind === 'basic' ? 'BASIC' : 'VERIFIED'} one. ` +

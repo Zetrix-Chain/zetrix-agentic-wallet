@@ -76,14 +76,17 @@ function normalize(s: string): string {
  * ("VerifiedAIBirthcert", "MyIDverified") still counts (review R3: whole-word matching sent those to Basic).
  * "verifiable" is not one (every credential is verifiable), and "unverified" / "nonverified" / "notverified" say Basic.
  */
+/** A negation written into the word itself: "unverified", "AIBirthcertNotVerified", "SelfVerifiedAIBirthcert". */
+const NEGATED_IN_WORD = /(un|non|not|self)verif/
+
 function saysVerified(word: string): boolean {
-  if (/^(un|non|not)verif/.test(word)) return false
+  if (NEGATED_IN_WORD.test(word)) return false
   return (word.includes('verif') && !word.includes('verifiable')) || word.includes('mydigital') || word === 'myid'
 }
 
 /** A word that says Basic: self-declared, or not verified. */
 function saysBasic(word: string): boolean {
-  return ['basic', 'self', 'selfdeclared', 'declared'].includes(word) || /^(un|non|not)verif/.test(word)
+  return ['basic', 'self', 'selfdeclared', 'declared'].includes(word) || NEGATED_IN_WORD.test(word)
 }
 
 /** Words that cancel the Verified or Basic word right after them ("not verified", "not the basic one"). */
