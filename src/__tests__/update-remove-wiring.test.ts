@@ -103,6 +103,22 @@ describe('buildPolicyWriteDeps wires a way to read a policy', () => {
   it('has none where no registry is deployed, so an update refuses instead of paying blind', async () => {
     expect(build({}).readPolicy).toBeUndefined()
   })
+
+  // Phases 2 and 3 carry the owner's HSM password in the body. A followed 307/308 would re-send that body to wherever the
+  // redirect points, so the policy-write client never follows one.
+  it('never follows a redirect from the policy-write service', async () => {
+    const fetchMock = vi.fn(async (..._args: unknown[]) => new Response('{}', { status: 500 }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const deps = build({})
+      await deps.client!.pay({ policyKey: 'k' } as never, 'header', 'update', 'hunter2')
+      await deps.client!.precheck({ policyKey: 'k' } as never)
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+      for (const call of fetchMock.mock.calls) expect((call[1] as { redirect?: string }).redirect).toBe('error')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
 })
 
 describe('get_my_policy says what an update needs', () => {

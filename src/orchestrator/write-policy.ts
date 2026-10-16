@@ -14,8 +14,10 @@
  * says explicitly that a payment was made.
  *
  * WHAT IS NEVER STORED: the HSM password. Phase 3 needs it on the wire — ms-zetrix signs the
- * permit at write time — but it is read from session configuration at call time and never written
- * to the receipt store (AC #6, and see `policy-write-receipt-store.ts`).
+ * permit at write time — and so does phase 2, as the owner proof ms-zetrix checks once
+ * paidWrite.requireOwnerProof is on. It is read from session configuration at call time and never
+ * written to the receipt store or returned (AC #6, and see `policy-write-receipt-store.ts`). Phase 1
+ * never carries it: the server refuses a credential sent to the free pre-check.
  *
  * WHAT THIS MODULE NEVER BUILDS: a transaction blob, a permit digest, or canonical attributes JSON
  * (AC #7). ms-zetrix does all three, with the owner's own key.
@@ -61,7 +63,7 @@ export interface WritePolicyDeps {
    * template — the same defect as skipping preflight entirely, one level down.
    */
   templateContract: string
-  /** The session's HSM password. Passed to phase 3 only, never persisted. */
+  /** The session's HSM password. Passed to phases 2 and 3 only, never persisted or returned. */
   hsmPassword: string
   ownerAddress: string
   network?: string
@@ -1869,8 +1871,27 @@ async function runPaidFlowLocked(
       message: describePolicyRefusal(refusal, 'No policy was written. The free pre-check had passed.'),
     }
   }
-  const paid = await client.pay(a.request, paymentHeader, a.route)
+  // The owner proof: the session's password goes with the payment, phase 2 only.
+  const paid = await client.pay(a.request, paymentHeader, a.route, deps.hsmPassword)
 
+  if (paid.kind === 'refused' && paid.ownerProof !== undefined) {
+    // The owner-proof check runs before the service claims, reserves or settles anything, so unlike any other refusal
+    // here, this one says for certain that no fee was taken. Retrying cannot help (the session's password is fixed), and
+    // each wrong password is one more guess against the owner's HSM account.
+    return {
+      state: 'payment_refused',
+      policyKey: policyKey,
+      paid: false,
+      message:
+        paid.ownerProof === 'required'
+          ? `The service refused this ${a.verb}: it needs the owner's HSM password with the payment and received none. No policy was ` +
+            `written and no fee was taken. Do not retry, and do not ask the user for a password: the wallet holds its own. If an ` +
+            `HSM_PASSWORD was set for this wallet, that is the value to check; otherwise contact support.`
+          : `The service refused the wallet's HSM password for this ${a.verb}. No policy was written and no fee was taken. Do not retry: ` +
+            `it cannot succeed, and every attempt is one more wrong guess on the owner's HSM account. Do not ask the user for a ` +
+            `password. If an HSM_PASSWORD was set for this wallet, that is the value to check; otherwise contact support.`,
+    }
+  }
   if (paid.kind === 'refused') {
     return {
       state: 'payment_refused',

@@ -273,6 +273,24 @@ export function derivePolicyWriteUrl(network: string): string | undefined {
 }
 
 /**
+ * Why a POLICY_WRITE_URL override cannot be used, or undefined when it can. The owner's HSM password rides in the body of
+ * the paid-write calls (phases 2 and 3, and remove), so the URL must be https; plain http is accepted only for a loopback
+ * host, which is how local testing reaches a service on the same machine.
+ */
+export function checkPolicyWriteUrl(raw: string): string | undefined {
+  let url: URL
+  try {
+    url = new URL(raw)
+  } catch {
+    return 'POLICY_WRITE_URL is not a valid URL.'
+  }
+  if (url.protocol === 'https:') return undefined
+  const loopback = url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '[::1]'
+  if (url.protocol === 'http:' && loopback) return undefined
+  return 'POLICY_WRITE_URL must be https (plain http is accepted only for localhost), because the owner\'s HSM password is sent to it.'
+}
+
+/**
  * The publisher of the two deployed testnet templates, `native-v1` and `ztp20-v1`.
  *
  * Read from chain 2026-09-30: `listTemplateKeys` for this address returns both keys, and both
@@ -438,7 +456,18 @@ export function loadConfig(env: NodeJS.ProcessEnv): AgenticWalletConfig {
 
   const oid4vpBaseUrlOverride = opt('OID4VP_BASE_URL')
   const policyDecisionUrlOverride = opt('POLICY_DECISION_URL')
-  const policyWriteUrlOverride = opt('POLICY_WRITE_URL')
+  // A warning, not a failure, like the other optional settings: the wallet starts, and the policy write tools are simply
+  // not built for a URL that cannot be trusted with a password. The built-in default is https and is not checked.
+  let policyWriteUrlOverride = opt('POLICY_WRITE_URL')
+  let policyWriteUrlRejected = false
+  if (policyWriteUrlOverride !== undefined) {
+    const problem = checkPolicyWriteUrl(policyWriteUrlOverride)
+    if (problem) {
+      process.stderr.write(`agentic-wallet-mcp: ${problem} The policy write tools are unavailable until this is fixed.\n`)
+      policyWriteUrlOverride = undefined
+      policyWriteUrlRejected = true
+    }
+  }
 
   // Checked now rather than on the first call, so a bad template shows up at startup. It is a warning, not a
   // failure: an optional feature's setting must not stop the wallet starting, and create_verification_qr
@@ -479,9 +508,12 @@ export function loadConfig(env: NodeJS.ProcessEnv): AgenticWalletConfig {
     policyDecisionUrl: policyDecisionUrlOverride ? stripTrailingSlash(policyDecisionUrlOverride) : undefined,
     myidVerifyLinkTemplate,
     policyDecisionAuth: opt('POLICY_DECISION_AUTH'),
+    // A rejected override does not fall back to the default: someone chose a different service on purpose.
     policyWriteUrl: policyWriteUrlOverride
       ? stripTrailingSlash(policyWriteUrlOverride)
-      : derivePolicyWriteUrl(network),
+      : policyWriteUrlRejected
+        ? undefined
+        : derivePolicyWriteUrl(network),
     policyTemplateAddress: opt('POLICY_TEMPLATE_ADDRESS') ?? derivePolicyTemplateAddress(network),
     policyTemplatePublisher: opt('POLICY_TEMPLATE_PUBLISHER') ?? derivePolicyTemplatePublisher(network),
     // An unset cap is a small default, not "spend anything": 1 JMYR per call and every other asset refused (on

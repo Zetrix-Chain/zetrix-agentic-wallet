@@ -13,6 +13,42 @@ const base = {
   HSM_PASSWORD: 'pw123456',
 } as NodeJS.ProcessEnv
 
+describe('POLICY_WRITE_URL', () => {
+  // The owner's HSM password rides in the body of the paid-write calls, so an override has to be https
+  // (plain http only for a loopback host). A rejected override is a warning and no URL, never the default.
+  const warn = () => vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+
+  it('accepts an https override and strips the trailing slash', () => {
+    const w = warn()
+    expect(loadConfig({ ...base, POLICY_WRITE_URL: 'https://policy.example.test/api/' }).policyWriteUrl).toBe('https://policy.example.test/api')
+    expect(w).not.toHaveBeenCalled()
+    w.mockRestore()
+  })
+
+  it.each(['http://localhost:8080/api', 'http://127.0.0.1:3000', 'http://[::1]:3000/api'])('accepts plain http for a loopback host: %s', (url) => {
+    const w = warn()
+    expect(loadConfig({ ...base, POLICY_WRITE_URL: url }).policyWriteUrl).toBe(url)
+    expect(w).not.toHaveBeenCalled()
+    w.mockRestore()
+  })
+
+  it.each(['http://policy.example.test/api', 'http://localhost.evil.test/api', 'ftp://policy.example.test', 'not a url'])(
+    'ignores %s with a warning, and does not fall back to the default',
+    (url) => {
+      const w = warn()
+      expect(loadConfig({ ...base, POLICY_WRITE_URL: url }).policyWriteUrl).toBeUndefined()
+      const text = w.mock.calls.map((c) => String(c[0])).join('')
+      expect(text).toMatch(/POLICY_WRITE_URL/)
+      expect(text).toMatch(/policy write tools are unavailable/)
+      w.mockRestore()
+    },
+  )
+
+  it('leaves the built-in default alone when nothing is set', () => {
+    expect(loadConfig(base).policyWriteUrl).toBe('https://public-api-sandbox.zetrix.com/api')
+  })
+})
+
 describe('loadConfig', () => {
   it('reads required fields, strips trailing slashes, and derives testnet defaults', () => {
     const cfg = loadConfig(base)

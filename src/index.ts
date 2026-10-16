@@ -377,8 +377,9 @@ export function buildToolList() {
         'spending policy check could not be completed, nothing was paid and no policy was written; trying again shortly is ' +
         'right. '  +
         '"payment_refused" is different: a payment was presented and the service rejected it, and ' +
-        'that says nothing either way about whether the fee was taken — never tell the user they ' +
-        'were not charged, and never tell them they were. ' +
+        'that usually says nothing either way about whether the fee was taken — never tell the user they ' +
+        'were not charged, and never tell them they were, unless the result\'s own message says no fee was taken ' +
+        '(a refused owner password does): then you may say so, and do not retry. ' +
         '"receipt_void" is the one state where paying again is correct — the settlement failed and ' +
         'the receipt bought nothing; `payFresh` is set to say so. ' +
         'On the sponsored path, "write_failed" and "unknown" both mean money moved and paying again would NOT help: quote ' +
@@ -542,8 +543,10 @@ export function buildToolList() {
         'say so. For "modified", read the policy again with get_my_policy, show the user what it holds now, and update from ' +
         'that; never retry with the old expectedUpdatedAtBlock. ' +
         'When `policyDenied` is true a spending policy refused the fee before it was signed: a decision, so do not retry. ' +
-        '"payment_refused" is different: a payment was presented and the service rejected it, and that says nothing either ' +
-        'way about whether the fee was taken — never tell the user they were not charged, and never tell them they were. ' +
+        '"payment_refused" is different: a payment was presented and the service rejected it, and that usually says nothing ' +
+        'either way about whether the fee was taken — never tell the user they were not charged, and never tell them they ' +
+        'were, unless the result\'s own message says no fee was taken (a refused owner password does): then you may say so, ' +
+        'and do not retry. ' +
         '"receipt_void" is the one state where paying again is correct — the settlement failed and the receipt bought ' +
         'nothing; `payFresh` is set to say so. ' +
         'On the sponsored path, "write_failed" means the update was NOT applied and the policy is unchanged, but a payment may have been taken: ' +
@@ -1536,7 +1539,7 @@ export function buildPolicyWriteDeps(input: {
   const templateContract = input.policyTemplateAddress
   return {
     policyWriteDeps: {
-      ...(input.policyWriteUrl ? { client: new PolicyWriteClient(input.policyWriteUrl, (url, init) => fetch(url, { ...init, signal: AbortSignal.timeout(POLICY_HTTP_TIMEOUT_MS) })) } : {}),
+      ...(input.policyWriteUrl ? { client: new PolicyWriteClient(input.policyWriteUrl, (url, init) => fetch(url, { ...init, redirect: 'error', signal: AbortSignal.timeout(POLICY_HTTP_TIMEOUT_MS) })) } : {}),
       // A self-paid write has no service to catch what the attribute vocabulary would have, so it needs a vocabulary to check against.
       hasVocabularySource: Boolean(input.readVocabulary),
       receipts: createFsPolicyWriteReceiptStore(join(input.stateDir, 'policy-write-receipts')),

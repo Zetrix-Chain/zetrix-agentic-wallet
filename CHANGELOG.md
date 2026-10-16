@@ -10,6 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.1] — 16 October 2026
+
+### Changed
+
+- **Upgrade to 0.16.1 if you write policies on testnet.** The testnet policy service is being updated to require the owner's HSM password in the payment step of a paid write. Every wallet up to and including 0.16.0 does not send it there, so once that service is updated it refuses their `write_policy` and `update_policy` calls with a generic refusal, before anything is reserved or charged; they work again after upgrading to 0.16.1. Production does not require it yet.
+- **Mainnet needs settings.** The wallet has no built-in policy service, registry or template for mainnet: set `POLICY_WRITE_URL`, `POLICY_REGISTRY_ADDRESS`, `POLICY_TEMPLATE_ADDRESS` (and `POLICY_TEMPLATE_PUBLISHER` or name a publisher in each call) to use the policy tools there. These settings are now in the README.
+- **`POLICY_WRITE_URL` must be https** (plain http only for localhost), because the owner's HSM password is sent to it. Any other value is ignored with a warning at startup, and the policy write tools are not offered.
+- **The refusal text for the owner's password no longer tells a plugin user to look for a variable.** It says not to ask the user for a password, to check `HSM_PASSWORD` only if one was set, and otherwise to contact support. The tool descriptions for `write_policy` and `update_policy` now allow the agent to say that no fee was taken when the result's own message says so (they still never claim it otherwise).
+- **`write_policy` and `update_policy` send the owner's HSM password with the payment.** ms-zetrix can refuse a paid policy write whose payment step carries no owner proof (`paidWrite.requireOwnerProof`, off in production until this release is in use), which stops a payment the owner signed for another x402 resource at the same price being replayed onto a write with attributes the replayer chose. The wallet already sent the password when collecting a finished write; it now also sends it in the payment step, and only there: the free price check refuses a password by design, so it never carries one. A password that is sent is always checked, so this is safe against a server that does not require it yet. It is read from the session at call time and is never stored, logged or returned. **Wallets older than this release cannot send it, so ms-zetrix can only start requiring it once this release is in use.** A refusal of the owner proof itself (the service's codes 461532 "required" and 461533 "invalid", before it claims, reserves or settles anything) is now its own answer: no fee was taken, do not retry (the session's password is fixed and each wrong one is a guess against the owner's HSM account), check `HSM_PASSWORD` or contact support; every other refused payment still says nothing about the fee. The policy-write client never follows a redirect, so a 307 or 308 cannot re-send a body that holds the password to another host.
+
 ## [0.16.0] — 15 October 2026
 
 ### Changed

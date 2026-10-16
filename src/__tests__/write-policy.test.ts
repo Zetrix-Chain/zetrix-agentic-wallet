@@ -1792,3 +1792,113 @@ describe('describeAssetAmount when the decimals cannot be read', () => {
     expect(await describeAssetAmount(JMYR_ADDR, '1000000', contractInfo({ symbol: 'JMYR', decimals: '0' }))).toBe('1000000 JMYR')
   })
 })
+
+// ms-zetrix refuses a paid write whose phase 2 carries no owner proof once paidWrite.requireOwnerProof is on
+//. The wallet sends the session's HSM password in phase 2, and ONLY there: phase 1 is free and unauthenticated,
+// so the server refuses a credential sent to it (POLICY_OWNER_PROOF_NOT_AT_PRECHECK).
+describe('the owner proof rides on phase 2 of a paid write, and nowhere else it should not', () => {
+  const calls = (http: unknown) => (http as { calls: Array<{ url: string; body: string; headers: Record<string, string> }> }).calls
+
+  it('phase 2 carries ownerHsmPassword next to the write itself', async () => {
+    const { d, http } = deps([
+      { status: 402, body: CHALLENGE },
+      { status: 202, body: { receipt: 'blob-1' }, headers: { 'X-PAYMENT-RECEIPT': 'blob-1' } },
+      { status: 200, body: { state: 'WRITTEN' } },
+    ])
+    await writePolicy(d, INPUT)
+    const phase2 = calls(http).find((c) => c.headers['X-PAYMENT'] !== undefined)!
+    const body = JSON.parse(phase2.body)
+    expect(body.ownerHsmPassword).toBe('hunter2')
+    expect(body.ownerAddress).toBe(OWNER)
+    expect(body.policyKey).toBe(INPUT.policyKey)
+    expect(Array.isArray(body.attributes)).toBe(true)
+  })
+
+  it('phase 1, the free pre-check, never carries it', async () => {
+    const { d, http } = deps([
+      { status: 402, body: CHALLENGE },
+      { status: 202, body: { receipt: 'blob-1' }, headers: { 'X-PAYMENT-RECEIPT': 'blob-1' } },
+      { status: 200, body: { state: 'WRITTEN' } },
+    ])
+    await writePolicy(d, INPUT)
+    const phase1 = calls(http).filter((c) => c.headers['X-PAYMENT'] === undefined && !c.url.endsWith('/collect'))
+    expect(phase1.length).toBeGreaterThan(0)
+    for (const c of phase1) expect(c.body).not.toMatch(/ownerHsmPassword|hunter2/)
+  })
+
+  it('a dry run sends only the free pre-check, so no password leaves the wallet', async () => {
+    const { d, http } = deps([{ status: 402, body: CHALLENGE }])
+    await writePolicy(d, { ...INPUT, dryRun: true })
+    for (const c of calls(http)) expect(c.body).not.toMatch(/ownerHsmPassword|hunter2/)
+  })
+
+  it('the password is not in what the tool returns, nor in the stored receipt', async () => {
+    const { d } = deps([
+      { status: 402, body: CHALLENGE },
+      { status: 202, body: { receipt: 'blob-1' }, headers: { 'X-PAYMENT-RECEIPT': 'blob-1' } },
+      { status: 200, body: { state: 'WRITTEN' } },
+    ])
+    const r = await writePolicy(d, INPUT)
+    expect(JSON.stringify(r)).not.toMatch(/hunter2/)
+    const stored = await d.receipts.list()
+    expect(JSON.stringify(stored)).not.toMatch(/hunter2|ownerHsmPassword/)
+  })
+
+  // The owner-proof check runs before the service claims, reserves or settles anything, so for these two codes (and only these)
+  // the wallet can say no fee was taken. It must not invite a retry: the session's password is fixed, and each wrong one is a
+  // guess against the owner's HSM account.
+  it('a wrong owner proof (461533) is reported as such: no fee taken, do not retry', async () => {
+    const { d } = deps([
+      { status: 402, body: CHALLENGE },
+      { status: 403, body: { success: false, messages: [{ type: 'ERROR', errorCode: 461533, message: 'POLICY_OWNER_PROOF_INVALID' }] } },
+    ])
+    const r = await writePolicy(d, INPUT)
+    expect(r.state).toBe('payment_refused')
+    expect(r.paid).toBe(false)
+    expect(r.message).toMatch(/refused the wallet's HSM password/)
+    expect(r.message).toMatch(/no fee was taken/)
+    expect(r.message).toMatch(/Do not retry/)
+    // A plugin user has no HSM_PASSWORD variable and the plugin's guide says never to ask for a password.
+    expect(r.message).toMatch(/Do not ask the user for a password/)
+    expect(r.message).toMatch(/If an HSM_PASSWORD was set/)
+    expect(r.message).toMatch(/contact support/)
+    expect(r.message).not.toMatch(/hunter2/)
+    expect(r.message).not.toMatch(/Whether the fee was taken is not stated/)
+    expect(r.message).not.toMatch(/prepare a new one/)
+  })
+
+  it('a missing owner proof (461532) is reported as such: no fee taken, do not retry', async () => {
+    const { d } = deps([
+      { status: 402, body: CHALLENGE },
+      { status: 403, body: { success: false, messages: [{ type: 'ERROR', errorCode: 461532, message: 'POLICY_OWNER_PROOF_REQUIRED' }] } },
+    ])
+    const r = await writePolicy(d, INPUT)
+    expect(r.state).toBe('payment_refused')
+    expect(r.paid).toBe(false)
+    expect(r.message).toMatch(/needs the owner's HSM password/)
+    expect(r.message).toMatch(/no fee was taken/)
+    expect(r.message).toMatch(/Do not retry, and do not ask the user for a password/)
+    expect(r.message).toMatch(/contact support/)
+  })
+
+  it('any other refusal of the payment still says nothing about the fee', async () => {
+    for (const status of [403, 400]) {
+      const { d } = deps([
+        { status: 402, body: CHALLENGE },
+        { status, body: { success: false, messages: [{ type: 'ERROR', errorCode: 461999, message: 'SOMETHING_ELSE' }] } },
+      ])
+      const r = await writePolicy(d, INPUT)
+      expect(r.state).toBe('payment_refused')
+      expect(r.message).toMatch(/Whether the fee was taken is not stated/)
+    }
+  })
+
+  it('the owner-proof codes only count as a 403, not on any status', async () => {
+    const { d } = deps([
+      { status: 402, body: CHALLENGE },
+      { status: 400, body: { success: false, messages: [{ type: 'ERROR', errorCode: 461533, message: 'x' }] } },
+    ])
+    const r = await writePolicy(d, INPUT)
+    expect(r.message).toMatch(/Whether the fee was taken is not stated/)
+  })
+})

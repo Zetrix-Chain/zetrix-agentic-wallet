@@ -705,3 +705,21 @@ describe('remove_policy', () => {
     expect((await removePolicy(d, REMOVE)).state).toBe('unavailable')
   })
 })
+
+// the same rule for update_policy: the owner proof rides on phase 2 (X-PAYMENT) of /pay/policy/update and
+// nowhere the server refuses it.
+describe('update_policy carries the owner proof on phase 2 only', () => {
+  it('phase 2 carries ownerHsmPassword, phase 1 never does, and the result and receipt never hold it', async () => {
+    const { d, http } = deps([{ status: 402, body: CHALLENGE }, PAID, WRITTEN])
+
+    const r = await updatePolicy(d, UPDATE)
+
+    const phase2 = http.calls.find((c) => c.headers['X-PAYMENT'] !== undefined)!
+    expect(JSON.parse(phase2.body).ownerHsmPassword).toBe('hunter2')
+    const phase1 = http.calls.filter((c) => c.headers['X-PAYMENT'] === undefined && !c.url.endsWith('/collect'))
+    expect(phase1.length).toBeGreaterThan(0)
+    for (const c of phase1) expect(c.body).not.toMatch(/ownerHsmPassword|hunter2/)
+    expect(JSON.stringify(r)).not.toMatch(/hunter2/)
+    expect(JSON.stringify(await d.receipts.list())).not.toMatch(/hunter2|ownerHsmPassword/)
+  })
+})

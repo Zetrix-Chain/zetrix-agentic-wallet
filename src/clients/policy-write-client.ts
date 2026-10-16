@@ -25,7 +25,8 @@
  *
  *   1. Phase 3 requires `ownerHsmPassword`, which AC #8 says it must not send. The server signs
  *      the permit at write time and `hsm.key_registry` will not release the key without it. The AC
- *      that still holds, and is enforced here, is that the RECEIPT STORE keeps no secret.
+ *      that still holds, and is enforced here, is that the RECEIPT STORE keeps no secret. Phase 2
+ *      carries it too, as the owner proof against payment replay.
  *   2. There is no 503. The real set is 200 / 202 / 402 / 502 / 504 — see `CollectOutcome`.
  *   3. A 409 has two meanings, and one of them hands back a receipt for a write already paid for.
  *   4. `X-PAYMENT-RESPONSE` cannot identify an attempt: it is base64 of
@@ -68,7 +69,11 @@ export type PayResult =
    * saying otherwise would send someone looking for a network fault that is not there.
    */
   | { kind: 'paid_untrackable'; detail: string }
-  | { kind: 'refused'; status: number; detail: string }
+  /**
+   * `ownerProof` is set when the refusal is the owner-proof check itself: the service looked at the password
+   * before it claimed, reserved or settled anything, so no fee was taken and sending the same password again cannot help.
+   */
+  | { kind: 'refused'; status: number; detail: string; ownerProof?: 'required' | 'invalid' }
   | { kind: 'unreachable'; detail: string }
 
 /**
@@ -163,6 +168,8 @@ const ERROR_POLICY_MODIFIED = 461503
 const ERROR_POLICY_KEY_NOT_FOUND = 461505
 const ERROR_POLICY_TEMPLATE_NOT_FOUND = 461512
 const ERROR_PAID_WRITE_IN_FLIGHT = 461529
+const ERROR_OWNER_PROOF_REQUIRED = 461532
+const ERROR_OWNER_PROOF_INVALID = 461533
 
 /** The first numeric `errorCode` in the service's error envelope `{ messages: [{ errorCode, message }] }`. */
 function errorCodeOf(body: string): number | undefined {
@@ -258,11 +265,24 @@ export class PolicyWriteClient {
   }
 
   /**
-   * Phase 2. The payment header is built by the wallet's own payment path — this client never
-   * signs anything and never sees the HSM password. `route` is the paid route being paid for; it defaults to the create.
+   * Phase 2. The payment header is built by the wallet's own payment path — this client never signs anything. `route`
+   * is the paid route being paid for; it defaults to the create.
+   *
+   * `ownerHsmPassword` is the owner proof ms-zetrix checks here once paidWrite.requireOwnerProof is on
+   *: without it, a payment the owner signed for another x402 resource at the same price could be replayed onto
+   * this write with attributes the replayer chose. A password that is sent is always checked, whether the server requires
+   * one or not, so sending it is safe against a server that does not. It rides on THIS request and nowhere else it is not
+   * wanted: phase 1 refuses a credential (POLICY_OWNER_PROOF_NOT_AT_PRECHECK), so `precheck` and `precheckUpdate` never
+   * take it, and it is never stored or returned.
    */
-  async pay(request: AdoptTemplateRequest | UpdateRequest, paymentHeader: string, route: WriteRoute = 'adopt-template'): Promise<PayResult> {
-    const res = await this.post(`/pay/policy/${route}`, request, { [HEADER_PAYMENT]: paymentHeader })
+  async pay(
+    request: AdoptTemplateRequest | UpdateRequest,
+    paymentHeader: string,
+    route: WriteRoute = 'adopt-template',
+    ownerHsmPassword?: string,
+  ): Promise<PayResult> {
+    const body = ownerHsmPassword ? { ...request, ownerHsmPassword } : request
+    const res = await this.post(`/pay/policy/${route}`, body, { [HEADER_PAYMENT]: paymentHeader })
     if (!res.reached) return { kind: 'unreachable', detail: res.detail }
 
     if (res.status === 202) {
@@ -296,7 +316,12 @@ export class PolicyWriteClient {
       return { kind: 'unreachable', detail: `unexpected ${res.status} where a 202 was expected: ${clip(res.body)}` }
     }
 
-    return { kind: 'refused', status: res.status, detail: describe(res.status, res.body) }
+    const code = errorCodeOf(res.body)
+    const ownerProof =
+      res.status === 403 && code === ERROR_OWNER_PROOF_REQUIRED ? 'required'
+      : res.status === 403 && code === ERROR_OWNER_PROOF_INVALID ? 'invalid'
+      : undefined
+    return { kind: 'refused', status: res.status, detail: describe(res.status, res.body), ...(ownerProof ? { ownerProof } : {}) }
   }
 
   /**
