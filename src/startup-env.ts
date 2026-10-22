@@ -33,8 +33,13 @@ export interface StartupEnvResult {
   passwordGenerated: boolean
 }
 
+/** The environment the wallet runs with: the config file's values, overridden by the process environment. */
+export function mergeStartupEnv(fileEnv: NodeJS.ProcessEnv | undefined, processEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return { ...fileEnv, ...processEnv }
+}
+
 export function resolveStartupEnv(input: StartupEnvInput): StartupEnvResult {
-  const env: NodeJS.ProcessEnv = { ...input.fileEnv, ...input.processEnv }
+  const env: NodeJS.ProcessEnv = mergeStartupEnv(input.fileEnv, input.processEnv)
 
   const stored = input.storedAccount
   if (!env.ZETRIX_ADDRESS && stored) env.ZETRIX_ADDRESS = stored.zetrixAddress

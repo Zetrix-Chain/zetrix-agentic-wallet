@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { buildToolList } from '../index'
 import { aiBirthcertChoice } from '../orchestrator/birthcert-choice'
 
-// The reviewed snapshot pins the exact words of every tool text; these pin what the words MEAN, so a
+// an earlier change. The reviewed snapshot pins the exact words of every tool text; these pin what the words MEAN, so a
 // regenerated snapshot cannot quietly drop a rule.
 
 function tool(name: string) {
@@ -80,16 +80,18 @@ describe('an AI Birthcert request that does not say Basic or Verified', () => {
     expect(GUIDE).toMatch(/offers only the kind you do not already have/i)
   })
 
-  // Review R1-M4: Verified is off by default on mainnet, but a wallet can have it configured there.
-  it('says Verified is unavailable where it is NOT CONFIGURED (mainnet by default), not that it is always unavailable on mainnet', () => {
-    expect(SECTION).toMatch(/not configured/i)
+  // Verified is built in on both networks, so the guidance must not say it is off on mainnet or needs a setting there.
+  it('says Verified is unavailable only when it cannot be used, never that mainnet lacks it or needs a setting', () => {
     expect(SECTION).not.toMatch(/not available through this plugin/i)
     expect(GUIDE).not.toMatch(/Verified kind is not available through this plugin/i)
-    expect(GUIDE).toMatch(/not configured/i)
+    expect(GUIDE).toMatch(/Verified kind is unavailable/i)
+    expect(GUIDE).not.toMatch(/today that is mainnet/i)
+    expect(GUIDE).not.toMatch(/on mainnet it needs one setting/i)
+    expect(SKILL).not.toMatch(/created: false` until the `myidVerifyLinkTemplate`/)
   })
 
   // Review R2-M1: an older sentence told the agent the user "most likely wants" Basic and to use subscribe_and_issue, which
-  // is the defect itself (and can charge the Basic fee without ever offering Verified).
+  // is the an earlier change defect itself (and can charge the Basic fee without ever offering Verified).
   it('no tool text says the user most likely wants the Basic one, or tells the agent to go straight to subscribe_and_issue for it', () => {
     expect(allToolText()).not.toMatch(/most likely want/i)
     // Pointing the agent at subscribe_and_issue is fine once the user has said Basic; the old wording made it the default.
@@ -117,9 +119,9 @@ describe('an AI Birthcert request that does not say Basic or Verified', () => {
     expect(text).toMatch(/say which/i)
   })
 
-  // Review R2-L6: "not configured" must not read as "you can configure it" in a plugin that has no setting for it.
-  it('the user guide says the plugin has no setting for it', () => {
-    expect(GUIDE).toMatch(/this plugin has no setting for it/i)
+  // Verified is built in on both networks, so the guide must not send a mainnet user looking for a setting.
+  it('the user guide does not say the plugin lacks a setting for the Verified kind', () => {
+    expect(GUIDE).not.toMatch(/this plugin has no setting for it/i)
   })
 
   // Review R2-L5
@@ -127,11 +129,12 @@ describe('an AI Birthcert request that does not say Basic or Verified', () => {
     expect(README).toMatch(/nothing is held"\. When a user asks for an AI Birthcert/)
   })
 
-  // Review R2-L7: mainnet has no default SSIVC URL (the URL in code is an unverified constant that is not used).
-  it('the README does not call the mainnet SSIVC URL auto-derived', () => {
+  // The README names both defaults, so an operator knows which host each network uses.
+  it('the README names the SSIVC host of each network', () => {
     const row = README.split('\n').find((l) => l.startsWith('| `SSIVC_BASE_URL`')) ?? ''
-    expect(row).toMatch(/no default on mainnet/i)
-    expect(row).not.toMatch(/Auto-derived per network/i)
+    expect(row).toContain('https://ssivc-api-uat.myegdev2.com/api')
+    expect(row).toContain('https://verifyid-api.zetrix.com/api')
+    expect(row).not.toMatch(/no default on mainnet/i)
   })
 
   it('the skill says the same about presenting when both are held', () => {
@@ -224,7 +227,7 @@ describe('the user answers with a short phrase when asked for a name', () => {
   })
 })
 
-// Links 2 and 3 replayed the first payment, but the agent told the user it had paid three times:
+// A QA finding: links 2 and 3 replayed the first payment, but the agent told the user it had paid three times:
 // the description said the tool spends "per call" and nothing said a new link after an expired one is free.
 describe('a new link after an expired one is not another fee', () => {
   it('request_ai_birthcert_verification says a new link after an expired one reuses the earlier payment', () => {
@@ -299,6 +302,7 @@ describe('confirm before paying, and nextStep', () => {
   })
 })
 
+// an earlier change review R1.
 describe('no text contradicts the new contracts', () => {
   // M1: a plain cache hit is issued: false, alreadyHeld: true now.
   it('no subscribe_and_issue text says a cache hit is issued: true', () => {
@@ -314,7 +318,7 @@ describe('no text contradicts the new contracts', () => {
     expect(text).toMatch(/a name that says verified/i)
   })
 
-  // M2: the Doc1 failure was quoting a fee for a link that reuses an earlier payment.
+  // M2: the QA failure was quoting a fee for a link that reuses an earlier payment.
   it('the skill makes the fee exception for unusedPayment, and the README lists the field', () => {
     expect(SKILL).toMatch(/unusedPayment/)
     expect(SKILL).toMatch(/do not quote the fee as a charge/i)
@@ -342,6 +346,7 @@ describe('balances are quoted as display, with the null-decimals exception', () 
   })
 })
 
+// an earlier change review R1 (option A, M1).
 describe('confirm is the quote echoed back, and an expired credential still stops at the price', () => {
   it.each(['request_ai_birthcert_verification', 'subscribe_and_issue'])('%s: confirm is the quote object, unchanged, and true is not accepted', (name) => {
     const t = tool(name)
@@ -396,6 +401,7 @@ describe('confirm is declared as the quote object in the schema', () => {
   })
 })
 
+// an earlier change review R3.
 describe('docs match the behaviour', () => {
   it('the README does not say a refused sponsored option falls back to self-pay on its own', () => {
     expect(README).not.toMatch(/automatically falls back to paying gas itself/i)
@@ -441,5 +447,23 @@ describe('the MyDigital ID app (owner check) and the MyID wallet (QR) are never 
       expect(text, name).toMatch(/MyID wallet/)
       expect(text, name).not.toMatch(/in the MyID app|MyID app/)
     }
+  })
+})
+
+// QA saw the agent tell a user "you'd pay the fee up front" for a Verified AI Birthcert while the issuing service was
+// running without payment. The wallet's own text stated the fee as fact; whether one applies comes from the readiness check.
+describe('the Verified fee is never stated as fact', () => {
+  const GUIDE = readDoc('openclaw-plugin', 'USER_GUIDE.md')
+  const CHOICE_SRC = readDoc('src', 'orchestrator', 'birthcert-choice.ts')
+
+  it('SKILL.md, USER_GUIDE.md and the kind-choice note say a fee applies only when the check says so', () => {
+    for (const [name, text] of [['SKILL.md', SKILL], ['USER_GUIDE.md', GUIDE], ['birthcert-choice.ts', CHOICE_SRC]] as const) {
+      expect(text, name).toMatch(/nothing is paid/)
+      expect(text, name).not.toMatch(/the fee is paid up front, the owner completes/i)
+    }
+  })
+
+  it('the kind-choice note tells the agent not to assume either kind is free or paid', () => {
+    expect(CHOICE_SRC).toMatch(/never assume either kind is free or paid/)
   })
 })

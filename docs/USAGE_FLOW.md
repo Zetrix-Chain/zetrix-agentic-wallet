@@ -28,7 +28,7 @@ on `prove_identity`) to override the cache, e.g. to present a credential from so
 
 `ZETRIX_ADDRESS`/`HOLDER_DID` are both optional — set only `HSM_PASSWORD` and the MCP creates a
 new HSM account automatically at startup, logging the new address to stderr and saving it
-(address, DID, and password) to a local account store (`~/.agentic-wallet-mcp/account.json`,
+(address, DID, and password) to a local account store (`~/.agentic-wallet-mcp/account.<network>.json`,
 owner-only) for automatic reuse on the next restart. Alternatively:
 
 > **You:** "My wallet_status call is failing — I don't have a holder account yet. Set one up.
@@ -209,6 +209,42 @@ different resource requires a different credential.
 
 ---
 
+## Phase 5 — spending policy (optional)
+
+A policy is a set of limits on chain: a maximum per transaction, a maximum over a window, an allowed or denied list of recipients.
+The signing service (Wallet BE) enforces it when the agent spends, **only where its enforcement is switched on**, which is a deployment
+setting: ask whoever runs your Wallet BE. A limit over a window also needs the spend history to be tracked, which is not switched on
+for testnet today (`check_policy_decision` answers "undetermined", which means stop, not permitted), so do not rely on one yet.
+
+Without a policy, the only limit is the wallet's per-call payment cap. On testnet and mainnet a policy that governs an asset **stands
+that cap aside** for the asset (an explicit `MAX_PAYMENT_AMOUNT` is never set aside), so with a policy the policy is the only limit;
+where your Wallet BE does not enforce policies, set `POLICY_CAP_BYPASS=false`. Writing a policy is a paid action: a sponsored write
+costs a fee in JMYR, a self-paid write only network gas in ZTX; either is quoted before anything is paid, and you choose.
+
+> **You:** "Limit my agent to 5 JMYR per transaction and 20 JMYR a week."
+
+1. → `get_policy_template_schema {}` — lists the templates on offer and what each attribute means. **Free.**
+2. → `policy_preflight { policyKey, attributes, validFromBlock, validToBlock, templateId? }` — checks the draft and shows, in plain words, what it
+   will mean (`validToBlock: "0"` means no end). **Free.**
+   Show the user the interpretation before going further: a valid policy can still mean something other than what they intended.
+3. → `write_policy { policyKey, templateId, attributes, dryRun: true }` — returns the price and whether the wallet can afford it. Pays nothing.
+4. → the same call without `dryRun` and with `confirm: true` **only after the user has seen the interpretation and the price and said yes.**
+   It pays and writes. The result says `written` once the chain holds exactly what was submitted. If it answers `needs_choice`, show the
+   user both ways to pay (sponsored: a JMYR fee; self: network gas in ZTX, no fee), let them choose, and call again with `gasPayer` set to
+   their answer.
+5. If the answer is `unknown`, the payment may have been made and its outcome could not be determined: do **not** pay or send again.
+   `get_my_policy` shows whether the policy is on chain. For a sponsored write, quote the receipt to support rather than retrying; a self-paid
+   write has no receipt, so quote the nonce. (`check_policy_write` is for a write that is still `settling` or `submitted`.)
+
+Reading is always free: `get_my_policy` lists the policies this wallet's owner has deployed. `update_policy` replaces one (the full
+attribute set, not a patch) and `remove_policy` removes one, which lifts every limit it set, so it needs `confirm: true` too.
+`check_policy_decision` answers whether a specific spend would be permitted right now.
+
+On mainnet the policy contracts and the write service are built in, so the same flow works with `ZETRIX_NETWORK=zetrix:mainnet`.
+Everything above pays real money there.
+
+---
+
 ## Full script, back to back
 
 ```
@@ -230,4 +266,8 @@ different resource requires a different credential.
 
 5. "Now fetch <protected-url> and pay automatically if it asks."  → pay_and_fetch
    [repeat step 5 for every further paid call]
+
+6. (optional) "Limit my agent to 5 JMYR per transaction."        → get_policy_template_schema,
+                                                                    policy_preflight, write_policy
+   [show the interpretation and the price first; confirm: true only after the user says yes]
 ```

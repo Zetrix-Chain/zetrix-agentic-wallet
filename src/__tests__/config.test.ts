@@ -3,15 +3,74 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import {
   loadConfig,
-  UNVERIFIED_MAINNET_SSIVC_BASE_URL,
+  MAINNET_SSIVC_BASE_URL,
+  MAINNET_AI_BIRTHCERT_VERIFIED_TEMPLATE_ID,
   derivePolicyRegistryAddress,
   derivePolicyTemplateAddress,
+  derivePolicyWriteUrl,
+  derivePolicyCapBypass,
+  deriveBindPresentation,
 } from '../config'
 
 const base = {
   ZETRIX_NETWORK: 'zetrix:testnet',
   HSM_PASSWORD: 'pw123456',
 } as NodeJS.ProcessEnv
+
+// The SDK uses plain http unless told otherwise, and the mainnet node refuses a POSTed contract call over http ("request must be
+// in json format"), so every host is reached over https except a loopback one. The SDK builds its URL from the scheme and host only
+// and ignores a separate port, so the decision is made on the host (a local node is ZETRIX_NODE_HOST=localhost:19333).
+describe('node connection scheme', () => {
+  const warn = () => vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+
+  it('is https for the public hosts on both networks', () => {
+    expect(loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:testnet' }).nodeSecure).toBe(true)
+    expect(loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet' }).nodeSecure).toBe(true)
+  })
+
+  it('a public host stays https whatever ZETRIX_NODE_PORT says, because the SDK ignores the port', () => {
+    expect(loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet', ZETRIX_NODE_PORT: '19333' }).nodeSecure).toBe(true)
+    expect(loadConfig({ ...base, ZETRIX_NODE_HOST: 'node.zetrix.com:443' }).nodeSecure).toBe(true)
+  })
+
+  it.each(['localhost', 'localhost:19333', '127.0.0.1', '127.0.0.1:19333', '[::1]', '[::1]:19333', 'LOCALHOST:19333'])(
+    'a loopback host keeps plain http: %s',
+    (host) => {
+      const w = warn()
+      expect(loadConfig({ ...base, ZETRIX_NODE_HOST: host }).nodeSecure).toBe(false)
+      expect(w).not.toHaveBeenCalled()
+      w.mockRestore()
+    },
+  )
+
+  it('a host that only looks like localhost is not loopback', () => {
+    expect(loadConfig({ ...base, ZETRIX_NODE_HOST: 'localhost.evil.test:19333' }).nodeSecure).toBe(true)
+    expect(loadConfig({ ...base, ZETRIX_NODE_HOST: '127.0.0.1.evil.test' }).nodeSecure).toBe(true)
+  })
+
+  it('ZETRIX_NODE_SECURE overrides either default', () => {
+    const w = warn()
+    expect(loadConfig({ ...base, ZETRIX_NODE_HOST: 'localhost:19333', ZETRIX_NODE_SECURE: 'TRUE' }).nodeSecure).toBe(true)
+    expect(loadConfig({ ...base, ZETRIX_NODE_HOST: 'node.internal.test:19333', ZETRIX_NODE_SECURE: 'false' }).nodeSecure).toBe(false)
+    w.mockRestore()
+  })
+
+  it('warns when plain http is sent to a node that is not on this machine, and says why', () => {
+    const w = warn()
+    loadConfig({ ...base, ZETRIX_NODE_HOST: 'node.internal.test:19333', ZETRIX_NODE_SECURE: 'false' })
+    const text = w.mock.calls.map((c) => String(c[0])).join('')
+    expect(text).toMatch(/node\.internal\.test:19333 is reached over plain http/)
+    expect(text).toMatch(/public Zetrix nodes refuse a contract query over http/)
+    w.mockRestore()
+  })
+
+  it('warns about a ZETRIX_NODE_SECURE value it does not recognise, and ignores it', () => {
+    const w = warn()
+    expect(loadConfig({ ...base, ZETRIX_NODE_SECURE: 'maybe' }).nodeSecure).toBe(true)
+    expect(w.mock.calls.map((c) => String(c[0])).join('')).toMatch(/ZETRIX_NODE_SECURE must be true or false, so "maybe" is ignored/)
+    w.mockRestore()
+  })
+})
 
 describe('POLICY_WRITE_URL', () => {
   // The owner's HSM password rides in the body of the paid-write calls, so an override has to be https
@@ -62,6 +121,10 @@ describe('loadConfig', () => {
       hsmPassword: 'pw123456',
       nodeHost: 'test-node.zetrix.com',
       nodePort: '',
+      nodeSecure: true,
+      // On for testnet and mainnet, where Wallet BE enforces policies; off elsewhere (see derivePolicyCapBypass).
+      policyCapBypass: true,
+      bindPresentation: true,
       templateRegistryAddress: 'ZTX3JszqPgRUx743SAp7q7zURfjvkWuH2FMEz',
       zidResolverBaseUrl: 'https://zid-resolver-sandbox.zetrix.com',
       policyRegistryAddress: 'ZTX3Z2Fgsssx5fVq5v8EnhTBh6mqxJ8FQFqnk',
@@ -105,11 +168,13 @@ describe('loadConfig', () => {
     ).toBe('ZTX3Custom')
   })
 
-  it('leaves the mainnet Verified AI Birthcert templateId undefined (unverified, APP-M04) unless explicitly overridden', () => {
-    // The mainnet id was never confirmed on-chain (a read at the registry address returned null) —
-    // auto-deriving it anyway would let a mainnet credential get cached under a possibly-wrong key
-    // that prove_identity might never find. Fail closed instead: require an explicit override.
-    expect(loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet' } as NodeJS.ProcessEnv).aiBirthcertVerifiedTemplateId).toBeUndefined()
+  it('defaults the mainnet Verified AI Birthcert templateId to the one read from the mainnet registry, and honours an override', () => {
+    // Read from the mainnet template registry (ZTX3GqJM1U6ifMPonwD4fGvrgoTKJua7b2cKX) on 2026-10-22.
+    expect(MAINNET_AI_BIRTHCERT_VERIFIED_TEMPLATE_ID).toBe('did:zid:2d8f9476809fe20de103c43438f738a122ef53665e0b615b7414bdf1f1b19b52')
+    expect(loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet' } as NodeJS.ProcessEnv).aiBirthcertVerifiedTemplateId).toBe(
+      MAINNET_AI_BIRTHCERT_VERIFIED_TEMPLATE_ID,
+    )
+    expect(loadConfig(base).aiBirthcertVerifiedTemplateId).toBe('did:zid:9641ee92552e9bcec672f300b071ff86d340ac78c83c225e95971cab8108fb80')
     expect(
       loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet', AI_BIRTHCERT_VERIFIED_TEMPLATE_ID: 'did:zid:custom' } as NodeJS.ProcessEnv)
         .aiBirthcertVerifiedTemplateId,
@@ -174,23 +239,31 @@ describe('loadConfig', () => {
     expect(cfg.ssivcBaseUrl).toBe('https://ssivc-custom.example.com/api')
   })
 
-  it('leaves the mainnet SSIVC base URL undefined (unverified, APP-M04) unless explicitly overridden', () => {
-    // Only the testnet host was ever actually reached and confirmed; the mainnet URL was an
-    // assumption by analogy, never tested live. Fail closed rather than wire the whole AI
-    // Birthcert verification feature against an unconfirmed mainnet endpoint.
-    expect(loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet' } as NodeJS.ProcessEnv).ssivcBaseUrl).toBeUndefined()
+  it('defaults the mainnet SSIVC base URL to the production host, and honours an override', () => {
+    expect(loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet' } as NodeJS.ProcessEnv).ssivcBaseUrl).toBe('https://verifyid-api.zetrix.com/api')
     const overridden = loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet', SSIVC_BASE_URL: 'https://ssivc.example.com/api' } as NodeJS.ProcessEnv)
     expect(overridden.ssivcBaseUrl).toBe('https://ssivc.example.com/api')
   })
 
-  it('keeps the known-but-unverified mainnet SSIVC host as a documented constant, not wired into loadConfig', () => {
-    // The URL is worth keeping on hand so enabling it later (once confirmed reachable) is a
-    // one-line change in deriveSsivcBaseUrl rather than someone having to rediscover it — but it
-    // must not be what a mainnet wallet actually gets by default; SSIVC_BASE_URL is the opt-in.
-    expect(UNVERIFIED_MAINNET_SSIVC_BASE_URL).toBe('https://verifyid-api.zetrix.com/api')
-    expect(loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet' } as NodeJS.ProcessEnv).ssivcBaseUrl).not.toBe(
-      UNVERIFIED_MAINNET_SSIVC_BASE_URL,
-    )
+  it('falls back to the default when SSIVC_BASE_URL or the template id is blank, on mainnet', () => {
+    const mainnet = { ...base, ZETRIX_NETWORK: 'zetrix:mainnet', SSIVC_BASE_URL: '   ', AI_BIRTHCERT_VERIFIED_TEMPLATE_ID: '   ' } as NodeJS.ProcessEnv
+    const cfg = loadConfig(mainnet)
+    expect(cfg.ssivcBaseUrl).toBe(MAINNET_SSIVC_BASE_URL)
+    expect(cfg.aiBirthcertVerifiedTemplateId).toBe(MAINNET_AI_BIRTHCERT_VERIFIED_TEMPLATE_ID)
+  })
+
+  it('has everything the Verified flow needs on mainnet with no setting at all', () => {
+    const cfg = loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet' } as NodeJS.ProcessEnv)
+    // index.ts wires verifyAiBirthcert exactly when ssivcBaseUrl is set, and create_verification_qr needs the link.
+    expect(cfg.ssivcBaseUrl).toBeTruthy()
+    expect(cfg.aiBirthcertVerifiedTemplateId).toBeTruthy()
+    expect(cfg.myidVerifyLinkTemplate).toBeTruthy()
+  })
+
+  it('pins the mainnet SSIVC host, and the testnet default does not change', () => {
+    expect(MAINNET_SSIVC_BASE_URL).toBe('https://verifyid-api.zetrix.com/api')
+    expect(loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet' } as NodeJS.ProcessEnv).ssivcBaseUrl).toBe(MAINNET_SSIVC_BASE_URL)
+    expect(loadConfig(base).ssivcBaseUrl).toBe('https://ssivc-api-uat.myegdev2.com/api')
   })
 
   it('SSIVC_ISSUANCE_TOKEN, if set, has no effect (the session API needs no bearer token)', () => {
@@ -425,11 +498,105 @@ describe('policy contract addresses', () => {
     expect(derivePolicyTemplateAddress('zetrix:testnet')).toBe('ZTX3WfTbuZwsLQDWe4f7mzrfULiNdDU84BLJ5')
   })
 
-  it('returns undefined on mainnet, because the contracts are not deployed there', () => {
+  it('returns the deployed mainnet contracts, read back from chain', () => {
+    expect(derivePolicyRegistryAddress('zetrix:mainnet')).toBe('ZTX3brJxpLuzHSbcNNLi2XrgWsQQQ2EHFZVWQ')
+    expect(derivePolicyTemplateAddress('zetrix:mainnet')).toBe('ZTX3P7CKSvPAX33GNJCbDeLz1dGoyjKw4ZAy3')
+    const cfg = loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet' } as NodeJS.ProcessEnv)
+    expect(cfg.policyRegistryAddress).toBe('ZTX3brJxpLuzHSbcNNLi2XrgWsQQQ2EHFZVWQ')
+    expect(cfg.policyTemplateAddress).toBe('ZTX3P7CKSvPAX33GNJCbDeLz1dGoyjKw4ZAy3')
+  })
+
+  it('has none on any other network, and the mainnet ones are different from testnet', () => {
     // APP-M04: a guessed address would make every read fail as "you have no policy" rather
     // than "this network has no policy system at all".
-    expect(derivePolicyRegistryAddress('zetrix:mainnet')).toBeUndefined()
-    expect(derivePolicyTemplateAddress('zetrix:mainnet')).toBeUndefined()
+    for (const network of ['zetrix:devnet', 'zetrix:local', '']) {
+      expect(derivePolicyRegistryAddress(network)).toBeUndefined()
+      expect(derivePolicyTemplateAddress(network)).toBeUndefined()
+    }
+    expect(derivePolicyRegistryAddress('zetrix:mainnet')).not.toBe(derivePolicyRegistryAddress('zetrix:testnet'))
+    expect(derivePolicyTemplateAddress('zetrix:mainnet')).not.toBe(derivePolicyTemplateAddress('zetrix:testnet'))
+  })
+
+  it('the policy write URL is the sandbox proxy on testnet, the production proxy on mainnet, and none elsewhere', () => {
+    expect(derivePolicyWriteUrl('zetrix:testnet')).toBe('https://public-api-sandbox.zetrix.com/api')
+    expect(derivePolicyWriteUrl('zetrix:mainnet')).toBe('https://public-api.zetrix.com/api')
+    for (const network of ['zetrix:devnet', 'zetrix:local', '']) expect(derivePolicyWriteUrl(network)).toBeUndefined()
+    expect(loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet' } as NodeJS.ProcessEnv).policyWriteUrl).toBe('https://public-api.zetrix.com/api')
+    // An override wins.
+    expect(loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet', POLICY_WRITE_URL: 'https://other.test/api/' } as NodeJS.ProcessEnv).policyWriteUrl).toBe('https://other.test/api')
+  })
+
+  it('a rejected (non-https) override leaves no URL and does not fall back to the default, on either network', () => {
+    const w = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+    for (const network of ['zetrix:testnet', 'zetrix:mainnet']) {
+      expect(loadConfig({ ...base, ZETRIX_NETWORK: network, POLICY_WRITE_URL: 'http://policy.example.test/api' } as NodeJS.ProcessEnv).policyWriteUrl).toBeUndefined()
+    }
+    w.mockRestore()
+  })
+
+  // A policy that governs an asset stands the default per-call cap aside, and the wallet never compares a payment with the policy's
+  // own limit (Wallet BE does), so the bypass is on for testnet and mainnet and off elsewhere, and POLICY_CAP_BYPASS overrides it
+  // either way. A value it does not understand turns it OFF (fails closed), whatever the network.
+  it('the policy cap bypass is on for testnet and mainnet, off for everything else, and POLICY_CAP_BYPASS overrides', () => {
+    expect(derivePolicyCapBypass('zetrix:testnet', undefined)).toBe(true)
+    expect(derivePolicyCapBypass('zetrix:mainnet', undefined)).toBe(true)
+    for (const network of ['zetrix:devnet', 'zetrix:local', '']) expect(derivePolicyCapBypass(network, undefined)).toBe(false)
+    expect(derivePolicyCapBypass('zetrix:mainnet', 'false')).toBe(false)
+    expect(derivePolicyCapBypass('zetrix:mainnet', ' FALSE ')).toBe(false)
+    expect(derivePolicyCapBypass('zetrix:testnet', 'false')).toBe(false)
+    expect(derivePolicyCapBypass('zetrix:devnet', 'true')).toBe(true)
+    for (const off of ['0', 'no', 'No', ' false ']) expect(derivePolicyCapBypass('zetrix:mainnet', off)).toBe(false)
+    for (const on of ['1', 'yes', 'TRUE', ' true ']) expect(derivePolicyCapBypass('zetrix:mainnet', on)).toBe(true)
+    expect(derivePolicyCapBypass('zetrix:devnet', 'maybe')).toBe(false)
+    expect(loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet' } as NodeJS.ProcessEnv).policyCapBypass).toBe(true)
+    expect(loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet', POLICY_CAP_BYPASS: 'false' } as NodeJS.ProcessEnv).policyCapBypass).toBe(false)
+    expect(loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:testnet' } as NodeJS.ProcessEnv).policyCapBypass).toBe(true)
+  })
+
+  // An operator who tries to turn it off and mistypes must not end up with it ON.
+  it('a POLICY_CAP_BYPASS value that is not true or false turns the bypass OFF, on every network', () => {
+    for (const network of ['zetrix:mainnet', 'zetrix:testnet', 'zetrix:devnet']) {
+      for (const typo of ['off', 'flase', 'disabled', 'n', 'maybe', 'null', '2', 'false.']) {
+        expect(derivePolicyCapBypass(network, typo), `${network} ${typo}`).toBe(false)
+      }
+    }
+  })
+
+  it('says so on stderr when POLICY_CAP_BYPASS is not true or false, and turns the bypass off', () => {
+    const w = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+    try {
+      const cfg = loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet', POLICY_CAP_BYPASS: 'off' } as NodeJS.ProcessEnv)
+      expect(cfg.policyCapBypass).toBe(false)
+      const written = w.mock.calls.map((c) => String(c[0])).join('')
+      expect(written).toContain('POLICY_CAP_BYPASS must be true or false')
+      expect(written).toContain('"off" is treated as false')
+    } finally {
+      w.mockRestore()
+    }
+  })
+
+  it('stays quiet for a recognised value, and a blank value is the same as not setting it', () => {
+    const w = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+    try {
+      for (const v of ['true', 'false', '0', '1', 'yes', 'no']) {
+        loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet', POLICY_CAP_BYPASS: v } as NodeJS.ProcessEnv)
+      }
+      expect(loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet', POLICY_CAP_BYPASS: '  ' } as NodeJS.ProcessEnv).policyCapBypass).toBe(true)
+      expect(w.mock.calls.map((c) => String(c[0])).join('')).not.toContain('POLICY_CAP_BYPASS')
+    } finally {
+      w.mockRestore()
+    }
+  })
+
+  it('an override still wins on mainnet', () => {
+    const cfg = loadConfig({
+      ...base,
+      ZETRIX_NETWORK: 'zetrix:mainnet',
+      POLICY_REGISTRY_ADDRESS: 'ZTX3OverrideRegistry',
+      POLICY_TEMPLATE_ADDRESS: 'ZTX3OverrideTemplate',
+    } as NodeJS.ProcessEnv)
+    expect(cfg.policyRegistryAddress).toBe('ZTX3OverrideRegistry')
+    expect(cfg.policyTemplateAddress).toBe('ZTX3OverrideTemplate')
   })
 
   it('lets an explicit override reach a local deployment on any network', () => {
@@ -453,28 +620,21 @@ describe('MYID_VERIFY_LINK_TEMPLATE', () => {
     expect(loadConfig(base).myidVerifyLinkTemplate).toBe(UAT_LINK)
   })
 
-  // PRODUCTION: MyID has stated this link, but their production side was not deployed and the host's association files could not be
-  // read, so mainnet fails closed (no default) like the other unverified mainnet values, and an operator opts in with the variable.
+  // PRODUCTION: MyID's verifier host, which MyID says is ready. It is the mainnet default, so nobody has to set it.
   const PROD_LINK = 'https://myid-verifier.zetrix.com/api/agentic-verify?referenceId={referenceId}'
 
-  it('has no default on mainnet until MyID production is verified, so create_verification_qr refuses before creating anything', () => {
+  it('defaults to the MyID production link on mainnet', () => {
     const mainnet = { ...base, ZETRIX_NETWORK: 'zetrix:mainnet' } as NodeJS.ProcessEnv
 
-    expect(loadConfig(mainnet).myidVerifyLinkTemplate).toBeUndefined()
+    expect(loadConfig(mainnet).myidVerifyLinkTemplate).toBe(PROD_LINK)
   })
 
-  it('pins the production link MyID stated, and it is a link the wallet would accept once switched on', async () => {
-    const { UNVERIFIED_MAINNET_MYID_VERIFY_LINK_TEMPLATE } = await import('../config')
+  it('pins the production link, and it is a link the wallet itself accepts', async () => {
+    const { MAINNET_MYID_VERIFY_LINK_TEMPLATE } = await import('../config')
     const { checkVerifyLinkTemplate } = await import('../verify-link-template')
 
-    expect(UNVERIFIED_MAINNET_MYID_VERIFY_LINK_TEMPLATE).toBe(PROD_LINK)
-    expect(checkVerifyLinkTemplate(UNVERIFIED_MAINNET_MYID_VERIFY_LINK_TEMPLATE)).toBeNull()
-  })
-
-  it('lets a mainnet operator opt in to the production link with the variable', () => {
-    const mainnet = { ...base, ZETRIX_NETWORK: 'zetrix:mainnet', MYID_VERIFY_LINK_TEMPLATE: PROD_LINK } as NodeJS.ProcessEnv
-
-    expect(loadConfig(mainnet).myidVerifyLinkTemplate).toBe(PROD_LINK)
+    expect(MAINNET_MYID_VERIFY_LINK_TEMPLATE).toBe(PROD_LINK)
+    expect(checkVerifyLinkTemplate(MAINNET_MYID_VERIFY_LINK_TEMPLATE)).toBeNull()
   })
 
   it('is overridden by MYID_VERIFY_LINK_TEMPLATE, on either network', () => {
@@ -484,11 +644,11 @@ describe('MYID_VERIFY_LINK_TEMPLATE', () => {
     expect(loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet', MYID_VERIFY_LINK_TEMPLATE: own } as NodeJS.ProcessEnv).myidVerifyLinkTemplate).toBe(own)
   })
 
-  it('falls back when the variable is blank: to the UAT link on testnet, to nothing on mainnet', () => {
+  it('falls back when the variable is blank: to the UAT link on testnet, to the production link on mainnet', () => {
     expect(loadConfig({ ...base, MYID_VERIFY_LINK_TEMPLATE: '   ' } as NodeJS.ProcessEnv).myidVerifyLinkTemplate).toBe(UAT_LINK)
     expect(
       loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet', MYID_VERIFY_LINK_TEMPLATE: '   ' } as NodeJS.ProcessEnv).myidVerifyLinkTemplate,
-    ).toBeUndefined()
+    ).toBe(PROD_LINK)
   })
 
   it('builds a default link the wallet itself accepts', async () => {
@@ -544,4 +704,40 @@ describe('MYID_VERIFY_LINK_TEMPLATE', () => {
     })
   })
 
+})
+
+// binding the presentation to the verifier's session is on unless it is switched off.
+describe('X401_BIND_PRESENTATION', () => {
+  const base = { ZETRIX_NETWORK: 'zetrix:testnet', HSM_PASSWORD: 'pw123456' } as NodeJS.ProcessEnv
+
+  it('is on by default, and off only when it says false', () => {
+    expect(deriveBindPresentation(undefined)).toBe(true)
+    for (const off of ['false', 'FALSE', ' false ', '0', 'no']) expect(deriveBindPresentation(off), off).toBe(false)
+    for (const on of ['true', '1', 'yes', 'TRUE']) expect(deriveBindPresentation(on), on).toBe(true)
+  })
+
+  it('stays ON for a value that is not true or false, and says so on stderr', () => {
+    const w = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+    try {
+      for (const typo of ['off', 'flase', 'disable']) expect(deriveBindPresentation(typo), typo).toBe(true)
+      const cfg = loadConfig({ ...base, X401_BIND_PRESENTATION: 'off' } as NodeJS.ProcessEnv)
+      expect(cfg.bindPresentation).toBe(true)
+      expect(w.mock.calls.map((c) => String(c[0])).join('')).toContain('X401_BIND_PRESENTATION must be true or false')
+    } finally {
+      w.mockRestore()
+    }
+  })
+
+  it('reads false from the environment, and stays quiet for a recognised value or none', () => {
+    const w = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+    try {
+      expect(loadConfig({ ...base, X401_BIND_PRESENTATION: 'false' } as NodeJS.ProcessEnv).bindPresentation).toBe(false)
+      expect(loadConfig({ ...base, X401_BIND_PRESENTATION: 'true' } as NodeJS.ProcessEnv).bindPresentation).toBe(true)
+      expect(loadConfig({ ...base, X401_BIND_PRESENTATION: '  ' } as NodeJS.ProcessEnv).bindPresentation).toBe(true)
+      expect(loadConfig(base).bindPresentation).toBe(true)
+      expect(w.mock.calls.map((c) => String(c[0])).join('')).not.toContain('X401_BIND_PRESENTATION')
+    } finally {
+      w.mockRestore()
+    }
+  })
 })

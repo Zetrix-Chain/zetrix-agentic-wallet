@@ -8,7 +8,7 @@
  *
  * NO SECRET MATERIAL, EVER. Not the HSM password, not the signature, not the blob.
  * Phases 2 and 3 do require `ownerHsmPassword` on the wire (phase 3: the permit is signed at the moment of
- * writing and `hsm.key_registry` will not release the key without it; phase 2: the owner proof
+ * writing and `hsm.key_registry` will not release the key without it; phase 2, the owner proof
  * against payment replay) — but that password comes from
  * session configuration at call time and never passes through this store. If one of these files
  * leaks, all it reveals is that a write is pending.

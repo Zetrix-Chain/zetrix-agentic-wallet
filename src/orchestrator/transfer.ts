@@ -28,7 +28,7 @@
  * An earlier revision of this comment said a transfer was "bounded by nothing but these guards".
  * That was true when it was written and is no longer the design.
  *
- * WALLET BE NOW ENFORCES, WHEN IT IS SWITCHED ON (`policy.pep.enabled`). It ships ON for dev and OFF
+ * WALLET BE NOW ENFORCES, WHEN IT IS SWITCHED ON. It ships ON for dev and OFF
  * for test, UAT and prod, so whether a given deployment enforces is a deployment setting this file cannot
  * see — which is why the per-call cap above still matters. When it does enforce, a refusal arrives through
  * `sign` as HTTP 200 with a numeric `errorCode`: 1000033 for a DENY (a decision), 1000034 when the policy

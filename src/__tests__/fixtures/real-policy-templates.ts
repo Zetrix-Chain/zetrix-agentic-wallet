@@ -5,7 +5,7 @@
  * `ZTX3WfTbuZwsLQDWe4f7mzrfULiNdDU84BLJ5` (Zetrix testnet), via
  * `listTemplateKeys` → `["native-v1","ztp20-v1"]` then `getTemplate` for each.
  *
- * WHY THIS FILE EXISTS. An earlier change shipped `policy_preflight` before any template existed on chain, so
+ * WHY THIS FILE EXISTS. an earlier change shipped `policy_preflight` before any template existed on chain, so
  * its vocabulary was invented from a field guide and then pinned by fixtures using the same invented
  * values — `uint`, `bool`, `RECIPIENT_LIST`. The tests were thorough, self-consistent, and validated
  * against nothing real. Measured against these templates, the type check and the empty-list blocker
@@ -124,7 +124,7 @@ export const GET_POLICY_ENVELOPE = {
  * above `INFORMATIONAL_ATTRIBUTES`; an earlier version of this header quietly restated the
  * discarded reasoning instead, and got the arithmetic wrong doing it — 11 + 3 = 14, not 13 — which
  * reads as a missing row and invites someone to add `approvalPolicy` to `ZTP20_V1`, silently
- * changing what `policy_preflight` treats as declared for every ZTP20 draft
+ * changing what `policy_preflight` treats as declared for every ZTP20 draft (an earlier change round 5,
  * APP-M02).
  *
  * WHY THIS EXISTS AS A FIXTURE rather than a literal in a test. `payToAllowlist` is in the

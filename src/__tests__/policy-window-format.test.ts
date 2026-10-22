@@ -141,7 +141,7 @@ describe('windowHint — only exact words, never a guess', () => {
   })
 })
 
-// ── review findings ──────────────────────────────────────────────────────────────────
+// ── review findings on an earlier change ──────────────────────────────────────────────────────────────────
 
 describe('a padded value is refused, not trimmed', () => {
   // The write validator trims before it parses; Spring's DurationStyle does not, and whether the decision-time

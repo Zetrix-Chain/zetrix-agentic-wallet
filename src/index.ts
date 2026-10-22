@@ -23,8 +23,8 @@ import { PaymentEngine, BlobBuilder } from 'x402-zetrix-client'
 import { keypair } from 'zetrix-encryption-nodejs'
 import type { PayRequest as X402PayRequest, WalletConfigData, ZetrixNodeConfig } from 'x402-zetrix-client'
 import { X401Wallet, type ZetrixNetwork } from 'x401-zetrix-client'
-import ZtxChainSDK from 'zetrix-sdk-nodejs'
-import { loadConfig, resolveTokenAddress, knownTokensFor, type AgenticWalletConfig } from './config.js'
+import { createNodeSdk, secureNodeForPaymentEngine } from './node-connection.js'
+import { loadConfig, resolveTokenAddress, knownTokensFor, isKnownNetwork, networkFromEnv, walletBeUrlForNetwork, type AgenticWalletConfig } from './config.js'
 import { resolveAssetSymbol, resolveAssetInfo, formatHumanAmount, fetchTokenInfo, type ContractQuery } from './clients/token-info-client.js'
 import { queryContract as runContractQuery, type ContractQueryInput, type ContractQueryResult } from './clients/contract-query-client.js'
 import {
@@ -34,9 +34,10 @@ import {
   type TokenBalanceResult,
 } from './clients/token-balance-client.js'
 import { fetchTemplateFields, type NodeMetaQuery } from './clients/template-info-client.js'
-import { WalletBeClient } from './clients/wallet-be-client.js'
+import { WalletBeClient, WalletBeError } from './clients/wallet-be-client.js'
 import { WalletBeSigner } from './signer.js'
-import { MbiVpAdapter, type VcPresentInput } from './clients/mbi-vp-adapter.js'
+import { createFsPresentedNonceStore } from './clients/presented-nonce-store.js'
+import { createX401WalletFactory } from './x401-wallet-factory.js'
 import { MbiClient, type PayRequirement } from './clients/mbi-client.js'
 import { ZidResolverClient } from './clients/zid-resolver-client.js'
 import { resolveIssuerProofKeys } from './clients/resolve-issuer-proof-keys.js'
@@ -45,18 +46,31 @@ import { createHeldCredentialFinder } from './held-credential.js'
 import { createVerificationLink } from './orchestrator/verification-qr.js'
 import { renderQrPng } from './qr-png.js'
 import { createFsQrFileStore } from './qr-file-store.js'
+import { createCredentialStatusChecker } from './orchestrator/credential-status.js'
 import type { TransferDeps } from './orchestrator/transfer.js'
 import { createPayer, policyWriteUrlRefusal, type PayFetch } from './orchestrator/pay.js'
 import { PaymentCapError, formatCapRefusal } from './payment-guard.js'
-import { assertWithinCapUnlessGoverned, buildPolicyGoverns } from './policy-cap-bypass.js'
+import { assertWithinCapUnlessGoverned, buildPolicyGoverns, policyCapBypassNotice } from './policy-cap-bypass.js'
 import { payWithReadinessCheck, PaymentReadinessError } from './payment-readiness.js'
 import { resolveHolder } from './orchestrator/resolve-holder.js'
-import { resolveStartupEnv } from './startup-env.js'
+import { mergeStartupEnv, resolveStartupEnv } from './startup-env.js'
 import { loadConfigFileEnv } from './config-file.js'
 import { generateHsmPassword } from './hsm-password.js'
 import { exportCredentials } from './export-credentials.js'
 import { createFsVcCache } from './clients/vc-cache.js'
-import { createFsAccountStore } from './clients/account-store.js'
+import type { StoredAccount } from './clients/account-store.js'
+import { acquireCreationLock, createFsCreationLock } from './account-lock.js'
+import {
+  accountFileName,
+  createAccountFiles,
+  LEGACY_ACCOUNT_FILE,
+  createNetworkAccountStore,
+  explainHolderFailure,
+  probeOwnership,
+  readAccountForExport,
+  resolveNetworkAccount,
+} from './account-resolution.js'
+import { createDegradedServer, flattenError } from './degraded-server.js'
 import { buildToolContent } from './tool-result.js'
 import { SsivcClient } from './clients/ssivc-client.js'
 import { createFsSsivcSessionStore } from './clients/ssivc-session-store.js'
@@ -105,7 +119,9 @@ export function buildToolList() {
       description:
         'Report the holder DID/address/network and the client-supplied held credentials. With `token`, ' +
         'also returns that token\'s balance and its contract address (`tokenAddress`) — the value a policy\'s ' +
-        'tokenAddress needs, so the user never has to be asked for it. Report a balance to the user as its `display` amount only.',
+        'tokenAddress needs, so the user never has to be asked for it. Report a balance to the user as its `display` amount only. ' +
+        'It also returns `credentialStatus`, one entry per held credential (at most ten): "active", "revoked" (the issuer has revoked it: tell the user, it is likely to be refused) ' +
+        'or "unknown" (the check could not be made, which is a warning and not a finding). The credentials themselves are returned untouched.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -119,7 +135,10 @@ export function buildToolList() {
       name: 'prove_identity',
       description:
         'Answer an x401 PROOF-REQUEST and return the PROOF-RESPONSE header to replay to the resource server. ' +
-        'If the wallet holds several credentials, pass vc: use the one the request or the verifier\'s challenge names, and if it names none, prefer the Verified AI Birthcert over the Basic one and say which one you presented.',
+        'If the wallet holds several credentials, pass vc: use the one the request or the verifier\'s challenge names, and if it names none, prefer the Verified AI Birthcert over the Basic one and say which one you presented. ' +
+        'The result carries `credentialStatus`: the wallet asks the issuer\'s service whether the credential has been revoked and only WARNS. ' +
+        'If `credentialStatus.state` is "revoked" the proof was still made, but a verifier is likely to refuse it: tell the user and ask whether they want a new credential. ' +
+        'If it is "unknown" the check could not be made (the credential was used anyway); say so only if the verifier then refuses it.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -151,6 +170,8 @@ export function buildToolList() {
         'This is the MyID wallet, not the MyDigital ID app that confirms a Verified AI Birthcert owner: never name one for the other. ' +
         "In a chat channel such as WhatsApp, send the QR code by attaching the file at qrCodePath; never send any other image as the QR code, because the credential's pass design is not one, and if you cannot attach an image, give the link and say plainly that you could not send the QR code. " +
         "When the credential has a saved pass design, the result also carries vcPassImagePaths: if the user wants to see the credential itself, send that image too, as its own picture captioned as the credential's pass design and never as the QR code. " +
+        'The result carries `credentialStatus`: the wallet asks the issuer\'s service whether the credential has been revoked and only warns, so a link is still made. ' +
+        'If it says "revoked" the message says so: tell the user plainly, because whoever opens the link will see a revoked credential. ' +
         'If it returns created: false, relay the reason and do not invent a link.',
       inputSchema: {
         type: 'object',
@@ -860,7 +881,8 @@ export function buildToolList() {
         'Obtain a VC from MBI: build the signed payload, pay x402, and return the issued credential. If a ' +
         'spending policy refuses the fee, the result has `policyDenied: true` (a decision: do not retry) or ' +
         '`policyCheckUnavailable: true` (transient: trying again shortly is right); either way nothing was paid and ' +
-        'no credential was issued. If a ' +
+        'no credential was issued. A credential returned from the cache also carries `credentialStatus` (the issuer may have revoked it since it ' +
+        'was issued): if it says "revoked", tell the user before reusing it and offer to replace it. If a ' +
         'still-valid credential for this templateId is already cached locally, it is returned with no payment as ' +
         '{ issued: false, alreadyHeld: true, fromCache: true, reason }: the user already has it, so never tell the user it was just issued. ' +
         'If it carries different values from the ones asked for (a different username, say), `differsFromRequest` lists them: ' +
@@ -988,8 +1010,8 @@ export function buildToolList() {
         'Start a Verified AI Birthcert issuance session with myid (MyDigital ID owner verification). ' +
         'The owner confirms in the MyDigital ID app, not the MyID wallet (that is only for the QR from create_verification_qr); never name one for the other. ' +
         'ALWAYS run credential_preflight for "verified_ai_birthcert" immediately before calling this, ' +
-        'even if you checked earlier in the conversation — preflight is free, this tool spends real ' +
-        'funds, and a balance the user topped up a minute ago is not the balance you read before that. ' +
+        'even if you checked earlier in the conversation — preflight is free, this tool can spend real ' +
+        'funds when the check says a fee applies, and a balance the user topped up a minute ago is not the balance you read before that. ' +
         'If a spending policy refuses the session fee, the result is { error } with `policyDenied: true` ' +
         '(a decision: do not retry) or `policyCheckUnavailable: true` (transient: trying again shortly is right); ' +
         'either way nothing was paid and no session was created. ' +
@@ -1022,7 +1044,8 @@ export function buildToolList() {
         'does not pay again either: it reuses the payment already made, which is only used up once the credential is ' +
         'issued. Every session result says so in `paidThisCall` (true only when THIS call sent a payment), and ' +
         '`message` opens with "No new payment" when it did not. Count a fee only when paidThisCall is true: never tell ' +
-        'the user they paid once per link. This tool spends ' +
+        'the user they paid once per link. When the check says no payment is needed, this tool creates the session directly: there is no price to confirm, `paidThisCall` is false and `message` opens with "No payment was needed". ' +
+        'When the check says a fee applies, this tool spends ' +
         'real funds: it self-pays an x402 challenge, subject to the same credential-issuance payment ' +
         'cap as subscribe_and_issue, which by default allows at most 1 JMYR for one payment. Set ' +
         'MAX_PAYMENT_AMOUNT to override it; a spending policy that governs the asset replaces the default cap. ' +
@@ -1118,13 +1141,14 @@ export function buildToolList() {
           dryRun: {
             type: 'boolean',
             description:
-              'Ask the price WITHOUT paying. Returns { quote: { asset, maxAmountRequired, payTo, gasModel } } ' +
+              'Ask the price WITHOUT paying. Returns { quote: { asset, maxAmountRequired, payTo, gasModel, paymentRequired } } ' +
               'and spends nothing, creates no session, and starts no verification — so you can tell the user ' +
               'the cost before collecting anything. `maxAmountRequired` is in the asset\'s RAW base units; ' +
               'resolve decimals (wallet_status returns `display`) before quoting a figure to a human. ' +
-              'A quote does NOT reserve the name and does NOT check whether it is already taken — myid checks ' +
-              'uniqueness only at issuance, so a name already in use still quotes cleanly. `agentName` is still ' +
-              'required because the server rejects a request without one, but the fee does not depend on it.',
+              'When `paymentRequired` is false the service is not charging: the amount is only indicative and the user ' +
+              'will not be asked to pay. A quote does NOT reserve the name and does NOT check whether it is already ' +
+              'taken. `agentName` is still required by this tool, but the fee does not depend on it. ' +
+              'A service with no quote route can only be priced by a session request: it is sent a throwaway name, never the name the user gave, and a service that is not charging then makes a session nobody receives.',
           },
           discardStuckReceiptAndPayFresh: {
             type: 'string',
@@ -1183,7 +1207,7 @@ export function buildToolList() {
       name: 'credential_preflight',
       description:
         'FREE readiness check — call this FIRST, before collecting ANY application detail from the user, ' +
-        'whenever they ask for a credential. Spends nothing, signs no transaction, creates no session. ' +
+        'whenever they ask for a credential. Spends nothing, signs no transaction, creates no session for the user. ' +
         'Returns { ready, fee, balances, cap, schema?, alreadyHeld?, unusedPayment?, blockers, notChecked }: the live fee and which side ' +
         'pays gas, the balances that matter, whether the spending limit permits it, and — for a template ' +
         'credential — the attributes it requires. `blockers` lists EVERY reason it is not ready at once ' +
@@ -1398,7 +1422,7 @@ type Payer = (accept: PayRequirement) => Promise<string>
  * Builds every consumer of the two payment-cap maps in one place — the auto-pay closures AND the
  * read-only map `credential_preflight` reports against — so no line in `main()` (istanbul-ignored,
  * live-wiring-only) ever pairs a cap with a payer on its own. `pay_and_fetch` pays whatever an
- * ARBITRARY url demands, so it keeps its own map (1 JMYR per call by default); credential issuance pays a
+ * ARBITRARY url demands, so it keeps its own map; credential issuance pays a
  * known issuer, so it gets the (possibly more permissive) issuance map, and preflight must report
  * against that same map or it and the guard enforcing it could disagree.
  *
@@ -1475,7 +1499,7 @@ export function buildTransactionLookup(
  * in `main()`, and deleting it leaves both tools unwired. What the shape buys is that the BODY —
  * which client, which store, which payer — is a function a test can call directly, and one now
  * does. The remaining gap is `main()`'s dep object as a whole, which is untested here exactly as
- * it is for buildAddressValidator and buildTransferSafetyWiring; it was recorded as tracked,
+ * it is for buildAddressValidator and buildTransferSafetyWiring; an earlier change recorded it as tracked,
  * not done, and that is still true.
  *
  * THE PAYER COMES FROM buildPayers. `pay` here is `payForPolicyWrite`, built from the same
@@ -1520,7 +1544,7 @@ export function buildPolicyWriteDeps(input: {
   policyGoverns?: (asset: string) => Promise<boolean>
   /**
    * The Policy Registry, through which one of the owner's policies is read for update_policy and remove_policy. Absent where
-   * the policy contracts are not deployed: an update then refuses rather than paying for something it cannot check.
+   * no Registry is configured (a network with no deployment): an update then refuses rather than paying for something it cannot check.
    */
   policyRegistryAddress?: string
   /**
@@ -1708,7 +1732,7 @@ export function buildAddressValidator(
  * inherits anyRequest().authenticated(), and this wallet holds no BaaS token. Guessing a host
  * would turn "nobody has wired this up" into a connection error, which reads like a transient
  * fault rather than a missing integration — the same honesty convention as
- * derivePolicyRegistryAddress returning undefined on mainnet.
+ * derivePolicyRegistryAddress returning undefined on a network with no deployment.
  *
  * With no client, check_policy_decision answers "undetermined" and says why. It never answers
  * "permitted".
@@ -1794,7 +1818,7 @@ export function buildPayers(
     // it tempting to file beside credential issuance — but the credential allowance exists to let
     // a wallet buy CREDENTIALS, and a policy write drawing on it would spend an allowance granted
     // for something else. maxPaymentAmount is the map a user raises when they mean "this wallet
-    // may spend", and it defaults to 1 JMYR per call on both networks (now; it was refuse-all on mainnet), a limit for a
+    // may spend", and it defaults to 1 JMYR per call on both networks (it was refuse-all on mainnet), a limit for a
     // path that puts a spending policy on chain.
     payForPolicyWrite: makePay(config.maxPaymentAmount),
     preflightCaps: config.credentialIssuanceCaps,
@@ -1846,6 +1870,9 @@ export function asPayRequest(accept: PayRequirement): X402PayRequest {
   return { ...(accept as Record<string, unknown>), extra: { gasModel: 'client', ...normalizedExtra } } as unknown as X402PayRequest
 }
 
+/** Set while this process holds the lock around creating an account; released once the account is saved, or if the start fails. */
+let releaseCreationLock: (() => Promise<void>) | undefined
+
 /* istanbul ignore next — live wiring, exercised by the 4.5 integration/manual smoke test. */
 async function main(): Promise<void> {
   // Local store for a holder account created via create_holder_account or first-run
@@ -1862,14 +1889,30 @@ async function main(): Promise<void> {
     fileEnv.ZETRIX_WALLET_STATE_DIR ??
     join(homedir(), '.agentic-wallet-mcp')
   ).replace(/\/+$/, '')
-  const accountStore = createFsAccountStore(join(stateDir, 'account.json'))
+  // Accounts are kept per network (account.testnet.json, account.mainnet.json). The network is read here, before
+  // the config loads, because the saved account is one of the config's inputs; `loadConfig` still rejects a value it
+  // does not know. The network comes from the same merged environment, read the same way, that loadConfig will see: a blank
+  // process value overrides the file's and then reads as unset, so the file's network must not be used in that case.
+  const accountFiles = createAccountFiles(stateDir)
+  const startupEnv = mergeStartupEnv(fileEnv, process.env)
+  const requestedNetwork = networkFromEnv(startupEnv)
+  const accountStore = createNetworkAccountStore(accountFiles, requestedNetwork)
 
   // Backup path for a self-provisioned wallet, before any server setup: it needs no password,
   // no network and no Wallet BE. Writing to stdout is safe here precisely because this branch
   // never starts the MCP server, so there is no protocol stream to corrupt.
   if (process.argv[2] === 'export-credentials') {
     const { exitCode } = await exportCredentials({
-      getAccount: () => accountStore.get(),
+      getAccount: async () => {
+        const found = await readAccountForExport(accountFiles, requestedNetwork)
+        if (found?.legacy) {
+          process.stderr.write(
+            `agentic-wallet-mcp: exporting the account in ${LEGACY_ACCOUNT_FILE}, which records no network. It may belong to testnet or mainnet; ` +
+              `the wallet has not been started on ${requestedNetwork} since accounts were kept per network.\n`,
+          )
+        }
+        return found?.account ?? null
+      },
       isTty: Boolean(process.stdout.isTTY),
       write: (s) => process.stdout.write(s),
       writeErr: (s) => process.stderr.write(s),
@@ -1877,7 +1920,39 @@ async function main(): Promise<void> {
     process.exit(exitCode)
   }
 
-  const storedAccount = process.env.ZETRIX_ADDRESS ? null : await accountStore.get()
+  // Which saved account belongs to this network. An account saved before accounts were kept per network has no network
+  // on it, so it is placed by asking the Wallet BEs; if that cannot be settled the start stops with a message rather
+  // than creating an account the user may not want (see account-resolution.ts).
+  let storedAccount: StoredAccount | null = null
+  if (!startupEnv.ZETRIX_ADDRESS && isKnownNetwork(requestedNetwork)) {
+    const walletBeOverride = startupEnv.WALLET_BE_URL?.trim().replace(/\/+$/, '')
+    const resolved = await resolveNetworkAccount(
+      {
+        files: accountFiles,
+        probe: async (network, account) => {
+          // A private Wallet BE is only known for the configured network. Asking the built-in public host about the other
+          // network would send this account's password to a host the user never configured, so that answer is "unknown".
+          if (network !== requestedNetwork && walletBeOverride) return 'unknown'
+          const client = new WalletBeClient(network === requestedNetwork && walletBeOverride ? walletBeOverride : walletBeUrlForNetwork(network))
+          return probeOwnership((m, a, p) => client.signMessage(m, a, p), account)
+        },
+        log: (s) => process.stderr.write(s),
+      },
+      requestedNetwork,
+    )
+    storedAccount = resolved.kind === 'saved' ? resolved.account : null
+    if (!storedAccount) {
+      // A new account is about to be created. Hold a lock while it is, so a second wallet process starting now waits for
+      // this account and uses it instead of creating one of its own (see account-lock.ts).
+      const lockName = `${accountFileName(requestedNetwork)}.lock`
+      const lock = await acquireCreationLock(
+        createFsCreationLock(join(stateDir, lockName), () => accountStore.get(), (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms))),
+        { lockName },
+      )
+      if (lock.kind === 'found') storedAccount = lock.account
+      else releaseCreationLock = lock.release
+    }
+  }
   const { env, passwordGenerated } = resolveStartupEnv({
     processEnv: process.env,
     storedAccount,
@@ -1886,7 +1961,10 @@ async function main(): Promise<void> {
   })
 
   const config = loadConfig(env)
+  const capBypassNotice = policyCapBypassNotice(config)
+  if (capBypassNotice) process.stderr.write(capBypassNotice)
   const hsmPassword = config.hsmPassword
+  const accountPath = join(stateDir, accountFileName(config.network))
 
   const be = new WalletBeClient(config.walletBeUrl)
   const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
@@ -1903,12 +1981,19 @@ async function main(): Promise<void> {
       sleep,
     },
     { zetrixAddress: config.zetrixAddress, holderDid: config.holderDid, hsmPassword },
-  )
+  ).catch((err: unknown) => {
+    throw explainHolderFailure(err, { address: config.zetrixAddress, network: config.network, walletBeUrl: config.walletBeUrl })
+  })
   if (created) {
-    await accountStore.set({ zetrixAddress, holderDid, hsmPassword, createdAt: new Date().toISOString() })
+    try {
+      await accountStore.set({ zetrixAddress, holderDid, hsmPassword, createdAt: new Date().toISOString() })
+    } finally {
+      await releaseCreationLock?.()
+      releaseCreationLock = undefined
+    }
     process.stderr.write(
       `agentic-wallet-mcp: no ZETRIX_ADDRESS was set — created a new HSM account and saved it to ` +
-        `~/.agentic-wallet-mcp/account.json; it will be reused automatically next run. ` +
+        `${accountPath}; it will be reused automatically next run. ` +
         `ZETRIX_ADDRESS=${zetrixAddress} (HOLDER_DID=${holderDid} is optional; it re-derives automatically).` +
         (passwordGenerated
           ? ` An HSM password was generated for this account — you never need to enter it, but it is the ` +
@@ -1918,7 +2003,7 @@ async function main(): Promise<void> {
     )
   } else if (storedAccount && config.zetrixAddress === storedAccount.zetrixAddress) {
     process.stderr.write(
-      `agentic-wallet-mcp: using the holder account saved in ~/.agentic-wallet-mcp/account.json ` +
+      `agentic-wallet-mcp: using the holder account saved in ${accountPath} ` +
         `(ZETRIX_ADDRESS=${zetrixAddress}) — no ZETRIX_ADDRESS/HSM_PASSWORD was set in the MCP config.\n`,
     )
   }
@@ -1943,7 +2028,11 @@ async function main(): Promise<void> {
 
   // Read-only on-chain contract query (same node + call path x402 uses for balance lookups),
   // used to resolve an x402 asset's real token symbol from its ZTP20 `contractInfo`.
-  const sdk = new ZtxChainSDK({ host: config.nodeHost, port: config.nodePort })
+  const sdk = createNodeSdk(config)
+  // x402-zetrix-client builds its own SDK (plain http) for nonce, fee and balance lookups, which the mainnet node refuses.
+  if (!secureNodeForPaymentEngine(PaymentEngine as never, config.nodeSecure)) {
+    process.stderr.write('agentic-wallet-mcp: could not switch the payment library to https; transfers and x402 payments may fail on mainnet.\n')
+  }
   const contractQuery: ContractQuery = (a) => sdk.contract.call(a)
   const resolveSymbol = (asset: string) => resolveAssetSymbol(asset, contractQuery)
 
@@ -1968,7 +2057,7 @@ async function main(): Promise<void> {
   // the agentDid auto-fill and to catch a missing required field. Fail-open (required-fields
   // check)/fail-closed (agentDid auto-fill): any fetch/parse error resolves to null inside the
   // client (see template-info-client).
-  const nodeBaseUrl = `https://${config.nodeHost}${config.nodePort ? `:${config.nodePort}` : ''}`
+  const nodeBaseUrl = `${config.nodeSecure ? 'https' : 'http'}://${config.nodeHost}${config.nodePort ? `:${config.nodePort}` : ''}`
   const nodeMetaQuery: NodeMetaQuery = (url) => fetch(url, { headers: { Accept: 'application/json' } }).then((r) => r.json())
   const resolveTemplateFields = (templateId: string) =>
     fetchTemplateFields(templateId, config.templateRegistryAddress, nodeBaseUrl, nodeMetaQuery)
@@ -2001,7 +2090,7 @@ async function main(): Promise<void> {
   // maxAmountRequired, enforced regardless of what the calling agent was told to do.
   //
   // Built per-caps rather than shared, so each surface can carry its own default. `pay_and_fetch` pays whatever an ARBITRARY
-  // url demands (it was refuse-all by default on mainnet and is 1 JMYR per call on both networks); credential
+  // url demands; credential
   // issuance pays a known issuer for a known credential (1 JMYR per call, the credential fee). Today the two defaults are the
   // same; an explicit MAX_PAYMENT_AMOUNT makes them one identical ceiling either way (see config.ts). Which map goes to which closure/consumer is
   // decided entirely inside buildPayers below, which is why that pairing must not be
@@ -2077,7 +2166,7 @@ async function main(): Promise<void> {
     }
   }
 
-  // `pay` (pay_and_fetch, arbitrary URLs — 1 JMYR per call by default), `payForCredential`
+  // `pay`, `payForCredential`
   // (a known issuer — carries the credential-fee allowance on both networks) and `preflightCaps`
   // (the read-only map credential_preflight reports against) all come from one call so nothing
   // else in main() pairs a cap map with what consumes it.
@@ -2100,9 +2189,7 @@ async function main(): Promise<void> {
   // survives a restart. As of 2026-08-17 the session-create call needs no bearer token — it's
   // gated by x402 instead (see docs/verified-birthcert-vc/SPEC.md §5.0), so payment readiness/cap
   // checks (this same `pay` closure) are what gate spending. Wiring itself is gated on
-  // `config.ssivcBaseUrl` being set: it's undefined on mainnet unless explicitly overridden
-  // (the mainnet host was never actually confirmed reachable), so the feature reports
-  // itself as not configured there rather than being wired against an unverified endpoint.
+  // `config.ssivcBaseUrl` being set, which it always is: both networks have a built-in host.
   const verifyAiBirthcert = config.ssivcBaseUrl
     ? (() => {
         const ssivcSessionStore = createFsSsivcSessionStore(join(config.stateDir, 'ssivc-session.json'))
@@ -2164,11 +2251,21 @@ async function main(): Promise<void> {
     return { publicKey, signedData: signBlob }
   }
 
-  const makeWallet = (present: VcPresentInput): X401Wallet =>
-    new X401Wallet(
-      { oid4vpBaseUrl: config.oid4vpBaseUrl, network: config.network as ZetrixNetwork },
-      { signer, vc: new MbiVpAdapter(mbi, walletBeSignerFn, messageSigner, resolveIssuerKeys, present), submitAuth },
-    )
+  // The verifier challenges this wallet has answered: each nonce is answered once (see presented-nonce-store.ts). One file per claim, so
+  // two wallet processes sharing this state directory cannot lose each other's claims.
+  const answeredChallenges = createFsPresentedNonceStore(join(config.stateDir, 'presented-nonces'))
+
+  // The factory (x401-wallet-factory.ts) adds the audience (the configured verifier's origin) and the answered-challenges store.
+  const makeWallet = createX401WalletFactory({
+    config,
+    mbi,
+    signer,
+    signHexBlob: walletBeSignerFn,
+    signMessage: messageSigner,
+    resolveIssuerKeys,
+    submitAuth,
+    answered: answeredChallenges,
+  })
 
   // transfer_token deps. Blob construction is BlobBuilder — the same tested code x402 payments
   // use — and signing is the same Wallet BE HSM path; the only genuinely new primitive is
@@ -2203,9 +2300,9 @@ async function main(): Promise<void> {
      *
      * It is kept, and wired to the general MAX_PAYMENT_AMOUNT bucket rather than the credential
      * one, for two reasons. It fails fast, so an obviously-doomed transfer never reaches the
-     * signer. And Wallet BE does not enforce policy everywhere yet (it is off in prod as shipped). This
-     * DEFAULT cap stands aside for an asset the owner's own policy governs (see policy-cap-bypass.ts), so on a network where
-     * Wallet BE is not enforcing, such a policy removes the only limit a transfer had.
+     * signer. And a Wallet BE does not necessarily enforce policy. This DEFAULT cap stands aside for an asset
+     * the owner's own policy governs (see policy-cap-bypass.ts), so where Wallet BE is not enforcing, such a policy removes
+     * the only limit a transfer had.
      */
     assertWithinCap: (asset, amount) =>
       assertWithinCapUnlessGoverned({ asset, maxAmountRequired: amount }, config.maxPaymentAmount, policyGoverns),
@@ -2304,6 +2401,9 @@ async function main(): Promise<void> {
     checkActivationStatus: (address: string) => be.checkActivationStatus(address),
     sleep,
     cache: vcCache,
+    // Whether the issuer has revoked a credential about to be presented. One signed call to MBI per credential, cached briefly;
+    // it only warns, so a failed or slow check never blocks anything (see orchestrator/credential-status.ts).
+    credentialStatus: createCredentialStatusChecker({ revokeStatus: (vcId) => mbi.revokeStatus(vcId, messageSigner) }),
     createVerificationLink: (input) =>
       createVerificationLink(input, {
         mbi,
@@ -2352,8 +2452,18 @@ async function main(): Promise<void> {
 }
 
 if (process.env.NODE_ENV !== 'test') {
-  main().catch((err: Error) => {
-    process.stderr.write(`agentic-wallet-mcp: fatal — ${err.message}\n`)
-    process.exit(1)
+  main().catch(async (err: unknown) => {
+    await releaseCreationLock?.()
+    const reason = flattenError(err)
+    process.stderr.write(`agentic-wallet-mcp: fatal — ${reason}\n`)
+    // A command that is not the server (export-credentials) must still fail with an exit code, not wait on stdio.
+    if (process.argv[2] === 'export-credentials') process.exit(1)
+    // Exiting here leaves the host with "Connection closed" and the agent with no tools and no reason. Stay up with
+    // the normal tool list, every call of which says why the wallet did not start and does nothing else.
+    try {
+      await createDegradedServer({ reason, version: packageVersion, tools: buildToolList }).connect(new StdioServerTransport())
+    } catch {
+      process.exit(1)
+    }
   })
 }

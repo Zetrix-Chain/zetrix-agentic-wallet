@@ -78,7 +78,7 @@ describe('asPriceConfirmation needs the quoteId', () => {
   })
 })
 
-// Review R1.
+// an earlier change review R1.
 describe('QuoteBook R1', () => {
   const price = { asset: 'ZTX', maxAmountRequired: '1000', payTo: 'ZTX3Pay', gasModel: 'self' as const }
   const binding = { tool: 'subscribe_and_issue' as const, subject: 'did:zid:t-1', details: '{}' }

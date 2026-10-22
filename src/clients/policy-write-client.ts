@@ -20,7 +20,7 @@
  * TypeScript would have to match the contract's re-serialisation byte for byte, and a one-byte
  * difference is an invalid signature discovered only after gas is spent.
  *
- * FOUR PLACES WHERE THE SERVER DIFFERS FROM THE SPEC'S TEXT, all read from `developv2` 2026-09-28
+ * FOUR PLACES WHERE THE SERVER DIFFERS FROM an earlier ticket's TEXT, all read from `developv2` 2026-09-28
  * and all recorded on the ticket:
  *
  *   1. Phase 3 requires `ownerHsmPassword`, which AC #8 says it must not send. The server signs

@@ -1,5 +1,5 @@
 /**
- * The LOW findings from the round-2 review.
+ * an earlier change — the LOW findings from the an earlier change round-2 review.
  */
 import { describe, it, expect } from 'vitest'
 import { checkAgainstVocabulary, isEnforceableAttribute } from '../orchestrator/policy-vocabulary-checks'

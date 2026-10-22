@@ -107,7 +107,7 @@ function human(raw: bigint): string {
 export async function assessSelfPay(deps: SelfPayDeps, call: SelfPayCall): Promise<SelfPayAssessment> {
   const notChecked = [
     'A snapshot: the balance and the network fee can change before the write.',
-    "Whether Wallet BE will sign it: it decides that when it is asked to, and in current versions it does not check a contract call that moves no asset against the spending policy.",
+    "Whether Wallet BE will sign it: it decides that when it is asked to, and it does not check a contract call that moves no asset against the spending policy.",
     'Whether the transaction will succeed once it is included: the gas is spent even if it fails on chain.',
   ]
   const problems: string[] = []

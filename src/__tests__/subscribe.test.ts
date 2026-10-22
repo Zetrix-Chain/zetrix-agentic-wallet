@@ -1730,6 +1730,7 @@ describe('subscribe_and_issue pays only the confirmed price', () => {
   })
 })
 
+// an earlier change review R2.
 describe('subscribe_and_issue R2', () => {
   const base = { templateId: 'did:zid:t-1', attributes: { agentName: 'Jak Sparrow', purpose: 'x401+x402' } }
   const settled = { vcId: 'did:zid:vc', txHash: '0xnew', verifiableCredential: { id: 'vc', validUntil: '2099-01-01T00:00:00Z' } }
@@ -1875,7 +1876,7 @@ it('subscribe_and_issue: a bare quote without a quoteId is refused, and nothing 
   expect(out.needsConfirmation).toBe(true)
 })
 
-// Review R1 (MEDIUM): every unconfirmed call gives a fresh quote, so two valid quotes for one request were easy
+// every unconfirmed call gives a fresh quote, so two valid quotes for one request were easy
 // to hold. With the first one's settle failing after its payment was signed, the second call found nothing held and paid
 // again. Spending a quote now spends every other open quote for the same request.
 describe('subscribe_and_issue: two quotes for one request cannot both pay', () => {
@@ -1914,7 +1915,7 @@ describe('subscribe_and_issue: two quotes for one request cannot both pay', () =
   })
 })
 
-// Review R1 (NIT): the expiry and other-template rules, through the tool, not only the quote book.
+// the expiry and other-template rules, through the tool, not only the quote book.
 describe('subscribe_and_issue: expired and other-template quotes, through the tool', () => {
   const base = { templateId: 'did:zid:t-1', attributes: { agentName: 'Jak Sparrow' } }
   const make = (book: QuoteBook) => {

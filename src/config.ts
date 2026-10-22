@@ -52,6 +52,25 @@ export interface AgenticWalletConfig {
   /** Zetrix RPC node port — empty when using default DNS-mapped hosts. */
   nodePort: string
   /**
+   * Whether the node is reached over https. True for every host except a loopback one, because the SDK uses plain http unless
+   * told otherwise and the mainnet node refuses a POSTed contract call over http. See {@link deriveNodeSecure}.
+   */
+  nodeSecure: boolean
+  /**
+   * Whether an owner's policy that governs an asset stands the default per-call cap aside for it (see policy-cap-bypass.ts).
+   * That is only safe where Wallet BE enforces the policy, so it is on for testnet and mainnet and OFF elsewhere. Set
+   * `POLICY_CAP_BYPASS=false` if the Wallet BE you use does not enforce policies: a policy then no longer limits payments at
+   * all. A value that is not true or false turns it OFF. See {@link derivePolicyCapBypass}.
+   */
+  policyCapBypass: boolean
+  /**
+   * Whether `prove_identity` binds the presentation to the verifier's session: the nonce and the verifier's origin go to MBI, and each
+   * challenge is answered once. On by default; `X401_BIND_PRESENTATION=false` turns it off, for a deployment whose verifier is not ready for it
+   * (a verifier that does not read the holder's key from the holder binding refuses a bound presentation, after it has been signed). A value
+   * that is not true or false is ignored with a warning: binding stays on.
+   */
+  bindPresentation: boolean
+  /**
    * Template-registry account address — the on-chain account whose metadata holds every credential
    * template (`template__<templateId>` → applyFormat). Fixed per network; auto-derived when not set.
    * `subscribe_and_issue` reads it to check a template's required attributes before paying.
@@ -59,13 +78,13 @@ export interface AgenticWalletConfig {
   templateRegistryAddress: string
   /**
    * Policy Registry contract address — the entry point for every policy read (`getPolicyContract`,
-   * `getPolicy`, and the proxied `getTemplate`). `undefined` on mainnet, where the Registry is not
-   * deployed; the policy tools then report the network as unsupported instead of querying.
+   * `getPolicy`, and the proxied `getTemplate`). Built in for testnet and mainnet; `undefined` on any other network unless
+   * `POLICY_REGISTRY_ADDRESS` is set, and the policy tools then report the network as unsupported instead of querying.
    */
   policyRegistryAddress?: string
   /**
    * Policy Template contract address — needed only for `getTemplateById`, which the Registry does
-   * not proxy. `undefined` on mainnet for the same reason as {@link policyRegistryAddress}.
+   * not proxy. Built in for testnet and mainnet, `undefined` elsewhere, for the same reason as {@link policyRegistryAddress}.
    */
   policyTemplateAddress?: string
   /**
@@ -91,9 +110,8 @@ export interface AgenticWalletConfig {
   policyDecisionUrl?: string
   /**
    * The link create_verification_qr hands the user, with `{referenceId}` where the MBI reference id goes —
-   * MyID's universal link, so a phone without the app is sent to the store. On testnet it defaults to the UAT link (see
-   * deriveMyidVerifyLinkTemplate). On mainnet there is **no default** until MyID's production side is verified, and the tool
-   * then refuses before it creates anything on MBI. MYID_VERIFY_LINK_TEMPLATE overrides either.
+   * MyID's universal link, so a phone without the app is sent to the store. Defaults to the UAT link on testnet and to MyID's
+   * production link on mainnet (see deriveMyidVerifyLinkTemplate). MYID_VERIFY_LINK_TEMPLATE overrides either.
    */
   myidVerifyLinkTemplate?: string
   /**
@@ -106,7 +124,7 @@ export interface AgenticWalletConfig {
    * Base URL of the pay-gated policy WRITE endpoint.
    *
    * Public by construction: the two paths live under `/pay/**`, which is gated by on-chain
-   * payment rather than by a JWT, and a bug exposed exactly
+   * payment rather than by a JWT, exposed exactly
    * `/api/pay/policy/adopt-template` and `…/collect` through ms-public-proxy on 2026-09-24 —
    * two exact paths, deliberately not a `/policy/**` wildcard.
    *
@@ -120,7 +138,7 @@ export interface AgenticWalletConfig {
   /**
    * Per-asset x402 auto-pay ceiling, asset -> max raw-unit string, `"*"` as fallback.
    * Defaults to 1 JMYR per call (the JMYR contract of the active network) and refuses every other asset; an explicit
-   * `MAX_PAYMENT_AMOUNT` replaces it. Mainnet now has the same default as testnet.
+   * `MAX_PAYMENT_AMOUNT` replaces it. Mainnet has the same default as testnet.
    * See src/payment-guard.ts.
    */
   maxPaymentAmount: Record<string, string>
@@ -132,26 +150,20 @@ export interface AgenticWalletConfig {
   /**
    * The cap for credential issuance specifically (`subscribe_and_issue`, Verified AI Birthcert).
    * Identical to `maxPaymentAmount` whenever `MAX_PAYMENT_AMOUNT` is set. When it is not, the two defaults are now the
-   * same too (1 JMYR per call); they were different on mainnet, where `maxPaymentAmount` kept `pay_and_fetch`
+   * same too; they were different on mainnet, where `maxPaymentAmount` kept `pay_and_fetch`
    * fail-closed. See `defaultCredentialIssuanceCaps`.
    */
   credentialIssuanceCaps: Record<string, string>
   /**
    * myid's SSIVC "AI Birthcert" session API base URL — backs request_ai_birthcert_verification /
-   * check_ai_birthcert_verification. Auto-derived on testnet only (the only host ever actually
-   * reached and confirmed live); undefined on mainnet unless SSIVC_BASE_URL is set explicitly
-   * (the mainnet host, {@link UNVERIFIED_MAINNET_SSIVC_BASE_URL}, was an assumption by
-   * analogy, never tested). Unset means the AI Birthcert verification tools report themselves as
-   * not configured rather than being wired against an unconfirmed endpoint.
+   * check_ai_birthcert_verification. Derived per network (see deriveSsivcBaseUrl); SSIVC_BASE_URL
+   * overrides it.
    */
   ssivcBaseUrl?: string
   /**
    * The Verified AI Birthcert's on-chain templateId, distinct from the Basic Birthcert's.
-   * Auto-derived on testnet only (confirmed on-chain, see deriveAiBirthcertVerifiedTemplateId);
-   * undefined on mainnet unless AI_BIRTHCERT_VERIFIED_TEMPLATE_ID is set explicitly (a
-   * chain read at the mainnet registry address returned `result: null`, so the id was never
-   * confirmed). Unset means check_ai_birthcert_verification reports a cacheError instead of
-   * caching a mainnet credential under a possibly-wrong key.
+   * Derived per network, both read from chain (see deriveAiBirthcertVerifiedTemplateId);
+   * AI_BIRTHCERT_VERIFIED_TEMPLATE_ID overrides it.
    */
   aiBirthcertVerifiedTemplateId?: string
   /** Which side pays network gas when the resource server offers a choice. Default 'sponsored'. */
@@ -184,6 +196,66 @@ function deriveNodeHost(network: string): string {
   return network.includes('testnet') ? 'test-node.zetrix.com' : 'node.zetrix.com'
 }
 
+/**
+ * Whether an owner's policy may stand the default per-call cap aside. The wallet cannot ask Wallet BE whether it is
+ * enforcing policies, and on a network where it is not, a policy that governs an asset removes the only limit the wallet had,
+ * because the wallet never compares a payment with the policy's own limit. So the answer is per network, on for testnet and
+ * mainnet (where Wallet BE enforces policies) and off for everything else, until `POLICY_CAP_BYPASS` says otherwise.
+ *
+ * FAILS CLOSED. A value that is not true or false (`off`, `flase`, `n`) turns the bypass OFF on every network, never leaves
+ * the default on: an operator who is trying to switch it off must not end up with it on because of a typo. `loadConfig` says so
+ * on stderr. (A blank value is the same as not setting it, like every other setting.)
+ */
+export function derivePolicyCapBypass(network: string, override: string | undefined): boolean {
+  if (override !== undefined && override.trim() !== '') return parseBooleanSetting(override) ?? false
+  return isTestnet(network) || network === 'zetrix:mainnet'
+}
+
+/** `X401_BIND_PRESENTATION`: on unless it says false. A value that is not true or false leaves it on (the loader warns). */
+export function deriveBindPresentation(override: string | undefined): boolean {
+  return parseBooleanSetting(override) ?? true
+}
+
+/** A node host with its optional `:port` taken off, lower-cased: `localhost:19333` -> `localhost`, `[::1]:19333` -> `[::1]`. */
+function nodeHostName(host: string): string {
+  const h = host.trim().toLowerCase()
+  if (h.startsWith('[')) {
+    const end = h.indexOf(']')
+    return end === -1 ? h : h.slice(0, end + 1)
+  }
+  const colons = h.split(':').length - 1
+  return colons === 1 ? h.slice(0, h.indexOf(':')) : h
+}
+
+/** Whether the node is on this machine (`localhost`, `127.0.0.1`, `[::1]`), with or without a port. */
+export function isLoopbackNodeHost(host: string): boolean {
+  const h = nodeHostName(host)
+  return h === 'localhost' || h === '127.0.0.1' || h === '[::1]' || h === '::1'
+}
+
+/** A true/false setting (`ZETRIX_NODE_SECURE`, `POLICY_CAP_BYPASS`) as a boolean, or undefined when unset or not recognised. */
+function parseBooleanSetting(override: string | undefined): boolean | undefined {
+  const v = override?.trim().toLowerCase()
+  if (v === 'true' || v === '1' || v === 'yes') return true
+  if (v === 'false' || v === '0' || v === 'no') return false
+  return undefined
+}
+
+/**
+ * Whether to reach the Zetrix node over https.
+ *
+ * zetrix-sdk-nodejs uses plain http unless `secure: true` is passed. The testnet node accepts that, the mainnet node does not:
+ * it answers a POSTed contract call over http with "request must be in json format", so every contract query failed on mainnet
+ * (a GET such as an account lookup worked either way). Both public nodes answer over https, so https is the default.
+ *
+ * Decided on the host alone: the SDK builds its URL from the scheme and `host` only and ignores a separate `port`. A loopback
+ * host keeps plain http, as before, and a local node on a port is given as `ZETRIX_NODE_HOST=localhost:19333`.
+ * `ZETRIX_NODE_SECURE` (true or false) overrides the default, for a private node reached over http.
+ */
+export function deriveNodeSecure(host: string, override: string | undefined): boolean {
+  return parseBooleanSetting(override) ?? !isLoopbackNodeHost(host)
+}
+
 function deriveZidResolverBaseUrl(network: string): string {
   return network.includes('testnet')
     ? 'https://zid-resolver-sandbox.zetrix.com'
@@ -196,12 +268,8 @@ function deriveWalletBeUrl(network: string): string {
     : 'https://wallet-api.zetrix.com/server'
 }
 
-/**
- * MyID's production universal link, as MyID stated it. UNVERIFIED: not read from the host, and not deployed when it was recorded.
- * Kept as a named constant so confirming it later is a one-line change (return it from deriveMyidVerifyLinkTemplate's mainnet
- * branch) and so a test pins the exact string.
- */
-export const UNVERIFIED_MAINNET_MYID_VERIFY_LINK_TEMPLATE = 'https://myid-verifier.zetrix.com/api/agentic-verify?referenceId={referenceId}'
+/** MyID's production universal link, on the MyID verifier host (the presentation is verified in the MyID app). */
+export const MAINNET_MYID_VERIFY_LINK_TEMPLATE = 'https://myid-verifier.zetrix.com/api/agentic-verify?referenceId={referenceId}'
 
 /**
  * MyID's universal link for create_verification_qr, per network.
@@ -211,15 +279,10 @@ export const UNVERIFIED_MAINNET_MYID_VERIFY_LINK_TEMPLATE = 'https://myid-verifi
  * for com.zetrix.myid.uat), and serves a "open this on your phone" page at that address. The first link the wallet was given,
  * `/v1/agent-verification/{referenceId}`, is claimed by neither: the phone opened the browser and the server answered 404.
  *
- * MAINNET: deliberately none, so create_verification_qr refuses before it creates anything on MBI rather than store a presentation
- * behind a link nobody can open. MyID has stated `https://myid-verifier.zetrix.com/api/agentic-verify?referenceId={referenceId}`
- * (see {@link UNVERIFIED_MAINNET_MYID_VERIFY_LINK_TEMPLATE}), but their production side was not deployed and the host sits behind a
- * Cloudflare browser check, so its association files could not be read. Do NOT wire the constant into this function's return
- * value until the host publishes apple-app-site-association and assetlinks.json for the production app and serves the "open on your
- * phone" page. MYID_VERIFY_LINK_TEMPLATE is the way to opt in before then.
+ * MAINNET: {@link MAINNET_MYID_VERIFY_LINK_TEMPLATE}, MyID's production verifier host (MyID said it is ready).
  */
-function deriveMyidVerifyLinkTemplate(network: string): string | undefined {
-  return network.includes('testnet') ? 'https://ssivc-api-uat.myegdev2.com/api/agentic-verify?referenceId={referenceId}' : undefined
+function deriveMyidVerifyLinkTemplate(network: string): string {
+  return network.includes('testnet') ? 'https://ssivc-api-uat.myegdev2.com/api/agentic-verify?referenceId={referenceId}' : MAINNET_MYID_VERIFY_LINK_TEMPLATE
 }
 
 function deriveMbiBaseUrl(network: string): string {
@@ -237,17 +300,20 @@ function deriveTemplateRegistryAddress(network: string): string {
  * (2026-09-18): the account exists, its `query()` dispatcher exposes getPolicyContract / getPolicy /
  * getTemplate, and a live call returned a well-formed reply.
  *
- * Mainnet returns undefined because the Registry is NOT DEPLOYED there — the same honesty
- * convention as {@link deriveSsivcBaseUrl}. A guessed address would make every read fail in a way
- * that reads as "you have no policy" rather than "this network has no policy system at all", which
- * is precisely the confusion the three-state read result exists to prevent.
+ * Mainnet: the Registry deployed on 2026-10-15 (the one ms-zetrix prod is configured with, `registryAddress` in its
+ * `values-prod.yaml`), read back from chain on 2026-10-16 — its Factory and Template contract are wired and
+ * `getPolicyContract` answers. Any other network returns undefined, an honest "not deployed":
+ * a guessed address would make every read fail in a way that reads as "you have no policy" rather than "this network has no
+ * policy system at all", which is precisely the confusion the three-state read result exists to prevent.
  *
  * The field guide also lists a separate local/dev deployment. Those addresses are deliberately NOT
  * recorded here — POLICY_REGISTRY_ADDRESS is how local testing reaches them, so this file never
  * carries a second environment someone could resolve to by accident.
  */
 export function derivePolicyRegistryAddress(network: string): string | undefined {
-  return isTestnet(network) ? 'ZTX3Z2Fgsssx5fVq5v8EnhTBh6mqxJ8FQFqnk' : undefined
+  if (isTestnet(network)) return 'ZTX3Z2Fgsssx5fVq5v8EnhTBh6mqxJ8FQFqnk'
+  if (network === 'zetrix:mainnet') return 'ZTX3brJxpLuzHSbcNNLi2XrgWsQQQ2EHFZVWQ'
+  return undefined
 }
 
 /**
@@ -262,14 +328,19 @@ export function derivePolicyRegistryAddress(network: string): string | undefined
 /**
  * The pay-gated policy write host, through ms-public-proxy.
  *
- * Testnet is the sandbox proxy, which is where the flow was verified end to end on 2026-09-22.
- * Mainnet returns undefined for the same reason {@link derivePolicyRegistryAddress} does: the
- * policy module is NOT enabled there (`POLICY_REGISTRY_ADDRESS` is empty in the prod profile), so
- * a guessed host would turn "this network has no policy system" into a connection error — and on
- * a write path, a confusing failure is one a user may respond to by trying again and paying.
+ * Testnet is the sandbox proxy, which is where the flow was verified end to end on 2026-09-22. Mainnet is the production proxy,
+ * `https://public-api.zetrix.com/api`, the host the team named for it (2026-10-16); its ingress allowlists the policy routes
+ * (`/pay/policy/*`, GET `/policy/vocabulary`) to ms-zetrix. Every script client tried (Node and curl, with and without a
+ * browser User-Agent, from the VPN and without it) gets a Cloudflare managed challenge on the mainnet API hosts, so the routes
+ * could not be exercised from a script: the first request that gets through is the first real test. A price check (phase 1)
+ * costs nothing, and a self-paid write pays only network gas. Any other network returns undefined, for the same reason
+ * {@link derivePolicyRegistryAddress} does: a guessed host would turn "this network has no policy system configured" into a
+ * connection error — and on a write path, a confusing failure is one a user may respond to by trying again and paying.
  */
 export function derivePolicyWriteUrl(network: string): string | undefined {
-  return isTestnet(network) ? 'https://public-api-sandbox.zetrix.com/api' : undefined
+  if (isTestnet(network)) return 'https://public-api-sandbox.zetrix.com/api'
+  if (network === 'zetrix:mainnet') return 'https://public-api.zetrix.com/api'
+  return undefined
 }
 
 /**
@@ -291,49 +362,49 @@ export function checkPolicyWriteUrl(raw: string): string | undefined {
 }
 
 /**
- * The publisher of the two deployed testnet templates, `native-v1` and `ztp20-v1`.
+ * The publisher of the two deployed templates, `native-v1` and `ztp20-v1`, per network.
  *
- * Read from chain 2026-09-30: `listTemplateKeys` for this address returns both keys, and both
- * derived ids resolve through `getTemplateById`. Undefined off testnet for the same reason as
- * {@link derivePolicyRegistryAddress}.
+ * Testnet, read from chain 2026-09-30: `listTemplateKeys` for this address returns both keys, and
+ * both derived ids resolve through `getTemplateById`. Mainnet, read from chain 2026-10-16: the same
+ * two keys on the mainnet Template contract, with attribute names and types identical to testnet's.
+ * Undefined on any other network, for the same reason as {@link derivePolicyRegistryAddress}.
  */
 export function derivePolicyTemplatePublisher(network: string): string | undefined {
-  return isTestnet(network) ? 'ZTX3QFo5oc3Ep8rdJZKgfPDFNN29qjxn5ofED' : undefined
+  if (isTestnet(network)) return 'ZTX3QFo5oc3Ep8rdJZKgfPDFNN29qjxn5ofED'
+  if (network === 'zetrix:mainnet') return 'ZTX3dco8hFcbYn3k1nxKJXVjeB3soikzNBStm'
+  return undefined
 }
 
 export function derivePolicyTemplateAddress(network: string): string | undefined {
-  return isTestnet(network) ? 'ZTX3WfTbuZwsLQDWe4f7mzrfULiNdDU84BLJ5' : undefined
+  if (isTestnet(network)) return 'ZTX3WfTbuZwsLQDWe4f7mzrfULiNdDU84BLJ5'
+  // Mainnet, read from chain 2026-10-16: the Template contract the mainnet Registry proxies `getTemplate` to, holding
+  // `native-v1` and `ztp20-v1` for the publisher in {@link derivePolicyTemplatePublisher}.
+  if (network === 'zetrix:mainnet') return 'ZTX3P7CKSvPAX33GNJCbDeLz1dGoyjKw4ZAy3'
+  return undefined
 }
 
 /**
- * The mainnet SSIVC host, by analogy with the other services' testnet/mainnet naming — but
- * UNVERIFIED (as of 2026-08-17): nobody has actually reached it and gotten a real response.
- * Kept as a named constant, not inlined, so confirming it later is a one-line change — flip
- * deriveSsivcBaseUrl's mainnet branch to return this — instead of someone having to rediscover
- * the URL from scratch. Do NOT wire this into deriveSsivcBaseUrl's return value until confirmed;
- * SSIVC_BASE_URL is the correct way to opt in before that happens.
+ * The production SSIVC "AI Birthcert" session API (apply and quote). Its sessions and sessions/quote routes were reached on
+ * 2026-10-22 and answer a request with no fields with the service's own validation error.
  */
-export const UNVERIFIED_MAINNET_SSIVC_BASE_URL = 'https://verifyid-api.zetrix.com/api'
+export const MAINNET_SSIVC_BASE_URL = 'https://verifyid-api.zetrix.com/api'
 
-/**
- * myid's SSIVC "AI Birthcert" session API. Testnet confirmed reachable (fetched and read in full
- * 2026-08-13). Returns undefined on mainnet so the caller fails closed rather than wiring the
- * feature against {@link UNVERIFIED_MAINNET_SSIVC_BASE_URL}; set SSIVC_BASE_URL explicitly once
- * that host is confirmed reachable.
- */
-function deriveSsivcBaseUrl(network: string): string | undefined {
-  return network.includes('testnet') ? 'https://ssivc-api-uat.myegdev2.com/api' : undefined
+/** myid's SSIVC "AI Birthcert" session API: the UAT host on testnet, {@link MAINNET_SSIVC_BASE_URL} on mainnet. */
+function deriveSsivcBaseUrl(network: string): string {
+  return network.includes('testnet') ? 'https://ssivc-api-uat.myegdev2.com/api' : MAINNET_SSIVC_BASE_URL
 }
 
 /**
- * `AI_BIRTHCERT_VERIFIED` templateId, deployed 2026-08-05 (`TEMPLATE_ONCHAIN_REFERENCE.md` §2).
- * Testnet id confirmed on-chain. The mainnet id is UNVERIFIED — a chain read at the mainnet
- * registry address returned `result: null` — so this returns undefined on mainnet (as of
- * 2026-08-17) rather than a guessed id a mainnet credential could get cached under incorrectly.
- * Set AI_BIRTHCERT_VERIFIED_TEMPLATE_ID explicitly once the mainnet registry account is confirmed.
+ * The mainnet `AI_BIRTHCERT_VERIFIED` templateId. Read from the mainnet template registry (ZTX3GqJM1U6ifMPonwD4fGvrgoTKJua7b2cKX)
+ * on 2026-10-22: "Verified AI Birthcert", version 1.0.0, the same issuer as the testnet one.
  */
-function deriveAiBirthcertVerifiedTemplateId(network: string): string | undefined {
-  return network.includes('testnet') ? 'did:zid:9641ee92552e9bcec672f300b071ff86d340ac78c83c225e95971cab8108fb80' : undefined
+export const MAINNET_AI_BIRTHCERT_VERIFIED_TEMPLATE_ID = 'did:zid:2d8f9476809fe20de103c43438f738a122ef53665e0b615b7414bdf1f1b19b52'
+
+/**
+ * `AI_BIRTHCERT_VERIFIED` templateId, deployed 2026-08-05 (`TEMPLATE_ONCHAIN_REFERENCE.md` §2). Both ids were read from chain.
+ */
+function deriveAiBirthcertVerifiedTemplateId(network: string): string {
+  return network.includes('testnet') ? 'did:zid:9641ee92552e9bcec672f300b071ff86d340ac78c83c225e95971cab8108fb80' : MAINNET_AI_BIRTHCERT_VERIFIED_TEMPLATE_ID
 }
 
 /**
@@ -352,8 +423,7 @@ const TOKEN_REGISTRY: Record<string, { testnet: string; mainnet: string }> = {
  * **Mainnet now carries the same default as testnet: 1 JMYR per call, everything else refused.** This was
  * refuse-all on mainnet, deliberately, because `pay_and_fetch` is the confused-deputy surface: a prompt-injected or
  * misled agent can point it at a hostile endpoint, and a permissive default auto-pays real value with nobody having
- * configured anything. Giving mainnet the same default is a deliberate decision;
- * what it
+ * configured anything. Giving mainnet the same default is a deliberate decision; what it
  * costs is that an unconfigured mainnet wallet can now be made to pay up to 1 JMYR per call to an arbitrary URL, with no
  * running total. An explicit `MAX_PAYMENT_AMOUNT` replaces it, and a spending policy for JMYR stands it aside.
  *
@@ -406,6 +476,22 @@ function defaultCredentialIssuanceCaps(network: string): Record<string, string> 
  */
 const KNOWN_NETWORKS = ['zetrix:testnet', 'zetrix:mainnet'] as const
 
+/** The `ZETRIX_NETWORK` setting exactly as `loadConfig` reads it: a blank value is unset, and unset is testnet. */
+export function networkFromEnv(env: NodeJS.ProcessEnv): string {
+  const v = env.ZETRIX_NETWORK
+  return v && v.trim() ? v.trim() : 'zetrix:testnet'
+}
+
+/** Whether `network` is one `loadConfig` accepts. Lets a caller skip network-specific work for a value it will reject. */
+export function isKnownNetwork(network: string): boolean {
+  return (KNOWN_NETWORKS as readonly string[]).includes(network)
+}
+
+/** The default Wallet BE for a known network, for asking the OTHER network's Wallet BE about a saved account. */
+export function walletBeUrlForNetwork(network: string): string {
+  return deriveWalletBeUrl(network)
+}
+
 /**
  * Above this, SETTLEMENT_WAIT_BUDGET_MS starts reinstating the long blocking call the 90s default
  * exists to prevent, so it is warned about on stderr. Not a clamp — see the loader.
@@ -445,13 +531,41 @@ export function loadConfig(env: NodeJS.ProcessEnv): AgenticWalletConfig {
   // Testnet by default so a zero-configuration start is safe: mainnet, like a non-zero
   // payment cap, requires a deliberate act. An unrecognised value is rejected rather than
   // defaulted — see KNOWN_NETWORKS for why guessing is unsafe here.
-  const network = opt('ZETRIX_NETWORK') ?? 'zetrix:testnet'
+  const network = networkFromEnv(env)
   if (!(KNOWN_NETWORKS as readonly string[]).includes(network)) {
     throw new Error(
       `agentic-wallet-mcp: unrecognised ZETRIX_NETWORK "${network}" — expected one of ${KNOWN_NETWORKS.join(', ')}. ` +
         `Values are matched exactly and are case-sensitive; anything unrecognised would otherwise resolve to ` +
         `MAINNET addresses and grant a real spending allowance.`,
     )
+  }
+
+  // The scheme the node is reached over. A warning, not a failure, for a setting that is unrecognised or that sends plain http to a
+  // node that is not on this machine (the public nodes refuse a contract query over http).
+  const nodeHost = opt('ZETRIX_NODE_HOST') ?? deriveNodeHost(network)
+  const nodeSecureOverride = opt('ZETRIX_NODE_SECURE')
+  if (nodeSecureOverride !== undefined && parseBooleanSetting(nodeSecureOverride) === undefined) {
+    process.stderr.write(`agentic-wallet-mcp: ZETRIX_NODE_SECURE must be true or false, so "${nodeSecureOverride}" is ignored.\n`)
+  }
+  const nodeSecure = deriveNodeSecure(nodeHost, nodeSecureOverride)
+  if (!nodeSecure && !isLoopbackNodeHost(nodeHost)) {
+    process.stderr.write(
+      `agentic-wallet-mcp: the node ${nodeHost} is reached over plain http (ZETRIX_NODE_SECURE=false). The public Zetrix nodes refuse ` +
+        `a contract query over http; this is only for a private node.\n`,
+    )
+  }
+
+  const policyCapBypassOverride = opt('POLICY_CAP_BYPASS')
+  if (policyCapBypassOverride !== undefined && parseBooleanSetting(policyCapBypassOverride) === undefined) {
+    process.stderr.write(
+      `agentic-wallet-mcp: POLICY_CAP_BYPASS must be true or false, so "${policyCapBypassOverride}" is treated as false: an owner's policy ` +
+        `will not lift the default per-call payment cap.\n`,
+    )
+  }
+
+  const bindPresentationOverride = opt('X401_BIND_PRESENTATION')
+  if (bindPresentationOverride !== undefined && parseBooleanSetting(bindPresentationOverride) === undefined) {
+    process.stderr.write(`agentic-wallet-mcp: X401_BIND_PRESENTATION must be true or false, so "${bindPresentationOverride}" is ignored: binding stays on.\n`)
   }
 
   const oid4vpBaseUrlOverride = opt('OID4VP_BASE_URL')
@@ -500,8 +614,11 @@ export function loadConfig(env: NodeJS.ProcessEnv): AgenticWalletConfig {
       'the server is normally started through main(), which generates a password when none exists — ' +
         'reaching this error means loadConfig was called directly without one',
     ),
-    nodeHost: opt('ZETRIX_NODE_HOST') ?? deriveNodeHost(network),
+    nodeHost,
     nodePort: opt('ZETRIX_NODE_PORT') ?? '',
+    nodeSecure,
+    policyCapBypass: derivePolicyCapBypass(network, policyCapBypassOverride),
+    bindPresentation: deriveBindPresentation(bindPresentationOverride),
     templateRegistryAddress: opt('ZETRIX_TEMPLATE_REGISTRY_ADDRESS') ?? deriveTemplateRegistryAddress(network),
     zidResolverBaseUrl: stripTrailingSlash(opt('ZID_RESOLVER_BASE_URL') ?? deriveZidResolverBaseUrl(network)),
     policyRegistryAddress: opt('POLICY_REGISTRY_ADDRESS') ?? derivePolicyRegistryAddress(network),

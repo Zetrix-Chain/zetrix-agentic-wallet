@@ -163,7 +163,7 @@ describe('transferToken — guards', () => {
     expect(deps.sign).not.toHaveBeenCalled()
   })
 
-  it('an ASYNCHRONOUS cap refusal (the check may read the policy of the owner) also stops the transfer before signing', async () => {
+  it('an ASYNCHRONOUS cap refusal also stops the transfer before signing', async () => {
     const assertWithinCap = vi.fn(async () => {
       throw new Error('payment cap exceeded for JMYR')
     })
@@ -279,9 +279,9 @@ describe('transferToken — a policy refusal is not a signing failure', () => {
     // The one mutant that survived an earlier review: replacing the field check with a
     // `message.includes('policy')` check left the whole suite green, because every fixture
     // message happened to contain the word. The docstring calls prose-matching the thing this
-    // must never do — a mistake that had to be unpicked before — so it is pinned here.
+    // must never do — the same mistake an earlier change had to unpick — so it is pinned here.
     //
-    // Wallet BE's contract is the numeric errorCode (1000033). These are all message-only errors,
+    // Wallet BE's contract is the numeric errorCode. These are all message-only errors,
     // so they are false: only a structured field ever counts.
     expect(isPolicyRefusal(new Error('policy denied: cumulative limit reached'))).toBe(false)
     expect(isPolicyRefusal(new Error('refused by spending policy'))).toBe(false)
@@ -293,7 +293,7 @@ describe('transferToken — a policy refusal is not a signing failure', () => {
     // Only a structured policy field counts.
     expect(isPolicyRefusal(Object.assign(new Error('anything at all'), { policyCode: 'X' }))).toBe(true)
     // A bare 403 does NOT: it can come from a proxy, a WAF or an auth gateway, and reporting that as a final policy
-    // decision ("retrying will not help") would be the inverse of the bug that was fixed.
+    // decision ("retrying will not help") would be the inverse of the bug an earlier change fixes.
     expect(isPolicyRefusal(Object.assign(new Error('anything at all'), { status: 403 }))).toBe(false)
     expect(isPolicyRefusal(Object.assign(new Error('Forbidden'), { status: 403, errorCode: 0 }))).toBe(false)
     // A near-miss field must not count either.
@@ -445,7 +445,7 @@ describe('APP-L01 — a zero amount is refused before anything is signed', () =>
 // ── Wallet BE reports a policy refusal as HTTP 200 + a numeric errorCode ────────────────────────────
 
 describe('Wallet BE policy refusals (errorCode 1000033 / 1000034)', () => {
-  // Wallet BE now refuse to sign when the PDP says DENY (1000033), or when it cannot complete the
+  // an earlier change makes Wallet BE refuse to sign when the PDP says DENY (1000033), or when it cannot complete the
   // check and fails closed (1000034). It answers HTTP 200 with the code, like every Wallet BE answer — so neither a
   // 403 nor a policyCode field ever exists, and both used to surface as "signing failed", the same words as the
   // signer being down. A decision and an outage need opposite advice.
@@ -707,7 +707,7 @@ describe('the generic "signing failed" path (review APP-M01)', () => {
 
 describe('a bare HTTP 403 is an ordinary signing failure (review APP-L02)', () => {
   // A 403 can come from a proxy, a WAF or an auth gateway. Reporting it as "refused by your spending policy, retrying will not
-  // help" would tell an agent to stop on what may be a transient or fixable fault — the inverse of what that fix addresses.
+  // help" would tell an agent to stop on what may be a transient or fixable fault — the inverse of what an earlier change fixes.
   const run = (e: unknown) => transferToken(makeDeps({ sign: vi.fn().mockRejectedValue(e) }), ok)
 
   it('is a signing failure, not a policy denial', async () => {

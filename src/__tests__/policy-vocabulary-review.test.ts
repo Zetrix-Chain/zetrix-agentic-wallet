@@ -1,5 +1,5 @@
 /**
- * Review follow-ups (APP-M-1, APP-L-1, -2, -3, -4, -5).
+ * an earlier change review follow-ups (APP-M-1, APP-L-1, -2, -3, -4, -5).
  *
  * The common thread: the live vocabulary is another service's text. It may TIGHTEN what the wallet refuses, and it may
  * never LOOSEN a refusal or be read as an instruction.

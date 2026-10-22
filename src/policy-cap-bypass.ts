@@ -3,7 +3,7 @@
  *
  * WHY. A payment has to pass the wallet's own per-payment cap and then Wallet BE's spending-policy check. For someone who
  * wrote a policy the two conflicted: a policy allowing 2 JMYR did not raise the default 1 JMYR wallet cap, so a 1.5 JMYR
- * payment was refused by the wallet before the policy was ever consulted. The decision (agreed with the reviewer) is that
+ * payment was refused by the wallet before the policy was ever consulted. The decision (a deliberate decision) is that
  * a policy for an asset is the owner's own, more specific limit, so the default cap for that asset is not applied on top.
  *
  * WHAT COUNTS AS "THE POLICY GOVERNS THE ASSET". Deliberately narrower than "a policy exists", because bypassing the
@@ -26,9 +26,15 @@
  * ONLY THE CAP STANDS ASIDE. The amount-format check that lives beside it does not (see `assertWithinCapUnlessGoverned`).
  *
  * KNOWN LIMITS, stated rather than hidden:
- *  - Wallet BE enforces the policy only where `policy.pep.enabled` is on (dev, test and UAT as shipped; OFF in prod). This
- *    module cannot ask Wallet BE whether it is enforcing, so on a network where it is off, a policy that governs an asset
- *    removes the only limit the wallet had for it. Agreed for mainnet and testnet alike.
+ *  - THE WALLET NEVER COMPARES A PAYMENT WITH THE POLICY'S OWN LIMIT. It only checks that a governing policy has a well-formed
+ *    `perTransactionMax`; the limit itself is enforced by Wallet BE, and only where it is enforcing policies. This module cannot ask
+ *    Wallet BE whether it is, so where it is not, a policy that governs an asset removes the only limit the wallet had for it: a
+ *    payment is then bounded by the balance alone (`pay_and_fetch` pays a 402 demand without asking, `transfer_token` needs only
+ *    `confirm: true`; the wallet-side `cumulativeMax` and `velocityCap` are never applied). The bypass is decided by the network
+ *    name alone, so a wallet pointed at another Wallet BE through `WALLET_BE_URL` gets it too. That is why the bypass itself is a
+ *    per-network setting (`policyCapBypass`, see `derivePolicyCapBypass` in config.ts): ON for testnet and mainnet, OFF
+ *    elsewhere, and `POLICY_CAP_BYPASS=false` turns it off where the Wallet BE does not enforce. While it is off the default cap
+ *    always applies. An unrecognised value turns it off. A mainnet wallet prints a notice at start-up when it is on.
  *  - A policy removed after it was read still bypasses the cap until the cache expires (30 seconds). A read that times out is
  *    never cached when it finally answers, so a late old answer cannot stretch that bound.
  *  - THE AGENT CAN WRITE THE POLICY. `write_policy` signs as the same account whose policy is read here, so an agent that
@@ -100,7 +106,7 @@ export function ownerPoliciesGovernAsset(owned: OwnerPolicies, asset: string): b
 export interface PolicyGovernsOptions {
   /** True when the user set MAX_PAYMENT_AMOUNT: their own limit is never bypassed. */
   explicitCaps: boolean
-  /** Undefined where the policy contracts are not deployed (mainnet today): nothing can govern, so the cap applies. */
+  /** Undefined where no policy Registry is configured (a network with no deployment): nothing can govern, so the cap applies. */
   registryAddress: string | undefined
   owner: string | undefined
   query: ContractQuery
@@ -196,14 +202,30 @@ export function createPolicyGovernsCheck(options: PolicyGovernsOptions): PolicyG
 }
 
 /**
+ * The line `main()` prints at start-up when the bypass is on for mainnet, or undefined when there is nothing to say. Mainnet is where
+ * a wallet pointed at a Wallet BE that does not enforce policies would lose its only per-call limit, so an operator sees it once and
+ * knows the setting that turns it off.
+ */
+export function policyCapBypassNotice(config: { network: string; policyCapBypass: boolean }): string | undefined {
+  if (!config.policyCapBypass || config.network !== 'zetrix:mainnet') return undefined
+  return (
+    `agentic-wallet-mcp: the policy cap bypass is ON for ${config.network}: an owner's policy that governs an asset stands the default ` +
+    `per-call payment cap aside. That is only safe where the Wallet BE in use enforces policies; if yours does not, set ` +
+    `POLICY_CAP_BYPASS=false.\n`
+  )
+}
+
+/**
  * The check as `main()` wires it, in one place a test can call. Written inline in `main()` (coverage-ignored), dropping
  * `explicitCaps` would make an explicit MAX_PAYMENT_AMOUNT bypassable with every test green; here it is pinned.
  */
 export function buildPolicyGoverns(
-  config: { paymentCapsExplicit: boolean; policyRegistryAddress?: string },
+  config: { paymentCapsExplicit: boolean; policyRegistryAddress?: string; policyCapBypass: boolean },
   owner: string | undefined,
   query: ContractQuery,
 ): PolicyGoverns {
+  // Off (a network without enforcement, or POLICY_CAP_BYPASS=false or not understood): the default cap always applies and the chain is never read.
+  if (!config.policyCapBypass) return async () => false
   return createPolicyGovernsCheck({
     explicitCaps: config.paymentCapsExplicit,
     registryAddress: config.policyRegistryAddress,

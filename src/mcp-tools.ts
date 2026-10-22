@@ -32,6 +32,13 @@ import { access } from 'node:fs/promises'
 import type { X401Wallet } from 'x401-zetrix-client'
 import type { VcPresentInput } from './clients/mbi-vp-adapter.js'
 import { proveIdentity } from './orchestrator/prove.js'
+import {
+  credentialId,
+  describeCredentialStatus,
+  statusForResult,
+  withCachedCredentialStatus,
+  type CredentialStatusChecker,
+} from './orchestrator/credential-status.js'
 import { payAndFetch, type PayFetch, type PayRequest } from './orchestrator/pay.js'
 import { subscribeAndIssue, type SubscribeDeps, type SubscribeOpts, type SubscribeResult } from './orchestrator/subscribe.js'
 import type { TokenBalanceResult } from './clients/token-balance-client.js'
@@ -49,7 +56,7 @@ import {
 } from './template-aliases.js'
 
 /**
- * A name that mixes Basic and Verified wording ("Verified AI Birthcert, not the basic one"). Guessing either
+ * A name that mixes Basic and Verified wording. Guessing either
  * kind could issue the wrong credential, so it is asked about, with nothing priced, signed or paid.
  */
 function unclearBirthcertKind(name: string): string {
@@ -107,6 +114,9 @@ import { transferToken, type TransferDeps, type TransferOpts } from './orchestra
 import { describeAttributes, type VerificationLinkInput, type VerificationLinkResult } from './orchestrator/verification-qr.js'
 import { defaultRevealFor, type VerifiableCredentialKind } from './default-reveal.js'
 import { revealablePaths } from './clients/mbi-vp-adapter.js'
+
+/** The most credentials wallet_status asks MBI about in one call; a longer client-supplied list is not checked past this. */
+const MAX_STATUS_CHECKS = 10
 
 export interface ToolDeps {
   config: {
@@ -221,6 +231,11 @@ export interface ToolDeps {
    * configured is decided inside it, which is why an unconfigured wallet answers `created: false` with the reason.
    */
   createVerificationLink?: (input: VerificationLinkInput) => Promise<VerificationLinkResult>
+  /**
+   * Asks MBI whether a credential has been revoked (gap G8). Optional so tests can omit it; index.ts always wires it. It only
+   * ever warns: it never throws and a failed check is `unknown`, so a presentation is never blocked by it.
+   */
+  credentialStatus?: CredentialStatusChecker
   verifyAiBirthcert?: {
     request: (input: RequestAiBirthcertVerificationInput) => Promise<RequestVerificationResult>
     check: () => Promise<CheckVerificationResult>
@@ -266,11 +281,10 @@ async function loadValidCachedCredentials(cache?: VcCacheStore) {
   return all.filter((entry) => isVcValid(entry))
 }
 
-/** Shared by both AI Birthcert verification tools when verifyAiBirthcert isn't wired (see ToolDeps) — the live wallet (index.ts) wires it whenever SSIVC_BASE_URL resolves (always on testnet; on mainnet only once set explicitly). */
+/** Shared by both AI Birthcert verification tools when verifyAiBirthcert isn't wired (see ToolDeps) — the live wallet (index.ts) wires it whenever SSIVC_BASE_URL resolves, which is always: both networks have a built-in default. */
 const AI_BIRTHCERT_NOT_CONFIGURED_ERROR =
-  'AI Birthcert verification is not configured on this wallet. On mainnet this is expected until ' +
-  'SSIVC_BASE_URL is set explicitly (the mainnet host was never confirmed reachable); on ' +
-  'testnet it means verifyAiBirthcert was not wired at all.'
+  'AI Birthcert verification is not configured on this wallet: verifyAiBirthcert was not wired at all, ' +
+  'which the live wallet never does (both networks have a built-in SSIVC host).'
 
 export function createTools(deps: ToolDeps) {
   // Named rather than returned inline so credential_preflight can reuse get_template_schema's
@@ -288,11 +302,20 @@ export function createTools(deps: ToolDeps) {
         for (const t of input.tokens) tokenBalances.push(await deps.queryTokenBalance(t))
       }
       const credentials = input.heldCredentials ?? (await loadValidCachedCredentials(deps.cache)).map((entry) => entry.vc)
+      // Whether the issuer has revoked each one. Alongside the credentials, never inside them: a credential is signed and must be
+      // passed on byte for byte. At most MAX_STATUS_CHECKS are asked about, concurrently; each check is bounded in time and never
+      // throws, so this cannot fail wallet_status.
+      const credentialStatus = deps.credentialStatus
+        ? await Promise.all(
+            credentials.slice(0, MAX_STATUS_CHECKS).map(async (vc) => ({ id: credentialId(vc), ...statusForResult(await deps.credentialStatus!(vc), false) })),
+          )
+        : undefined
       return {
         holderDid: deps.config.holderDid,
         zetrixAddress: deps.config.zetrixAddress,
         network: deps.config.network,
         credentials,
+        ...(credentialStatus !== undefined && credentialStatus.length > 0 ? { credentialStatus } : {}),
         ...(balances !== undefined ? { balances } : {}),
         ...(tokenBalance !== undefined ? { tokenBalance } : {}),
         ...(tokenBalances !== undefined ? { tokenBalances } : {}),
@@ -317,7 +340,11 @@ export function createTools(deps: ToolDeps) {
         revealAttribute: input.revealAttribute,
         issuerKeys: input.issuerKeys,
       })
-      return proveIdentity(wallet, input.proofRequest, deps.config.holderDid)
+      // Asked at the same time as the proof is built, so the check adds no waiting beyond the slower of the two. It only
+      // warns: the proof is made and returned whatever the answer.
+      const status = deps.credentialStatus ? deps.credentialStatus(vc) : undefined
+      const proof = await proveIdentity(wallet, input.proofRequest, deps.config.holderDid)
+      return status === undefined ? proof : { ...proof, credentialStatus: statusForResult(await status) }
     },
 
     /**
@@ -402,6 +429,8 @@ export function createTools(deps: ToolDeps) {
         revealAttribute = chosenPaths
         revealedByDefault = true
       }
+      // Asked at the same time as the link is made; it only warns and never delays or blocks the link.
+      const status = deps.credentialStatus ? deps.credentialStatus(vc) : undefined
       const result = await deps.createVerificationLink({
         vc,
         revealAttribute,
@@ -409,6 +438,8 @@ export function createTools(deps: ToolDeps) {
         expiryMinutes: input.expiryMinutes,
       })
       if (!result.created) return result
+      const credentialStatus = status === undefined ? undefined : statusForResult(await status)
+      const statusNote = credentialStatus === undefined ? undefined : describeCredentialStatus(credentialStatus)
       const passImages = savedPassImages ? await existingFiles(savedPassImages) : []
       // Say which credential was presented and what was revealed: the agent did not choose either, and the user
       // should be told. A Basic credential must not be passed off as an owner-verified one.
@@ -422,10 +453,11 @@ export function createTools(deps: ToolDeps) {
         passImages.length > 0
           ? " The credential's pass design image is also returned (vcPassImagePaths): if the user wants to see it, send it as its own picture, captioned as the credential's pass design. It is not the QR code."
           : ''
-      const extra = basicNote + passNote
+      const extra = basicNote + passNote + (statusNote ? ` ${statusNote}` : '')
       return {
         ...result,
         credentialUsed,
+        ...(credentialStatus !== undefined ? { credentialStatus } : {}),
         ...(revealedByDefault ? { revealedByDefault: true } : {}),
         ...(passImages.length > 0 ? { vcPassImagePaths: passImages } : {}),
         ...(extra ? { message: result.message + extra } : {}),
@@ -464,9 +496,13 @@ export function createTools(deps: ToolDeps) {
       // Named in the price question, so the user's yes is to the kind they meant.
       const basicId = resolveTemplateAlias('ai birthcert', deps.config.network)
       const credentialLabel = basicId !== undefined && templateId === basicId ? 'Basic AI Birthcert (self-declared, not identity-verified)' : undefined
-      const result = await subscribeAndIssue(
-        { ...deps.subscribeDeps, passDesignId, ...(credentialLabel ? { credentialLabel } : {}) },
-        { ...input, templateId, attributes },
+      // A credential handed back from the cache was issued earlier: say whether it has since been revoked (a warning only).
+      const result = await withCachedCredentialStatus(
+        await subscribeAndIssue(
+          { ...deps.subscribeDeps, passDesignId, ...(credentialLabel ? { credentialLabel } : {}) },
+          { ...input, templateId, attributes },
+        ),
+        deps.credentialStatus,
       )
       if (!result.schema) return result
       // The caller never needs to know about a key the wallet fills in for them — agentDid is

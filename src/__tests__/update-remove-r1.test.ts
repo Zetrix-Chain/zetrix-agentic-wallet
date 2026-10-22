@@ -1,5 +1,5 @@
 /**
- * Review round 1: M1 recovery on the receipt's own operation, M2 a null validity bound, M3 a malformed error
+ * M1 recovery on the receipt's own operation, M2 a null validity bound, M3 a malformed error
  * envelope, M4 the false recovery promises and the create 461529 mapping, and the LOW findings L1 to L6.
  */
 import { describe, it, expect, vi } from 'vitest'

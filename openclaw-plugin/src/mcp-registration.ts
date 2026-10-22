@@ -24,7 +24,7 @@ export interface PluginConfig {
   network?: string
   maxPaymentAmount?: Record<string, string>
   zetrixAddress?: string
-  /** MyID's link for create_verification_qr, with `{referenceId}` in it. Absent until MyID supplies it. */
+  /** MyID's link for create_verification_qr, with `{referenceId}` in it. Optional: the wallet has a built-in link for each network. */
   myidVerifyLinkTemplate?: string
 }
 
@@ -116,7 +116,7 @@ export function buildServerEntry(walletBundlePath: string, config: PluginConfig,
         : {}),
       ZETRIX_WALLET_STATE_DIR: stateDir,
       ...(config.zetrixAddress ? { ZETRIX_ADDRESS: config.zetrixAddress } : {}),
-      // Absent, not blank, when unset: the wallet reads "not set" as "create_verification_qr refuses", and says why.
+      // Absent, not blank, when unset: the wallet then uses its built-in link for the network.
       ...(config.myidVerifyLinkTemplate?.trim() ? { MYID_VERIFY_LINK_TEMPLATE: config.myidVerifyLinkTemplate.trim() } : {}),
     },
   }

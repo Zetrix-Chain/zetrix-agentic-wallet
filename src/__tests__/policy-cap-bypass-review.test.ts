@@ -1,5 +1,5 @@
 /**
- * Review round 1: M1 (native policy naming a token), M2 (repeated names), M3 (amount format), L3 (wiring), L4
+ * M1 (native policy naming a token), M2 (repeated names), M3 (amount format), L3 (wiring), L4
  * (monotonic clock), L5 (timeout, no-contract caching), and the two mutation survivors.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
@@ -8,7 +8,9 @@ import {
   buildPolicyGoverns,
   createPolicyGovernsCheck,
   ownerPoliciesGovernAsset,
+  policyCapBypassNotice,
 } from '../policy-cap-bypass'
+import { loadConfig } from '../config'
 import { PaymentCapError } from '../payment-guard'
 import type { OwnerPolicies } from '../clients/policy-read-client'
 
@@ -129,15 +131,15 @@ describe('R1-L3: the wiring main() uses is pinned here', () => {
 
   it('an explicit MAX_PAYMENT_AMOUNT is never bypassed and never reads the chain', async () => {
     const query = vi.fn() as never
-    const governs = buildPolicyGoverns({ paymentCapsExplicit: true, policyRegistryAddress: REGISTRY }, OWNER, query)
+    const governs = buildPolicyGoverns({ paymentCapsExplicit: true, policyRegistryAddress: REGISTRY, policyCapBypass: true }, OWNER, query)
     expect(await governs(JMYR)).toBe(false)
     expect(query).not.toHaveBeenCalled()
   })
 
-  it('no registry (mainnet today) or no owner never reads the chain', async () => {
+  it('no registry (a network with no deployment) or no owner never reads the chain', async () => {
     const query = vi.fn() as never
-    expect(await buildPolicyGoverns({ paymentCapsExplicit: false, policyRegistryAddress: undefined }, OWNER, query)(JMYR)).toBe(false)
-    expect(await buildPolicyGoverns({ paymentCapsExplicit: false, policyRegistryAddress: REGISTRY }, undefined, query)(JMYR)).toBe(false)
+    expect(await buildPolicyGoverns({ paymentCapsExplicit: false, policyRegistryAddress: undefined, policyCapBypass: true }, OWNER, query)(JMYR)).toBe(false)
+    expect(await buildPolicyGoverns({ paymentCapsExplicit: false, policyRegistryAddress: REGISTRY, policyCapBypass: true }, undefined, query)(JMYR)).toBe(false)
     expect(query).not.toHaveBeenCalled()
   })
 
@@ -145,10 +147,31 @@ describe('R1-L3: the wiring main() uses is pinned here', () => {
     // Built here, not at describe scope: afterEach(vi.restoreAllMocks) would reset a rejection set up earlier, and the test
     // would then be proving a parse failure instead of a failed read.
     const failingQuery = vi.fn().mockRejectedValue(new Error('no chain in tests'))
-    const governs = buildPolicyGoverns({ paymentCapsExplicit: false, policyRegistryAddress: REGISTRY }, OWNER, failingQuery as never)
+    const governs = buildPolicyGoverns({ paymentCapsExplicit: false, policyRegistryAddress: REGISTRY, policyCapBypass: true }, OWNER, failingQuery as never)
     expect(await governs(JMYR)).toBe(false)
     expect(failingQuery).toHaveBeenCalled()
     await expect(failingQuery({})).rejects.toThrow('no chain in tests')
+  })
+})
+
+describe('the bypass is a per-network switch, on for testnet and mainnet, off elsewhere or when POLICY_CAP_BYPASS says so', () => {
+  it('with the switch off the default cap always applies and the chain is never read', async () => {
+    const query = vi.fn() as never
+    const governs = buildPolicyGoverns({ paymentCapsExplicit: false, policyRegistryAddress: REGISTRY, policyCapBypass: false }, OWNER, query)
+    expect(await governs(JMYR)).toBe(false)
+    expect(await governs('ZTX')).toBe(false)
+    expect(query).not.toHaveBeenCalled()
+  })
+
+  it('with the switch off a governing policy does not lift the cap, even though it would with the switch on', async () => {
+    const caps = { [JMYR]: '1000000' } // the default cap: 1 JMYR per call
+    const query = vi.fn() as never
+    const off = buildPolicyGoverns({ paymentCapsExplicit: false, policyRegistryAddress: REGISTRY, policyCapBypass: false }, OWNER, query)
+    await expect(assertWithinCapUnlessGoverned({ asset: JMYR, maxAmountRequired: '1500000' }, caps, off)).rejects.toBeInstanceOf(PaymentCapError)
+    // The same check built by hand with the switch effectively on, over a policy that governs the asset, stands the cap aside.
+    const read = vi.fn(async () => owned([policy([['assetScope', 'ztp20'], ['tokenAddress', JMYR], ['perTransactionMax', '2000000']])]))
+    const on = createPolicyGovernsCheck({ explicitCaps: false, registryAddress: REGISTRY, owner: OWNER, query: vi.fn() as never, read })
+    await expect(assertWithinCapUnlessGoverned({ asset: JMYR, maxAmountRequired: '1500000' }, caps, on)).resolves.toBeUndefined()
   })
 })
 
@@ -290,5 +313,55 @@ describe('R2-L2: a stuck read stops blocking as soon as it settles', () => {
     await new Promise((r) => setTimeout(r, 10)) // the stuck read settles
     expect(await governs(JMYR)).toBe(true) // a fresh read starts straight away
     expect(read).toHaveBeenCalledTimes(2)
+  })
+})
+
+// The mainnet switch: the start-up notice, and the explicit cap on mainnet with the bypass on.
+describe('the mainnet switch as an operator meets it', () => {
+  const env = (extra: Record<string, string> = {}) =>
+    ({ ZETRIX_NETWORK: 'zetrix:mainnet', HSM_PASSWORD: 'pw123456', ...extra }) as NodeJS.ProcessEnv
+
+  it('tells a mainnet operator, once at start-up, that the bypass is on and how to turn it off', () => {
+    const notice = policyCapBypassNotice(loadConfig(env()))
+    expect(notice).toContain('policy cap bypass is ON for zetrix:mainnet')
+    expect(notice).toContain('POLICY_CAP_BYPASS=false')
+    expect(notice?.endsWith('\n')).toBe(true)
+  })
+
+  it('says nothing when the bypass is off, or on testnet', () => {
+    const w = vi.spyOn(process.stderr, 'write').mockImplementation(() => true) // 'off' makes loadConfig warn
+    try {
+      expect(policyCapBypassNotice(loadConfig(env({ POLICY_CAP_BYPASS: 'false' })))).toBeUndefined()
+      expect(policyCapBypassNotice(loadConfig(env({ POLICY_CAP_BYPASS: 'off' })))).toBeUndefined()
+      expect(policyCapBypassNotice(loadConfig(env({ ZETRIX_NETWORK: 'zetrix:testnet' })))).toBeUndefined()
+    } finally {
+      w.mockRestore()
+    }
+  })
+
+  it('an explicit MAX_PAYMENT_AMOUNT on mainnet is never bypassed, even with the bypass on and a governing policy', async () => {
+    const cfg = loadConfig(env({ MAX_PAYMENT_AMOUNT: JSON.stringify({ [JMYR]: '1000000', '*': '0' }) }))
+    expect(cfg.policyCapBypass).toBe(true)
+    expect(cfg.paymentCapsExplicit).toBe(true)
+    const query = vi.fn() as never
+    const governs = buildPolicyGoverns(cfg, OWNER, query)
+    expect(await governs(JMYR)).toBe(false)
+    expect(query).not.toHaveBeenCalled() // an explicit cap means the policy is not even read
+    await expect(
+      assertWithinCapUnlessGoverned({ asset: JMYR, maxAmountRequired: '2000000' }, cfg.maxPaymentAmount, governs),
+    ).rejects.toBeInstanceOf(PaymentCapError)
+  })
+
+  it('a mistyped POLICY_CAP_BYPASS on mainnet leaves the default cap in force', async () => {
+    const w = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+    try {
+      const cfg = loadConfig(env({ POLICY_CAP_BYPASS: 'off' }))
+      const query = vi.fn() as never
+      const governs = buildPolicyGoverns({ ...cfg, policyRegistryAddress: REGISTRY }, OWNER, query)
+      expect(await governs(JMYR)).toBe(false)
+      expect(query).not.toHaveBeenCalled()
+    } finally {
+      w.mockRestore()
+    }
   })
 })

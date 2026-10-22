@@ -907,7 +907,7 @@ describe('the docs agree with the tool descriptions about money', () => {
     }
   })
 
-  // Round-1 review, LOW finding 5: the exact-snapshot test above pins wording, but a future
+  // an earlier change round-1 review, LOW finding 5: the exact-snapshot test above pins wording, but a future
   // fixture edit that dropped a rule's WORDS while keeping the fixture in sync with the code would
   // sail through it silently. These are semantic (regex) guards on the underlying rule, independent
   // of exact phrasing, so either rule going missing from any of these surfaces fails on its own merit.

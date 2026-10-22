@@ -1,5 +1,5 @@
 /**
- * Acceptance criteria that were already delivered, pinned against the recorded vocabulary so they
+ * an earlier ticket's acceptance criteria that an earlier change already delivered, pinned against the recorded vocabulary so they
  * cannot drift unseen. (valueHuman is in policy-value-human.test.ts.)
  *
  *   - a cap whose pair is missing is described exactly as the served `withoutPairMeans` says: LIFETIME is stated as a

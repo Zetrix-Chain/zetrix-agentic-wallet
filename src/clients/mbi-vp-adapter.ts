@@ -24,7 +24,8 @@
  */
 
 import type { VcProofProvider } from 'x401-zetrix-client'
-import type { MbiClient } from './mbi-client.js'
+import type { MbiClient, MbiVpCreateBody } from './mbi-client.js'
+import type { PresentedNonceStore } from './presented-nonce-store.js'
 import type { IssuerProofKeys } from './resolve-issuer-proof-keys.js'
 
 /** Calls MBI's VP endpoints. Injectable so this is unit-testable without live HTTP. */
@@ -57,6 +58,16 @@ export interface VcPresentInput {
    * fetched out-of-band. When omitted, the injected resolver runs as before.
    */
   issuerKeys?: IssuerProofKeys
+  /**
+   * The origin of the verifier this wallet presents to (see x401-audience.ts), from the wallet's own configuration. Sent to MBI with the
+   * verifier's nonce so both are written into what the holder signs. Left out when no usable verifier address is configured.
+   */
+  audience?: string
+  /**
+   * Whether the presentation is bound to the verifier's session at all: the nonce and audience sent to MBI, and each challenge answered once.
+   * Default true; false is the `X401_BIND_PRESENTATION=false` setting.
+   */
+  bindSession?: boolean
 }
 
 /** Local structural guard — this package has no shared guards util. */
@@ -207,6 +218,8 @@ export class MbiVpAdapter implements VcProofProvider {
     private readonly signMessage: MessageSigner,
     private readonly resolveIssuerKeys: IssuerKeyResolver,
     private readonly present: VcPresentInput,
+    /** The challenges already answered; when given, a nonce is answered once. Without it the adapter behaves as it always did. */
+    private readonly answered?: PresentedNonceStore,
   ) {}
 
   async createVp(input: {
@@ -221,13 +234,44 @@ export class MbiVpAdapter implements VcProofProvider {
     // which MBI treats as "reveal all" — the prior default.
     const revealAttributes = this.present.revealAttribute ?? dcqlToRevealAttributes(input.credentialQuery, this.present.vc)
 
-    // 1. Derive the unsigned VP blob (BBS+ selective disclosure server-side, from the issuer's key).
-    const createBody: Record<string, unknown> = {
+    // A challenge is answered once. The claim is taken before anything is made and given back if the attempt fails before the holder has
+    // signed anything: nothing exists for that nonce then, so the challenge may still be answered. After a signature it stays.
+    const bind = this.present.bindSession !== false
+    const answered = bind && input.nonce ? this.answered : undefined
+    if (answered && !(await answered.claim(input.nonce))) {
+      throw new Error('MbiVpAdapter: this challenge has already been answered, so it will not be answered again. Ask the resource for a new one.')
+    }
+    let signing = false
+    try {
+      return await this.buildAndSign(input, revealAttributes, bind, () => {
+        signing = true
+      })
+    } catch (e) {
+      if (answered && !signing) await answered.release(input.nonce).catch(() => undefined)
+      throw e
+    }
+  }
+
+  /**
+   * The steps of createVp. `beforeSigning` is called just before the holder's key is asked to sign: from then on a signature may exist,
+   * whatever the call returns, so the challenge counts as answered.
+   */
+  private async buildAndSign(
+    input: { credentialQuery: unknown; nonce: string; holderDid: string },
+    revealAttributes: string[],
+    bind: boolean,
+    beforeSigning: () => void,
+  ): Promise<{ vp: unknown; ed25519PublicKey: string; bbsPublicKey: string; presentationSubmission: Record<string, unknown> }> {
+    // 1. Derive the unsigned VP blob (BBS+ selective disclosure server-side, from the issuer's key). The verifier's nonce and audience go with
+    //    it: MBI hands them to ms-credential, which writes them into the payload the holder signs in step 2.
+    const createBody: MbiVpCreateBody = {
       vc: this.present.vc,
       revealAttributes,
     }
     if (this.present.rangeProof !== undefined) createBody.rangeProof = this.present.rangeProof
-    const created = await this.mbi.createVp(createBody as { vc: unknown; revealAttributes: string[]; rangeProof?: unknown }, this.signMessage)
+    if (bind && input.nonce) createBody.nonce = input.nonce
+    if (bind && this.present.audience) createBody.audience = this.present.audience
+    const created = await this.mbi.createVp(createBody, this.signMessage)
 
     const blobId = created.blobId
     const blob = created.blob
@@ -237,6 +281,7 @@ export class MbiVpAdapter implements VcProofProvider {
 
     // 2. Holder Ed25519 signature over the hex blob — via Wallet BE (custody preserved). This key
     //    proves OUR signature to MBI; it is unrelated to the issuer keys resolved below.
+    beforeSigning()
     const { signBlob, publicKey } = await this.signHexBlob(blob)
 
     // 3. Submit + get the finished VP back in the same call (no separate read-back).

@@ -1,5 +1,5 @@
 /**
- * Wiring: the registered tokens and the decimals reader must reach BOTH places a draft is
+ * an earlier change wiring: the registered tokens and the decimals reader must reach BOTH places a draft is
  * preflighted — the `policy_preflight` tool and the check `write_policy` runs before paying — from
  * ONE builder, so the two cannot give the user different answers about the same draft.
  *

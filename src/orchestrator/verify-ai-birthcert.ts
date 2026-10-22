@@ -22,6 +22,10 @@ import {
   type SsivcSessionCreated,
   type SsivcSessionStatus,
   type SsivcSessionOutcome,
+  type SsivcChallenge,
+  type SsivcQuote,
+  type SsivcQuoteRequestBody,
+  type SsivcStartOutcome,
 } from '../clients/ssivc-client.js'
 import { orderAccepts, isSponsored, type GasPreference } from '../accept-selection.js'
 import {
@@ -48,7 +52,12 @@ import { PaymentCapError, type PaymentCapDetail } from '../payment-guard.js'
 import { describePolicyRefusal, policyRefusalFlags, toPaymentPolicyError } from '../policy-refusal.js'
 
 export interface VerifyAiBirthcertDeps {
-  ssivc: Pick<SsivcClient, 'createSessionChallenge' | 'createSessionSettle' | 'createSessionWithReceipt' | 'getSession'>
+  ssivc: Pick<SsivcClient, 'createSessionChallenge' | 'createSessionSettle' | 'createSessionWithReceipt' | 'getSession'> &
+    /**
+     * Optional so an SSIVC without these routes keeps working: with no quote the price comes from the 402 check, exactly as
+     * before, and a session is never started without a payment.
+     */
+    Partial<Pick<SsivcClient, 'quoteSession' | 'startSession'>>
   /** Ed25519-signs a hex blob (-> Wallet BE `/sign-blob`) — reused as-is from the rest of the wallet. */
   signHexBlob: (blobHex: string) => Promise<{ signBlob: string; publicKey: string }>
   /** Signs a UTF-8 message (-> Wallet BE `/sign-message`) — used for MBI's `/vc/ext/download` auth, same scheme as `/vp/ext/*`. */
@@ -125,21 +134,19 @@ export interface RequestAiBirthcertVerificationInput {
   /** Per-call override of `deps.gasPreference` for this request only. Omit to use the configured default. */
   gasPayer?: GasPreference
   /**
-   * Stop after SSIVC's free phase-1 quote and report it, instead of paying. Mirrors
-   * `subscribe_and_issue`'s `dryRun`, so both issuance paths can be priced the same way.
+   * Report SSIVC's price instead of paying. Mirrors `subscribe_and_issue`'s `dryRun`, so both issuance paths can be
+   * priced the same way.
    *
-   * Verified live against SSIVC UAT (2026-09-04): a correctly signed session request with no
-   * `X-Payment` header returns 402 carrying the full quote, repeatably, and creates **no**
-   * server-side session. It does cost one Wallet-BE signing call — SSIVC validates the signature
-   * before issuing the challenge — but no funds move.
+   * SSIVC's quote route answers it: no session is created and no name is needed (the signed fields are the key, the address
+   * and the owner reference). It says whether anything is charged (`paymentRequired`), and when it is not, the amount is
+   * only indicative. It costs one Wallet-BE signing call; no funds move.
    *
-   * `agentName` is still required (SSIVC rejects a body without one, `422`), but the fee is
-   * **name-independent** — two different names return byte-identical quotes. A caller pricing the
-   * credential before the user has chosen a name may therefore pass a placeholder, so long as it
-   * never presents that placeholder as the name that will be used.
+   * Only an SSIVC without that route (404/405) is asked the old way: a session request with no `X-Payment` header, which
+   * answers 402 with the price and creates nothing. That request needs a name, and the fee is **name-independent**, so a
+   * caller pricing before the user has chosen a name may pass a placeholder, so long as it never presents that placeholder
+   * as the name that will be used.
    *
-   * A quote does NOT reserve anything and does NOT check name availability — SSIVC's uniqueness
-   * check runs at issuance, not at challenge time (a name already taken still quotes cleanly).
+   * A quote does NOT reserve anything and does NOT check name availability.
    */
   dryRun?: boolean
   /**
@@ -227,6 +234,12 @@ export interface VerificationQuote {
   payTo?: string
   /** Which side pays network gas for the option that would actually be used. */
   gasModel: 'sponsored' | 'self'
+  /**
+   * What SSIVC said about whether it charges for this session. Present on a dry run only when SSIVC's quote answered:
+   * `false` means no payment is needed (and `maxAmountRequired` is then only indicative); `true` means it charges.
+   * Absent means SSIVC did not say, which is read as "may charge", never as free.
+   */
+  paymentRequired?: boolean
 }
 
 /**
@@ -449,7 +462,8 @@ async function getConfirmedStatus(
  * overwriting it would silently orphan that receipt or verification link).
  */
 type PriorSessionDecision =
-  | { kind: 'still_pending'; result: SsivcSessionCreated }
+  /** `free` is set when the session needed no payment, so the message must not say it was paid for. */
+  | { kind: 'still_pending'; result: SsivcSessionCreated; free?: true }
   /** The record the receipt came from — the caller reads its optional fields back. */
   | { kind: 'replay_receipt'; receipt: string; stored: StoredSsivcSession }
   | { kind: 'pay_fresh' }
@@ -484,7 +498,10 @@ async function decidePriorSession(
     // receipt is scoped to the request body's signature (see ssivc-client.ts: `signedData` is what
     // binds a session to a specific agent key), not to agentName at the payment layer, so replaying
     // it under the new agentName's body is the same operation createSessionWithReceipt already does.
-    if (otherStatus === 'gone') return { kind: 'replay_receipt', receipt: stored.paymentReceipt, stored }
+    if (otherStatus === 'gone') return replayOrFresh(stored)
+    // A session that needed no payment holds nothing of value: the user may start another under a new name, and this one
+    // simply expires. Only a paid one is protected, because its receipt is real money.
+    if (otherStatus.status === 'pending' && stored.paymentReceipt === '') return { kind: 'pay_fresh' }
     if (otherStatus.status === 'pending') {
       return {
         kind: 'blocked',
@@ -501,15 +518,16 @@ async function decidePriorSession(
     // (SPEC.md §634), a "settled but unconsumed" case exactly like the 404/"gone" branch above — the
     // receipt is ONLY consumed once a session reaches "issued". Same reasoning as above applies: safe
     // to replay under the new agentName's signed body regardless of the exact status string.
-    return { kind: 'replay_receipt', receipt: stored.paymentReceipt, stored }
+    return replayOrFresh(stored)
   }
 
   const status = await getConfirmedStatus(deps, stored.sessionId)
-  if (status === 'gone') return { kind: 'replay_receipt', receipt: stored.paymentReceipt, stored }
+  if (status === 'gone') return replayOrFresh(stored)
   if (status.status === 'pending') {
     return {
       kind: 'still_pending',
       result: { sessionId: stored.sessionId, verificationUrl: stored.verificationUrl, expiresAt: status.expiresAt },
+      ...(stored.paymentReceipt === '' ? { free: true as const } : {}),
     }
   }
   if (status.status === 'issued') return { kind: 'pay_fresh' } // receipt consumed — dead
@@ -520,7 +538,15 @@ async function decidePriorSession(
   // the receipt unconsumed. Treat it exactly like the 404/"gone" branch above — replay it — rather
   // than failing closed. `pending` (still in flight) and `issued` (dead receipt) remain the only two
   // statuses handled specially; everything else funnels here.
-  return { kind: 'replay_receipt', receipt: stored.paymentReceipt, stored }
+  return replayOrFresh(stored)
+}
+
+/**
+ * Replay the receipt a session was paid with, or start fresh when it was paid with nothing. A session SSIVC created without
+ * asking for payment has no receipt, and replaying an empty one would send SSIVC a payment header that means nothing.
+ */
+function replayOrFresh(stored: StoredSsivcSession): PriorSessionDecision {
+  return stored.paymentReceipt === '' ? { kind: 'pay_fresh' } : { kind: 'replay_receipt', receipt: stored.paymentReceipt, stored }
 }
 
 /**
@@ -543,6 +569,8 @@ export async function findUnusedVerificationPayment(
   const stored = await deps.sessionStore.get()
   if (!stored) return undefined
   if (stored.sessionId === '') return { agentName: stored.agentName, linkOpen: false, settling: true }
+  // A session that needed no payment leaves no payment to reuse.
+  if (stored.paymentReceipt === '') return undefined
   const status = await getConfirmedStatus(deps, stored.sessionId)
   if (status !== 'gone' && status.status === 'issued') return undefined
   return { agentName: stored.agentName, linkOpen: status !== 'gone' && status.status === 'pending' }
@@ -984,6 +1012,12 @@ const NO_NEW_PAYMENT_REPLAYED =
 const NO_NEW_PAYMENT_SAME_LINK =
   'No new payment was made on this call: this is the same link as before, still open, and already ' +
   'paid for. Do not tell the user they paid again. '
+/** Opens `message` when SSIVC handed back a session without asking for payment. */
+const NO_PAYMENT_NEEDED =
+  'No payment was needed: the verification service is not charging for this session, so nothing was paid and no ' +
+  'fee applies. Do not tell the user they paid, and do not ask them to agree to a fee. '
+const NO_PAYMENT_SAME_LINK =
+  'No payment was made on this call: this is the same link as before, still open, and it needed no payment. '
 
 /**
  * Attached to every result where a live SSIVC session now exists but MyDigital ID has not yet
@@ -1354,7 +1388,10 @@ async function payAndCreateSession(
   confirmed: ConfirmedQuote,
   book: QuoteBook,
 ): Promise<{ session: SsivcSessionCreated; paymentReceipt: string }> {
-  const challenge = await deps.ssivc.createSessionChallenge(await buildBody())
+  const started = await firstCall(deps, await buildBody())
+  // SSIVC stopped charging after the quote: it made the session instead of asking for payment. Nothing is paid.
+  if (started.kind === 'created') return { session: started.session, paymentReceipt: '' }
+  const challenge = started.challenge
   // The confirmed gas model picks the option (review R1): the user agreed to that option's price, not the other's.
   const candidates = orderAccepts(challenge.accepts, confirmed.gasModel)
   const primary = candidates[0]
@@ -1442,8 +1479,18 @@ async function askToConfirmPayment(
   agentName: string,
   input: RequestAiBirthcertVerificationInput,
   lead = '',
+  /** The price SSIVC already answered with on this call, so it is not asked for again. */
+  priced?: SsivcChallenge,
 ): Promise<RequestVerificationResult> {
-  const quoted = await quoteVerification(deps, agentName, input)
+  let quoted: Awaited<ReturnType<typeof challengeQuote>>
+  try {
+    quoted = priced ? quoteFromChallenge(deps, priced, input) : await challengeQuote(deps, agentName, input)
+  } catch (err) {
+    if (isAgentNameInUse(err)) return { error: freeAgentNameInUseMessage(err, agentName) }
+    throw err
+  }
+  // SSIVC was not charging after all and made the session; it is kept and handed back, not lost.
+  if ('created' in quoted) return recordFreeSession(deps, agentName, optionalRequestFields(input), quoted.created)
   if (!('quote' in quoted)) return quoted
   return needsConfirmationResult(deps, quoted.quote, lead, verificationBinding(agentName, input))
 }
@@ -1549,15 +1596,6 @@ async function requestAiBirthcertVerificationInner(
 }
 
 /**
- * The signed SSIVC request body. Shared by the paid path and the quote so both send byte-identical
- * bodies — SSIVC verifies `signedData` over the canonical JSON of every other field, and a quote
- * that differed from what would later be paid would be pricing a different request.
- *
- * Rebuilt (and re-signed) on EVERY attempt, never reused: SSIVC rejects a `timestamp` older than 5
- * minutes (error `55`, REQ-28b), and a sponsored settlement retry loop can easily outlive that
- * window.
- */
-/**
  * The four optional request fields, as a spreadable object with absent ones omitted.
  *
  * One definition shared by {@link buildSessionBody}, the two session-store writes, and the
@@ -1575,6 +1613,12 @@ function optionalRequestFields(
   return fields
 }
 
+/**
+ * The signed SSIVC session request. `signedData` covers every other field, so the fields are signed exactly as sent.
+ *
+ * Rebuilt (and re-signed) on EVERY attempt, never reused: SSIVC rejects a `timestamp` older than its window (error `55`,
+ * REQ-28b; 15 minutes in its OpenAPI), and a sponsored settlement retry loop can easily outlive that window.
+ */
 async function buildSessionBody(
   // Narrowed to exactly what it uses, so advanceQueuedSettlement no longer needs a
   // `deps as VerifyAiBirthcertDeps` cast to call it — that cast re-widened the very type whose
@@ -1599,15 +1643,100 @@ async function buildSessionBody(
   return { ...fields, signedData } as SsivcSessionRequestBody
 }
 
-/** Phase-1 challenge only: no payment header, no settle, no session store, no lock. */
+/**
+ * The quote request: the signed fields of a session request without the ones that only exist once a name is chosen. SSIVC
+ * verifies the signature over the fields it receives, so this signs exactly these.
+ */
+async function buildQuoteBody(
+  deps: Pick<VerifyAiBirthcertDeps, 'publicKeyHex' | 'address' | 'now' | 'holderDid' | 'signHexBlob'>,
+): Promise<SsivcQuoteRequestBody> {
+  const fields = {
+    publicKey: deps.publicKeyHex,
+    address: deps.address,
+    timestamp: isoSeconds(deps.now()),
+    ownerReference: deps.holderDid,
+  }
+  const digestHex = createHash('sha256').update(canonicalizeJson(fields), 'utf8').digest('hex')
+  const { signBlob: signedData } = await deps.signHexBlob(digestHex)
+  return { ...fields, signedData }
+}
+
+/**
+ * What SSIVC says a session costs, from its quote, which creates nothing and needs no name. `undefined` when this SSIVC has
+ * no quote, so the caller uses the 402 check.
+ */
+async function readSsivcQuote(deps: VerifyAiBirthcertDeps): Promise<SsivcQuote | undefined> {
+  if (typeof deps.ssivc.quoteSession !== 'function') return undefined
+  return deps.ssivc.quoteSession(await buildQuoteBody(deps))
+}
+
+/**
+ * The price for a dry run (credential_preflight). SSIVC's quote when it has one: no session is created, no name is needed,
+ * and `paymentRequired` says whether anything is charged. Otherwise the 402 check an older SSIVC supports.
+ */
 async function quoteVerification(
   deps: VerifyAiBirthcertDeps,
   agentName: string,
   input: RequestAiBirthcertVerificationInput,
 ): Promise<RequestVerificationResult> {
+  const priced = await readSsivcQuote(deps)
+  if (!priced) {
+    // This SSIVC has no quote route, so the only way to see its price is a session request. That request never carries the
+    // user's name or details: a session SSIVC makes from it would hold the name, and the user's real request would then be
+    // refused as a taken name. It carries a throwaway name of its own instead.
+    const probed = await challengeQuote(deps, priceCheckName(deps.now()), { agentName: '', gasPayer: input.gasPayer })
+    // SSIVC is not charging, so the probe made a session nobody will receive. It is dropped, and reported as what it is: a
+    // free price.
+    if ('created' in probed) return { quote: FREE_QUOTE }
+    return probed
+  }
   const requestedGasPayer = input.gasPayer === 'self' || input.gasPayer === 'sponsored' ? input.gasPayer : undefined
-  const body = await buildSessionBody(deps, agentName, input)
-  const challenge = await deps.ssivc.createSessionChallenge(body)
+  const chosen = orderAccepts(priced.accepts, requestedGasPayer ?? deps.gasPreference ?? 'sponsored')[0]
+  // Free with nothing to choose from is still an answer: the request starts free in the same case.
+  if (!chosen && priced.paymentRequired === false) return { quote: FREE_QUOTE }
+  if (!chosen) return { error: 'SSIVC quote returned no usable payment options' }
+  return {
+    quote: {
+      asset: String(chosen.asset ?? ''),
+      maxAmountRequired: String(chosen.maxAmountRequired ?? ''),
+      ...(chosen.payTo ? { payTo: String(chosen.payTo) } : {}),
+      gasModel: isSponsored(chosen) ? 'sponsored' : 'self',
+      // Only when SSIVC said so. Left out otherwise, which the readiness check reads as "may charge".
+      ...(priced.paymentRequired === undefined ? {} : { paymentRequired: priced.paymentRequired }),
+    },
+  }
+}
+
+/**
+ * The name a price check sends to an SSIVC that has no quote route. Never the user's: a session made from it must not hold a
+ * name the user may choose. Unique per call, so repeated checks do not collide with each other.
+ */
+function priceCheckName(now: Date): string {
+  return `price-check-${now.getTime().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+}
+
+/** The price shown for a free SSIVC that gave no options of its own. Nothing is charged, so nothing here is ever paid. */
+const FREE_QUOTE: VerificationQuote = { asset: 'ZTX', maxAmountRequired: '0', gasModel: 'self', paymentRequired: false }
+
+/**
+ * The first call of a session request, with no payment. A price (402), or, when SSIVC is not charging, the session it
+ * created. A client without `startSession` can only read a 402, which is the old behaviour.
+ */
+async function firstCall(
+  deps: Pick<VerifyAiBirthcertDeps, 'ssivc'>,
+  body: SsivcSessionRequestBody,
+): Promise<SsivcStartOutcome> {
+  if (typeof deps.ssivc.startSession === 'function') return deps.ssivc.startSession(body)
+  return { kind: 'challenge', challenge: await deps.ssivc.createSessionChallenge(body) }
+}
+
+/** The price of a challenge, as the quote a result carries, or the error when it has no usable option. */
+function quoteFromChallenge(
+  deps: Pick<VerifyAiBirthcertDeps, 'gasPreference'>,
+  challenge: SsivcChallenge,
+  input: Pick<RequestAiBirthcertVerificationInput, 'gasPayer'>,
+): { quote: VerificationQuote } | { error: string } {
+  const requestedGasPayer = input.gasPayer === 'self' || input.gasPayer === 'sponsored' ? input.gasPayer : undefined
   const chosen = orderAccepts(challenge.accepts, requestedGasPayer ?? deps.gasPreference ?? 'sponsored')[0]
   if (!chosen) return { error: 'SSIVC 402 returned no usable payment options' }
 
@@ -1621,6 +1750,105 @@ async function quoteVerification(
       gasModel: isSponsored(chosen) ? 'sponsored' : 'self',
     },
   }
+}
+
+/**
+ * The first call, no payment header, no settle, no lock. Answers with the price, or with `created` when SSIVC was not
+ * charging and made a session: that session is real, so the caller must keep it.
+ */
+async function challengeQuote(
+  deps: VerifyAiBirthcertDeps,
+  agentName: string,
+  input: RequestAiBirthcertVerificationInput,
+): Promise<{ quote: VerificationQuote } | { error: string } | { created: SsivcSessionCreated }> {
+  const started = await firstCall(deps, await buildSessionBody(deps, agentName, input))
+  if (started.kind === 'created') return { created: started.session }
+  return quoteFromChallenge(deps, started.challenge, input)
+}
+
+/**
+ * Starts a session without any payment, but ONLY when SSIVC's own quote says nothing is charged (`paymentRequired` is exactly
+ * `false`). Anything else, a quote that cannot be read included, takes the paying path, which asks before it pays.
+ *
+ * Returns nothing when the paying path should run: the quote did not say free. When SSIVC began charging between the quote
+ * and this call, the price it answered with is handed back (`challenge`) so the price stop does not ask for it again. A
+ * session SSIVC creates is a real one, which is why the quote is asked first and the request carries the user's real name.
+ */
+async function startFreeSession(
+  deps: VerifyAiBirthcertDeps,
+  agentName: string,
+  input: RequestAiBirthcertVerificationInput,
+): Promise<{ done: RequestVerificationResult } | { challenge: SsivcChallenge } | undefined> {
+  if (typeof deps.ssivc.quoteSession !== 'function' || typeof deps.ssivc.startSession !== 'function') return undefined
+  let priced: SsivcQuote | undefined
+  try {
+    priced = await readSsivcQuote(deps)
+  } catch {
+    // Cannot tell. The paying path asks the user before it pays, so not knowing is safe there.
+    return undefined
+  }
+  if (priced?.paymentRequired !== false) return undefined
+
+  let started: SsivcStartOutcome
+  try {
+    started = await deps.ssivc.startSession(await buildSessionBody(deps, agentName, input))
+  } catch (err) {
+    if (isAgentNameInUse(err)) return { done: { error: freeAgentNameInUseMessage(err, agentName) } }
+    throw err
+  }
+  if (started.kind === 'challenge') return { challenge: started.challenge }
+  return { done: await recordFreeSession(deps, agentName, optionalRequestFields(input), started.session) }
+}
+
+/**
+ * Keeps a session SSIVC created without asking for payment, and gives it back as one. The empty receipt is how the saved
+ * session says it needed no payment: it is never replayed or reported as a payment to reuse.
+ *
+ * A save that fails does not lose the link: the session exists and is one-time, so the link is returned with a note that
+ * the wallet could not keep it.
+ */
+async function recordFreeSession(
+  deps: Pick<VerifyAiBirthcertDeps, 'sessionStore' | 'now' | 'holderDid'>,
+  agentName: string,
+  fields: Record<string, string>,
+  session: SsivcSessionCreated,
+): Promise<RequestVerificationResult> {
+  let unsaved = ''
+  try {
+    await deps.sessionStore.set({
+      sessionId: session.sessionId,
+      agentName,
+      createdAt: deps.now().toISOString(),
+      verificationUrl: session.verificationUrl,
+      paymentReceipt: '',
+      holderDid: deps.holderDid,
+      ...fields,
+    })
+  } catch {
+    unsaved =
+      'This wallet could not save the session, so check_ai_birthcert_verification will not find it: give the user the ' +
+      'link now, and do not start another. '
+  }
+  const optional = Object.keys(fields).length ? ' and the details you gave' : ''
+  return {
+    ...session,
+    paidThisCall: false,
+    message:
+      NO_PAYMENT_NEEDED +
+      `It was started for agentName "${agentName}"${optional}: tell the user that name, so a mistake is caught before they verify. ` +
+      // A session the wallet could not save cannot be followed up, so there is no re-check to promise.
+      (unsaved || noAutoRecheckMessage(session.expiresAt, deps.now())),
+  }
+}
+
+/** The name is taken. In a session that needs no payment there is no fee to speak of, so the message says only that. */
+function freeAgentNameInUseMessage(err: SsivcError, agentName: string): string {
+  const code = err.statusCode ? ` (status_code ${err.statusCode})` : ''
+  return (
+    `AGENT NAME ALREADY IN USE${code}: "${quotedServiceReason(err)}". The credential service refused agentName "${agentName}" ` +
+    `because it is already taken, so do NOT retry it with the same name. Nothing was paid. The name may belong to a session ` +
+    `started earlier, possibly this user's own whose link was lost, so ask the user for a different agentName.`
+  )
 }
 
 /**
@@ -1644,6 +1872,15 @@ async function discardStuckReceiptBeforePaying(
           `Nothing was discarded and nothing was paid: this wallet holds no payment receipt at all. ` +
           `There is nothing to start over from — call request_ai_birthcert_verification again without ` +
           `discardStuckReceiptAndPayFresh and it will pay normally.`,
+      },
+    }
+  }
+  if (stored.paymentReceipt === '') {
+    return {
+      refusal: {
+        error:
+          `Nothing was discarded and nothing was paid: the saved verification session needed no payment, so there is no ` +
+          `receipt to discard. Call request_ai_birthcert_verification again without discardStuckReceiptAndPayFresh.`,
       },
     }
   }
@@ -1689,6 +1926,25 @@ async function discardStuckReceiptBeforePaying(
   if (options.checkOnly) return { discarded: stored.paymentReceipt }
   await deps.sessionStore.clear()
   return { discarded: stored.paymentReceipt }
+}
+
+/**
+ * What to tell the agent about the saved record when an issued session cannot be resolved. A session that needed no payment
+ * has no receipt, so there is nothing to clear and no second fee to warn about.
+ */
+function unresolvedReceiptAdvice(stored: StoredSsivcSession): string {
+  if (stored.paymentReceipt === '') {
+    return 'This session needed no payment, so there is no payment receipt to clear. Starting over costs nothing.'
+  }
+  return (
+    `Show the user payment receipt ${stored.paymentReceipt} and, only with their explicit agreement, call ` +
+    `clear_stuck_payment_receipt with confirmReceiptId set to exactly that id and ` +
+    `confirmDiscardLiveSession set to true. This clears only this WALLET's local record ` +
+    `of the session; it does not destroy, undo, or refund any credential that already ` +
+    `exists. Once cleared, the next request_ai_birthcert_verification pays a SECOND fee ` +
+    `regardless of whether a credential already exists, so make sure the user understands ` +
+    `that before agreeing.`
+  )
 }
 
 /** {@link checkExistingVerifiedVc}'s verdict. */
@@ -1841,14 +2097,7 @@ async function checkExistingVerifiedVc(
                   `keeps failing the same way, this is not a transient problem — but note this is NOT ` +
                   `the give-up-before-a-session-exists case clear_stuck_payment_receipt otherwise ` +
                   `handles: this session already reached "issued", so a credential most likely WAS ` +
-                  `minted from it; only confirming that here failed. Show the user payment receipt ` +
-                  `${stored.paymentReceipt} and, only with their explicit agreement, call ` +
-                  `clear_stuck_payment_receipt with confirmReceiptId set to exactly that id and ` +
-                  `confirmDiscardLiveSession set to true — this clears only this WALLET's local record ` +
-                  `of the session; it does not destroy, undo, or refund any credential that already ` +
-                  `exists. Once cleared, the next request_ai_birthcert_verification pays a SECOND fee ` +
-                  `regardless of whether a credential already exists, so make sure the user understands ` +
-                  `that before agreeing.`,
+                  `minted from it; only confirming that here failed. ` + unresolvedReceiptAdvice(stored),
               },
             }
           }
@@ -1985,16 +2234,24 @@ async function payOrReplayLocked(
     return {
       ...decision.result,
       paidThisCall: false,
-      message: NO_NEW_PAYMENT_SAME_LINK + noAutoRecheckMessage(decision.result.expiresAt, deps.now()),
+      message: (decision.free ? NO_PAYMENT_SAME_LINK : NO_NEW_PAYMENT_SAME_LINK) + noAutoRecheckMessage(decision.result.expiresAt, deps.now()),
     }
   if (decision.kind === 'blocked') return { error: decision.message }
+  // SSIVC may not be charging at all. Its quote says so without creating anything; only then is a session started with no
+  // payment and no price to confirm.
+  let answeredWith: SsivcChallenge | undefined
+  if (decision.kind === 'pay_fresh') {
+    const free = await startFreeSession(deps, agentName, input)
+    if (free && 'done' in free) return free.done
+    answeredWith = free?.challenge
+  }
   // a call that would pay stops at the price unless the user has said yes. Not a replay (it pays nothing), and
   // not discardStuckReceiptAndPayFresh: its exact receipt id is the user's agreement to pay again, and by now it has
   // already discarded that receipt, so stopping here would strand them.
   const { verdict, confirmed } = confirmationVerdict(deps, agentName, input)
   if (decision.kind === 'pay_fresh' && verdict !== 'ok') {
     // only a quote this wallet gave, for this request, unexpired, unused and unchanged.
-    return askToConfirmPayment(deps, agentName, input, verdict === 'none' ? '' : quoteVerdictLead(verdict))
+    return askToConfirmPayment(deps, agentName, input, verdict === 'none' ? '' : quoteVerdictLead(verdict), answeredWith)
   }
 
   /**
@@ -2340,6 +2597,8 @@ async function payOrReplayLocked(
     throw err
   }
 
+  if (paid.paymentReceipt === '') return recordFreeSession(deps, agentName, effectiveOptionalFields, paid.session)
+
   await deps.sessionStore.set({
     sessionId: paid.session.sessionId,
     agentName,
@@ -2670,6 +2929,15 @@ async function clearStuckPaymentReceiptLocked(
   const stored = await deps.sessionStore.get()
   if (!stored) {
     return { cleared: false, message: 'Nothing to clear — this wallet has no stored verification session or payment receipt.' }
+  }
+
+  if (stored.paymentReceipt === '') {
+    return {
+      cleared: false,
+      message:
+        'Nothing to clear: the saved verification session was started without a payment, so there is no payment receipt. ' +
+        'To start over, call request_ai_birthcert_verification again: the same name gives the same link while it is open, and another name starts a new session.',
+    }
   }
 
   // A record with a real sessionId is not a stuck receipt: the user may still have a working

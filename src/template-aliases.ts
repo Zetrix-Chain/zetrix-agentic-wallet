@@ -136,7 +136,7 @@ export function aiBirthcertKindOfName(input: string): 'verified' | 'basic' | 'un
  * True for a loose name of the VERIFIED AI Birthcert ("Verified AI Birthcert", "verified birthcert",
  * "verified_ai_birthcert", "birthcert verification", "MyDigital ID AI Birthcert"), which no template alias may
  * resolve. Every such name also contains "birthcert", so before this it resolved to the BASIC template:
- * in the Doc1 QA run a user who chose Verified was priced, and could have been issued, the Basic one.
+ * in a QA run a user who chose Verified was priced, and could have been issued, the Basic one.
  *
  * Verification wording (verified / verify / verification, MyDigital ID, MyID) means Verified; a negating or
  * self-declared word ("not yet verified", "non-verified", "self-verified", "without verification", "basic") means

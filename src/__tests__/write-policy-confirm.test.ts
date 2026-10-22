@@ -1,5 +1,5 @@
 /**
- * write_policy pays and writes only with `confirm: true`.
+ * an earlier change round 1, R1-M4: write_policy pays and writes only with `confirm: true`.
  *
  * The policy the agent writes is the policy the wallet then reads to stand its own default cap aside, so an agent that could
  * write one on its own could lift its own limit. Without `confirm: true` the call stops at the price.

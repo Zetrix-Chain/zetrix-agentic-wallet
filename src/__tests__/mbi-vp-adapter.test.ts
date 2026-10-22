@@ -54,7 +54,7 @@ describe('MbiVpAdapter (x401 VcProofProvider over MBI /vp/ext/*)', () => {
     // (request-bound), so the adapter hands it the message signer for both calls.
     expect(signMessage).not.toHaveBeenCalled()
     expect(mbi.createVp).toHaveBeenCalledWith(
-      { vc: { id: 'vc-1' }, revealAttributes: ['mykad.name'] },
+      { vc: { id: 'vc-1' }, revealAttributes: ['mykad.name'], nonce: 'n1' },
       signMessage,
     )
     expect(signHexBlob).toHaveBeenCalledWith('deadbeef')
@@ -99,7 +99,7 @@ describe('MbiVpAdapter (x401 VcProofProvider over MBI /vp/ext/*)', () => {
     await adapter.createVp({ credentialQuery: {}, nonce: 'n', holderDid: 'd' })
 
     expect(mbi.createVp).toHaveBeenCalledWith(
-      { vc: { id: 'v' }, revealAttributes: [], rangeProof: { ageOver: 18 } },
+      { vc: { id: 'v' }, revealAttributes: [], rangeProof: { ageOver: 18 }, nonce: 'n' },
       signMessage,
     )
   })
@@ -123,6 +123,7 @@ describe('MbiVpAdapter (x401 VcProofProvider over MBI /vp/ext/*)', () => {
           'agentIdentityCredential.controllerName',
           'agentIdentityCredential.purpose',
         ],
+        nonce: 'n',
       },
       signMessage,
     )
@@ -141,7 +142,7 @@ describe('MbiVpAdapter (x401 VcProofProvider over MBI /vp/ext/*)', () => {
     await adapter.createVp({ credentialQuery: AGENT_DCQL, nonce: 'n', holderDid: 'd' })
 
     expect(mbi.createVp).toHaveBeenCalledWith(
-      { vc: { id: 'v' }, revealAttributes: ['agentName'] },
+      { vc: { id: 'v' }, revealAttributes: ['agentName'], nonce: 'n' },
       signMessage,
     )
   })

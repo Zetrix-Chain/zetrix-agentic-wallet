@@ -1172,7 +1172,7 @@ describe('round 1 — the remaining findings', () => {
   })
 
   it('does not advertise requestKey as an idempotency key', () => {
-    // APP-L04, and the same wrong fact an earlier version carried: repeating one is not a safe retry.
+    // APP-L04, and the same wrong fact an earlier change carried: repeating one is not a safe retry.
     const tool = buildToolList().find((t) => t.name === 'write_policy')!
     const text = tool.inputSchema.properties!.requestKey!.description
     expect(text).toMatch(/Do NOT treat it as an idempotency key/i)
@@ -1657,7 +1657,7 @@ describe('dryRun asks for the price and does nothing else', () => {
         { status: 409, body: { state: 'ALREADY_IN_FLIGHT', receipt: 'blob-old', detail: 'already paid' } },
         { status: 200, body: { state: 'WRITTEN', policyKey: 'native-v1', txHash: '0xaaa' } },
       ])
-      // The wallet's OWN confirmed payment saved this receipt (one it does not hold is not collected at all).
+      // The wallet's OWN confirmed payment saved this receipt.
       await d.receipts.set({ blobId: 'blob-old', policyKey: 'native-v1', ownerAddress: OWNER, paidAt: '2026-10-07T00:00:00.000Z' })
       const r = await writePolicy(d, { ...INPUT, dryRun: true })
       expect(callsOf(http)).toHaveLength(1)

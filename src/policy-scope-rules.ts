@@ -6,7 +6,7 @@
  * `native-v1` with `assetScope: "JMYR"`. Preflight answered `ready: true` and described the scope as
  * "limited to JMYR". The write service refuses that draft at its free pre-check — twice over — so
  * the user was handed a confident green light for something that could never be written. That is
- * the false-assurance class that took many review rounds to remove, arriving by a different door:
+ * the false-assurance class an earlier change spent eight rounds removing, arriving by a different door:
  * preflight only checked a draft against the TEMPLATE's vocabulary, and these three rules are not
  * in the template. They live in the service.
  *

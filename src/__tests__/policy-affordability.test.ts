@@ -253,7 +253,7 @@ describe('checkAffordability — what it reports on the result', () => {
   })
 })
 
-// ── review findings ──────────────────────────────────────────────────────────────────
+// ── review findings on an earlier change ──────────────────────────────────────────────────────────────────
 
 describe('checkAffordability — a payment made IN ZTX needs the amount plus the network fee', () => {
   // PaymentEngine.checkBalance: for ZTX, required = amount + fee, from ONE balance.

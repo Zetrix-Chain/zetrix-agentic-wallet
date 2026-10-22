@@ -1,5 +1,5 @@
 /**
- * Review round 1: M1 a native policy that names a token, M2 an attribute with neither value nor valueHuman,
+ * M1 a native policy that names a token, M2 an attribute with neither value nor valueHuman,
  * and the LOW findings L1 to L5.
  *
  * Everything here goes through the REAL preflight (not a stub), with the real address checksum, so a refusal that only

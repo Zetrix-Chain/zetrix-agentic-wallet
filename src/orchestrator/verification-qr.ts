@@ -50,7 +50,7 @@ export interface VerificationLinkDeps {
   mbi: Pick<MbiClient, 'createVp' | 'submitVp'>
   signHexBlob: HexBlobSigner
   signMessage: MessageSigner
-  /** MyID's link with a `{referenceId}` placeholder. Undefined when none is configured for this network. */
+  /** MyID's link with a `{referenceId}` placeholder. Undefined only when a blank or invalid override leaves none. */
   linkTemplate?: string
   /** Renders `text` as a PNG QR code. */
   renderQr: (text: string) => Promise<Buffer>

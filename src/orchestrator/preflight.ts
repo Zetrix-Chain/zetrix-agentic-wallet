@@ -406,7 +406,7 @@ function uncheckable(isVerified: boolean, isFree = false): string[] {
   ]
   if (isVerified) {
     items.unshift(
-      'Whether the agent name is still free. myid checks uniqueness at issuance, not now, so a name in use still prices normally and is only refused after payment.',
+      'Whether the agent name is still free. myid checks uniqueness at issuance, not now, so a name in use still prices normally and is only refused at issuance, which is after the fee when there is one.',
     )
   }
   // `paymentRequired` is a service-wide MBI setting, not a property of this

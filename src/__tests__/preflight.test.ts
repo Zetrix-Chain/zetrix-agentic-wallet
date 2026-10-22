@@ -424,6 +424,7 @@ describe('credentialPreflight: the Basic-or-Verified note on an AI Birthcert', (
     const out = await credentialPreflight(deps() as never, { credential: VERIFIED_AI_BIRTHCERT })
 
     expect(out.choice).toMatch(/never assume Basic is free/i)
+    expect(out.choice).toMatch(/never assume either kind is free or paid/i)
   })
 
   // Review R1-M2: the wallet deliberately makes no claim about the fee when a name is refused (SSIVC's uniqueness check
@@ -577,6 +578,7 @@ describe('credentialPreflight nextStep', () => {
   })
 })
 
+// an earlier change review R1.
 describe('credentialPreflight: an earlier payment, when the price cannot be read or the payment is still settling', () => {
   it('a failed price read does not block when the next link reuses an earlier payment', async () => {
     const d = deps({

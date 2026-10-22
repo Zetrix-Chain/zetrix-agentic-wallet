@@ -102,7 +102,7 @@ export const QUALIFIER_ATTRIBUTES: ReadonlySet<string> = new Set([
   'assetScope',
   'unknownAttributePolicy',
   // The service's vocabulary calls it a QUALIFIER (it says WHICH token a policy governs and caps nothing
-  // itself). It was missing here until this set was compared this set with the recorded vocabulary, so a
+  // itself). It was missing here until an earlier change compared this set with the recorded vocabulary, so a
   // policy of `assetScope` + `tokenAddress` alone counted as having an enforceable constraint.
   'tokenAddress',
   ...WINDOW_RULES.map((rule) => rule.window),

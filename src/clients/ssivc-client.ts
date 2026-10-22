@@ -95,6 +95,35 @@ export interface SsivcChallenge {
   accepts: PayRequirement[]
 }
 
+/**
+ * The body of a quote request: the signed fields of a session request without the ones that only exist once a name is
+ * chosen (`agentName`, `id` and the optional fields). SSIVC verifies the signature over the fields it receives.
+ */
+export interface SsivcQuoteRequestBody {
+  publicKey: string
+  address: string
+  timestamp: string
+  ownerReference: string
+  signedData: string
+}
+
+/**
+ * SSIVC's answer to "what would a session cost, and does it cost anything". `paymentRequired` is a boolean only when SSIVC said
+ * so; anything else is `undefined`, which a caller must read as "may charge", never as free.
+ */
+export interface SsivcQuote {
+  paymentRequired: boolean | undefined
+  accepts: PayRequirement[]
+}
+
+/**
+ * The first call of a session, with no payment: SSIVC answers with the price (402), or, when it charges nothing, with the
+ * session itself.
+ */
+export type SsivcStartOutcome =
+  | { kind: 'challenge'; challenge: SsivcChallenge }
+  | { kind: 'created'; session: SsivcSessionCreated }
+
 export interface SsivcSessionCreated {
   sessionId: string
   verificationUrl: string
@@ -134,6 +163,7 @@ interface SsivcEnvelope<T> {
 }
 
 const SESSIONS_PATH = '/v2/verify/ai-birthcert/sessions'
+const QUOTE_PATH = `${SESSIONS_PATH}/quote`
 
 /**
  * Opt-in wire tracing for the SSIVC exchange, enabled with `SSIVC_TRACE=1`.
@@ -199,6 +229,40 @@ export class SsivcClient {
     return { x402Version: raw.x402Version, accepts: raw.accepts ?? [] }
   }
 
+  /**
+   * Asks what a session would cost, with nothing created and no name needed. Returns `undefined` when this SSIVC has no
+   * such route (404 or 405), so the caller can use the 402 check an older SSIVC supports. Every other failure is thrown.
+   */
+  async quoteSession(body: SsivcQuoteRequestBody): Promise<SsivcQuote | undefined> {
+    const res = await this.fetch('POST', QUOTE_PATH, body)
+    if (res.status === 404 || res.status === 405) return undefined
+    if (!res.ok) throw await this.error(res, 'quoteSession failed')
+    const env = (await res.json()) as SsivcEnvelope<{ paymentRequired?: unknown; accepts?: unknown }>
+    const data = env.data
+    // Strictly a boolean. A string "false", 0 or a missing field is not SSIVC saying it is free.
+    const paymentRequired = typeof data?.paymentRequired === 'boolean' ? data.paymentRequired : undefined
+    // A free answer needs no options to be understood, so it may leave them out; any other answer without them is malformed.
+    if (!data || typeof data !== 'object' || (!Array.isArray(data.accepts) && paymentRequired !== false)) {
+      throw new SsivcError('SSIVC quote succeeded (2xx) but returned a malformed data envelope', res.status)
+    }
+    return { paymentRequired, accepts: Array.isArray(data.accepts) ? (data.accepts as PayRequirement[]) : [] }
+  }
+
+  /**
+   * The first call of a session, with no payment headers. A 402 is the price; a 200 or 201 is a session SSIVC created
+   * without asking for payment. Only call this once a quote has said the session is free, or when a 402 is what is wanted
+   * anyway: where SSIVC charges nothing, this creates a real session.
+   */
+  async startSession(body: SsivcSessionRequestBody): Promise<SsivcStartOutcome> {
+    const res = await this.fetch('POST', SESSIONS_PATH, body)
+    if (res.status === 402) {
+      const raw = (await res.json()) as { x402Version: number; accepts?: PayRequirement[] }
+      return { kind: 'challenge', challenge: { x402Version: raw.x402Version, accepts: raw.accepts ?? [] } }
+    }
+    if (res.status === 200 || res.status === 201) return { kind: 'created', session: await this.readCreatedSession(res) }
+    throw await this.error(res, 'startSession: expected 402 payment_required or a created session')
+  }
+
   /** Fresh pay — retry with `X-Payment`. Returns the session plus the settlement receipt to persist. */
   createSessionSettle(body: SsivcSessionRequestBody, xPayment: string): Promise<SsivcSessionOutcome> {
     return this.createSessionPaid(body, { 'X-Payment': xPayment })
@@ -227,16 +291,17 @@ export class SsivcClient {
       return { kind: 'queued', paymentReceipt, retryAfterSeconds }
     }
 
+    return { kind: 'settled', session: await this.readCreatedSession(res), paymentReceipt }
+  }
+
+  /** The session in a 2xx create response. */
+  private async readCreatedSession(res: Response): Promise<SsivcSessionCreated> {
     const env = (await res.json()) as SsivcEnvelope<{ sessionId: string; verification_url: string; expiresAt: string }>
     const data = env.data
     if (!data || typeof data !== 'object' || !data.sessionId || !data.verification_url || !data.expiresAt) {
       throw new SsivcError('SSIVC createSession succeeded (2xx) but returned a malformed data envelope', res.status)
     }
-    return {
-      kind: 'settled',
-      session: { sessionId: data.sessionId, verificationUrl: data.verification_url, expiresAt: data.expiresAt },
-      paymentReceipt,
-    }
+    return { sessionId: data.sessionId, verificationUrl: data.verification_url, expiresAt: data.expiresAt }
   }
 
   async getSession(sessionId: string): Promise<SsivcSessionStatus> {

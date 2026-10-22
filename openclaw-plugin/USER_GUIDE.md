@@ -60,13 +60,20 @@ Other things that work straight away, all free:
 | Which credentials you hold | no |
 | What a credential template requires | no |
 | Reading on-chain contract data | no |
+| Reading the spending policy you have set on chain | no |
+| Checking a draft spending policy before you set it | no |
 | Proving your identity to a service | no |
 | Showing a person a link and QR code to verify the agent in the MyID wallet | no |
 | **Fetching a resource that charges per use** | **yes** |
 | **Obtaining a verifiable credential** | **yes** |
 | **Starting a Verified AI Birthcert check (owner identity verification via MyDigital ID)** | **yes** |
+| **Setting, changing or removing a spending policy on chain** | **yes** (a fee, or only network gas if you pay it yourself; quoted before you pay; removing one is free) |
 
-The three paid actions are refused until you set a limit.
+The paid actions are refused until you set a limit.
+
+Before it shows a credential to anyone, the wallet asks the issuer's service whether the credential has been **revoked**. If it has,
+the agent tells you. The wallet only warns and still shows it, so you decide what to do. If the issuer's service cannot be reached,
+the wallet says it could not check; that is not the same as the credential being fine.
 
 ---
 
@@ -164,15 +171,42 @@ The limit is enforced by the wallet itself, before any payment is signed. Your a
 past it, and neither can a website. If a payment exceeds the limit it is refused, and the agent should
 tell you so rather than retrying.
 
+This holds for a limit you set yourself in `maxPaymentAmount`: nothing replaces it. If you leave it unset, the wallet applies a default
+(1 JMYR per call), and a spending policy you set on chain for a token **replaces that default for that token** (see "Spending policy on
+chain" below).
+
 > ⚠️ **Set this through the plugin settings, not by editing `openclaw.json` directly.** The plugin
 > manages its own entry in that file and will either overwrite your edit or stop managing the entry
 > altogether. Neither is obvious when it happens.
 
+## Spending policy on chain (optional)
+
+The limit above is checked by the wallet on every payment, except that a policy can replace the wallet's DEFAULT limit for a token it
+governs. A **spending policy** is stored on chain and enforced by the signing service when the agent spends, **where that service has
+enforcement switched on**, so it can hold limits the wallet alone cannot, such as a list of allowed recipients. Two things to know:
+
+- **A policy replaces the wallet's default limit for the token it governs** on testnet and mainnet. A limit you set yourself in
+  `maxPaymentAmount` is never replaced, so **if you want the wallet's limit to stay in force whatever policy exists, set `maxPaymentAmount`
+  in the plugin settings.** The replacement cannot be switched off from the plugin settings: where the signing service does not enforce
+  policies, a policy removes the wallet's only limit for that token and nothing enforces the policy.
+- **A total over a week needs spend history that is not tracked on testnet today.** Do not rely on one yet.
+
+- Ask the agent to **check** a draft first. It shows you, in plain words, what the policy will mean. Read it: a policy that is valid can
+  still mean something other than what you intended.
+- Setting or changing a policy **is a paid action and needs your yes**: a fee in JMYR, or only network gas if you pay the gas yourself. The agent tells you the price and waits. It will not pay on its own.
+- **Removing a policy lifts every limit it set**, so the agent asks you to confirm.
+- Reading your policies is always free.
+- If a write ends as "unknown", the payment may have been made and its outcome could not be determined: **do not ask the agent to pay or
+  send it again**. It can read the chain to see whether the policy is there. For a sponsored write, give the receipt to support; a self-paid
+  write has no receipt, so give them the nonce the agent shows.
+
+---
+
 ## Getting an AI Birthcert
 
-There are two kinds. **Basic** is self-declared by the agent, with no check of the owner's identity: it is quick and shows only the agent's username. **Verified** confirms the owner's identity through MyDigital ID: the fee is paid up front, the owner completes a check in the MyDigital ID app, and the agent name must be unique (it is only checked after payment, so a name that turns out to be taken is refused late).
+There are two kinds. **Basic** is self-declared by the agent, with no check of the owner's identity: it is quick and shows only the agent's username. **Verified** confirms the owner's identity through MyDigital ID: the owner completes a check in the MyDigital ID app, and the agent name must be unique. Whether there is a fee is shown by the agent's readiness check before it asks for anything. When there is one, it is paid up front and the name is only checked after payment, so a name that turns out to be taken is refused late; when there is not, nothing is paid and the session starts straight away.
 
-If you ask for an AI Birthcert without saying which, the agent first checks what the wallet already holds, explains the difference, and asks which you prefer; it offers only the kind you do not already have. If you want both, it issues them one after the other, Basic first. If you give it a name, it uses that name as you gave it and does not ask for it again (if it suggests a tidier form it waits for your yes first). Where the Verified kind is not configured (today that is mainnet, and this plugin has no setting for it), the agent says so and offers only Basic.
+If you ask for an AI Birthcert without saying which, the agent first checks what the wallet already holds, explains the difference, and asks which you prefer; it offers only the kind you do not already have. If you want both, it issues them one after the other, Basic first. If you give it a name, it uses that name as you gave it and does not ask for it again (if it suggests a tidier form it waits for your yes first). If the Verified kind is unavailable (for example the issuing service cannot be reached), the agent says so and offers only Basic.
 
 **A paid credential asks before it pays.** When a credential costs something, the agent first tells you the price (and says when network gas is paid on top) and waits for your yes. Nothing is paid on the first request. Your yes covers only that price, for that request, for about 10 minutes, and pays once: if the price or the request changes, or the time runs out, the agent asks again. A free credential, one you already hold, and a verification link that reuses an earlier payment need no yes.
 
@@ -182,10 +216,9 @@ Ask the agent to verify itself and it can give you a link and a QR code that ope
 wallet. Anyone who holds the link can read what it reveals until it expires (5 minutes by default), so the agent
 shows it only to you and tells you which attributes it reveals.
 
-On testnet this works out of the box: the link points at MyID's UAT address. On mainnet it needs one setting until MyID's
-production side is verified: **MyID verification link** (`myidVerifyLinkTemplate`), an `https` link with `{referenceId}` where
-the reference id goes, for example `https://<MyID link domain>/<path>?referenceId={referenceId}`. Until it is set there the
-agent answers that it cannot create the link.
+This works out of the box on both networks: the link points at MyID's UAT address on testnet and at its production address on
+mainnet. To use another link, set **MyID verification link** (`myidVerifyLinkTemplate`): an `https` link with `{referenceId}`
+where the reference id goes, for example `https://<MyID link domain>/<path>?referenceId={referenceId}`.
 
 ```bash
 openclaw config set plugins.entries.zetrix-agentic-wallet.config.myidVerifyLinkTemplate \
@@ -235,11 +268,11 @@ Before you do:
 
 - **Back up your wallet** (above) if you have not already
 - **Review your spending limit** — the same number now means real money
-- **The Verified AI Birthcert check is unavailable on mainnet through this plugin.** Its endpoint
-  was never confirmed reachable on mainnet, so the wallet refuses to use it there unless an
-  operator sets it explicitly — something this plugin does not currently expose a setting for.
-  Every other tool works normally.
-- Note that mainnet uses a **different account** from your testnet one
+- **The Verified AI Birthcert works on mainnet** with no setting: the wallet uses the production issuing service, the MyID
+  verification link and the mainnet template.
+- **Spending policies work on mainnet too**, with the same steps; the policy contracts and the write service are built in. The fee is
+  real money, and a policy is enforced by the signing service, so check with your operator that it is switched on before you rely on it.
+- Note that mainnet uses a **different account** from your testnet one. The wallet keeps one saved account per network (`account.testnet.json` and `account.mainnet.json` in the state folder), so changing the network setting picks up the right one, and the first start on mainnet creates a new account there. An account saved by an older version (`account.json`) is placed on its network automatically and left in place
 
 ## If something is wrong
 

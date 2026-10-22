@@ -1,5 +1,5 @@
 /**
- * Phase 1: who pays the gas is the user's choice, put to them when self-pay is on offer and never made by the wallet.
+ * an earlier change phase 1: who pays the gas is the user's choice, put to them when self-pay is on offer and never made by the wallet.
  *
  * Self-pay is offered only when the wallet can carry it out (`deps.selfPay`). Without it nothing changes. With it, a call that names no
  * `gasPayer` stops at `needs_choice` (nothing paid, whatever `confirm` says); "sponsored" is today's flow; "self" is refused until the

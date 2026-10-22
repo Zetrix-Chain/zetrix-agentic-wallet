@@ -27,10 +27,10 @@ describe('the out-of-the-box spending cap, end to end', () => {
     expect(() => assertWithinPaymentCap(mainnetFee, cfg.credentialIssuanceCaps)).not.toThrow()
   })
 
-  // Note: the allowance WAS scoped to issuance on purpose, because pay_and_fetch auto-pays arbitrary URLs and a
-  // misled agent could drain a wallet nobody configured. The reviewer agreed to give the general cap the same default; the
+  // an earlier change note: the allowance WAS scoped to issuance on purpose, because pay_and_fetch auto-pays arbitrary URLs and a
+  // misled agent could drain a wallet nobody configured. It was decided to give the general cap the same default; the
   // exposure is now up to 1 JMYR per call, with no running total, until the user sets MAX_PAYMENT_AMOUNT.
-  it('and now the same 1 JMYR is allowed by the GENERAL cap too, and nothing above it or in any other asset', () => {
+  it('and the same 1 JMYR is allowed by the GENERAL cap too, and nothing above it or in any other asset', () => {
     const cfg = loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet' } as never)
     const mainnetFee = { asset: JMYR_MAINNET, maxAmountRequired: '1000000' }
     expect(() => assertWithinPaymentCap(mainnetFee, cfg.maxPaymentAmount)).not.toThrow()

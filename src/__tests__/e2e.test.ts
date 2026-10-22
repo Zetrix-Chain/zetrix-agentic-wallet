@@ -19,7 +19,8 @@ import jsQR from 'jsqr'
 import { X401Wallet } from 'x401-zetrix-client'
 import { WalletBeClient } from '../clients/wallet-be-client'
 import { WalletBeSigner } from '../signer'
-import { MbiVpAdapter, type VcPresentInput } from '../clients/mbi-vp-adapter'
+import type { PresentedNonceStore } from '../clients/presented-nonce-store'
+import { createX401WalletFactory } from '../x401-wallet-factory'
 import { MbiClient } from '../clients/mbi-client'
 import { ZidResolverClient } from '../clients/zid-resolver-client'
 import { resolveIssuerProofKeys } from '../clients/resolve-issuer-proof-keys'
@@ -115,11 +116,20 @@ describe('agentic-wallet-mcp prove_identity — end to end', () => {
     const mbi = new MbiClient('https://mbi.test')
     const zidResolver = new ZidResolverClient(ZID_RESOLVER)
     const resolveIssuerKeys = (vc: unknown) => resolveIssuerProofKeys(vc, zidResolver)
-    const makeWallet = (present: VcPresentInput) =>
-      new X401Wallet(
-        { oid4vpBaseUrl: OID4VP },
-        { signer, vc: new MbiVpAdapter(mbi, walletBeSignerFn, messageSigner, resolveIssuerKeys, present) },
-      )
+    const claimed = new Set<string>()
+    const answered: PresentedNonceStore = {
+      claim: async (n) => (claimed.has(n) ? false : (claimed.add(n), true)),
+      release: async (n) => void claimed.delete(n),
+    }
+    const makeWallet = createX401WalletFactory({
+      config: { oid4vpBaseUrl: OID4VP, network: 'zetrix:testnet', bindPresentation: true },
+      mbi,
+      signer,
+      signHexBlob: walletBeSignerFn,
+      signMessage: messageSigner,
+      resolveIssuerKeys,
+      answered,
+    })
 
     const tools = createTools({
       config: { holderDid: 'did:zid:h', zetrixAddress: 'ZTX3H', network: 'zetrix:testnet' },
@@ -140,7 +150,7 @@ describe('agentic-wallet-mcp prove_identity — end to end', () => {
     // MBI was driven create → submit(includeVp:true); Wallet BE signed one request-bound login per
     // /ext call, the VP blob, and (separately) the holder-binding nonce.
     const createCall = fetchMock.mock.calls.find(([u]) => String(u).endsWith('/v1/vp/ext/create'))
-    expect(JSON.parse((createCall![1] as RequestInit).body as string)).toEqual({ vc: heldVc, revealAttributes: [] })
+    expect(JSON.parse((createCall![1] as RequestInit).body as string)).toEqual({ vc: heldVc, revealAttributes: [], nonce: 'nonce-1', audience: 'https://verifier.test' })
     const submitCall = fetchMock.mock.calls.find(([u]) => String(u).endsWith('/v1/vp/ext/submit'))
     expect(JSON.parse((submitCall![1] as RequestInit).body as string)).toEqual({
       blobId: 'b1', signedBlob: 'sig', publicKey: 'edpk', includeVp: true,
@@ -166,12 +176,23 @@ describe('agentic-wallet-mcp prove_identity — end to end', () => {
     const oid4vpBody = JSON.parse((oid4vpSubmitCall![1] as RequestInit).body as string)
     expect(oid4vpBody.bbs_public_key).toBe('zISSUERBBSKEY')
     expect(oid4vpBody.ed25519_public_key).toBe('issuered25519hex')
+    // The verifier reads the holder's key from `holder_binding.publicKey`: it must be the key that signed the presentation (the one MBI was given).
+    expect(oid4vpBody.holder_binding.publicKey).toBe('edpk')
+    expect(oid4vpBody.holder_binding.publicKey).toBe(JSON.parse((submitCall![1] as RequestInit).body as string).publicKey)
 
     // PROOF-RESPONSE envelope carries the verbatim payload + HMAC + timestamp.
     const env = JSON.parse(Buffer.from(out.proofResponseHeader, 'base64url').toString('utf8'))
     expect(env.signature).toBe('hmac-sig')
     expect(env.timestamp).toBe('2026-01-01T00:00:00Z')
     expect(JSON.parse(env.payload)).toMatchObject({ presentationId: 'req-1', verified: true, status: 'VERIFIED' })
+
+    // The same challenge is not answered twice, and the refusal comes before anything else is asked of MBI or the HSM.
+    const callsBefore = fetchMock.mock.calls.length
+    await expect(tools.prove_identity({ proofRequest: proofRequestHeader(), vc: heldVc })).rejects.toMatchObject({
+      cause: expect.objectContaining({ message: expect.stringMatching(/already been answered/) }),
+    })
+    const newCalls = fetchMock.mock.calls.slice(callsBefore).map(([u]) => String(u))
+    expect(newCalls.some((u) => u.endsWith('/v1/vp/ext/create') || u.endsWith('/wallet/hsm/sign-blob'))).toBe(false)
   })
 })
 

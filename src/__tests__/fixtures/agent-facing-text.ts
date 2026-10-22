@@ -26,6 +26,8 @@ export const EXPECTED_AGENT_TEXT: Record<string, Record<string, readonly string[
       "Report the holder DID/address/network and the client-supplied held credentials.",
       "With `token`, also returns that token's balance and its contract address (`tokenAddress`) — the value a policy's tokenAddress needs, so the user never has to be asked for it.",
       "Report a balance to the user as its `display` amount only.",
+      "It also returns `credentialStatus`, one entry per held credential (at most ten): \"active\", \"revoked\" (the issuer has revoked it: tell the user, it is likely to be refused) or \"unknown\" (the check could not be made, which is a warning and not a finding).",
+      "The credentials themselves are returned untouched.",
     ],
     "inputSchema.properties.heldCredentials.description": [
       "VCs the client holds.",
@@ -57,6 +59,8 @@ export const EXPECTED_AGENT_TEXT: Record<string, Record<string, readonly string[
       "This is the MyID wallet, not the MyDigital ID app that confirms a Verified AI Birthcert owner: never name one for the other.",
       "In a chat channel such as WhatsApp, send the QR code by attaching the file at qrCodePath; never send any other image as the QR code, because the credential's pass design is not one, and if you cannot attach an image, give the link and say plainly that you could not send the QR code.",
       "When the credential has a saved pass design, the result also carries vcPassImagePaths: if the user wants to see the credential itself, send that image too, as its own picture captioned as the credential's pass design and never as the QR code.",
+      "The result carries `credentialStatus`: the wallet asks the issuer's service whether the credential has been revoked and only warns, so a link is still made.",
+      "If it says \"revoked\" the message says so: tell the user plainly, because whoever opens the link will see a revoked credential.",
       "If it returns created: false, relay the reason and do not invent a link.",
     ],
     "inputSchema.properties.vc.description": [
@@ -80,6 +84,9 @@ export const EXPECTED_AGENT_TEXT: Record<string, Record<string, readonly string[
     "description": [
       "Answer an x401 PROOF-REQUEST and return the PROOF-RESPONSE header to replay to the resource server.",
       "If the wallet holds several credentials, pass vc: use the one the request or the verifier's challenge names, and if it names none, prefer the Verified AI Birthcert over the Basic one and say which one you presented.",
+      "The result carries `credentialStatus`: the wallet asks the issuer's service whether the credential has been revoked and only WARNS.",
+      "If `credentialStatus.state` is \"revoked\" the proof was still made, but a verifier is likely to refuse it: tell the user and ask whether they want a new credential.",
+      "If it is \"unknown\" the check could not be made (the credential was used anyway); say so only if the verifier then refuses it.",
     ],
     "inputSchema.properties.proofRequest.description": [
       "The PROOF-REQUEST header value from the 401 challenge.",
@@ -562,6 +569,7 @@ export const EXPECTED_AGENT_TEXT: Record<string, Record<string, readonly string[
     "description": [
       "Obtain a VC from MBI: build the signed payload, pay x402, and return the issued credential.",
       "If a spending policy refuses the fee, the result has `policyDenied: true` (a decision: do not retry) or `policyCheckUnavailable: true` (transient: trying again shortly is right); either way nothing was paid and no credential was issued.",
+      "A credential returned from the cache also carries `credentialStatus` (the issuer may have revoked it since it was issued): if it says \"revoked\", tell the user before reusing it and offer to replace it.",
       "If a still-valid credential for this templateId is already cached locally, it is returned with no payment as { issued: false, alreadyHeld: true, fromCache: true, reason }: the user already has it, so never tell the user it was just issued.",
       "If it carries different values from the ones asked for (a different username, say), `differsFromRequest` lists them: tell the user and ask whether to keep it or replace it.",
       "Setting forceReissue:true alone does NOT pay again — it only asks to be shown that existing credential first: you get back { issued: false, vcId, vc, fromCache: true, reason } instead, and nothing is paid.",
@@ -652,7 +660,7 @@ export const EXPECTED_AGENT_TEXT: Record<string, Record<string, readonly string[
     "description": [
       "Start a Verified AI Birthcert issuance session with myid (MyDigital ID owner verification).",
       "The owner confirms in the MyDigital ID app, not the MyID wallet (that is only for the QR from create_verification_qr); never name one for the other.",
-      "ALWAYS run credential_preflight for \"verified_ai_birthcert\" immediately before calling this, even if you checked earlier in the conversation — preflight is free, this tool spends real funds, and a balance the user topped up a minute ago is not the balance you read before that.",
+      "ALWAYS run credential_preflight for \"verified_ai_birthcert\" immediately before calling this, even if you checked earlier in the conversation — preflight is free, this tool can spend real funds when the check says a fee applies, and a balance the user topped up a minute ago is not the balance you read before that.",
       "If a spending policy refuses the session fee, the result is { error } with `policyDenied: true` (a decision: do not retry) or `policyCheckUnavailable: true` (transient: trying again shortly is right); either way nothing was paid and no session was created.",
       "Returns { sessionId, verificationUrl, expiresAt, expiresIn, expiresInSeconds, paidThisCall, message } — show verificationUrl to the human owner and ask them to open it and complete MyDigital ID verification (typically finishes in seconds).",
       "Tell them how long the link is good for by quoting `expiresIn` exactly as given: the wallet works it out from its own clock, so never calculate the time remaining yourself from `expiresAt` — your clock and timezone may differ from the server's.",
@@ -668,7 +676,8 @@ export const EXPECTED_AGENT_TEXT: Record<string, Record<string, readonly string[
       "A new link after an expired one does not pay again either: it reuses the payment already made, which is only used up once the credential is issued.",
       "Every session result says so in `paidThisCall` (true only when THIS call sent a payment), and `message` opens with \"No new payment\" when it did not.",
       "Count a fee only when paidThisCall is true: never tell the user they paid once per link.",
-      "This tool spends real funds: it self-pays an x402 challenge, subject to the same credential-issuance payment cap as subscribe_and_issue, which by default allows at most 1 JMYR for one payment.",
+      "When the check says no payment is needed, this tool creates the session directly: there is no price to confirm, `paidThisCall` is false and `message` opens with \"No payment was needed\".",
+      "When the check says a fee applies, this tool spends real funds: it self-pays an x402 challenge, subject to the same credential-issuance payment cap as subscribe_and_issue, which by default allows at most 1 JMYR for one payment.",
       "Set MAX_PAYMENT_AMOUNT to override it; a spending policy that governs the asset replaces the default cap.",
       "It can return { error: \"...\" } instead of a session.",
       "Read `message` before deciding what to tell the user or whether retrying is safe — it does NOT always mean nothing was paid.",
@@ -729,10 +738,12 @@ export const EXPECTED_AGENT_TEXT: Record<string, Record<string, readonly string[
     ],
     "inputSchema.properties.dryRun.description": [
       "Ask the price WITHOUT paying.",
-      "Returns { quote: { asset, maxAmountRequired, payTo, gasModel } } and spends nothing, creates no session, and starts no verification — so you can tell the user the cost before collecting anything.",
+      "Returns { quote: { asset, maxAmountRequired, payTo, gasModel, paymentRequired } } and spends nothing, creates no session, and starts no verification — so you can tell the user the cost before collecting anything.",
       "`maxAmountRequired` is in the asset's RAW base units; resolve decimals (wallet_status returns `display`) before quoting a figure to a human.",
-      "A quote does NOT reserve the name and does NOT check whether it is already taken — myid checks uniqueness only at issuance, so a name already in use still quotes cleanly.",
-      "`agentName` is still required because the server rejects a request without one, but the fee does not depend on it.",
+      "When `paymentRequired` is false the service is not charging: the amount is only indicative and the user will not be asked to pay.",
+      "A quote does NOT reserve the name and does NOT check whether it is already taken.",
+      "`agentName` is still required by this tool, but the fee does not depend on it.",
+      "A service with no quote route can only be priced by a session request: it is sent a throwaway name, never the name the user gave, and a service that is not charging then makes a session nobody receives.",
     ],
     "inputSchema.properties.discardStuckReceiptAndPayFresh.description": [
       "DESTRUCTIVE, and it SPENDS.",
@@ -782,7 +793,7 @@ export const EXPECTED_AGENT_TEXT: Record<string, Record<string, readonly string[
   "credential_preflight": {
     "description": [
       "FREE readiness check — call this FIRST, before collecting ANY application detail from the user, whenever they ask for a credential.",
-      "Spends nothing, signs no transaction, creates no session.",
+      "Spends nothing, signs no transaction, creates no session for the user.",
       "Returns { ready, fee, balances, cap, schema?, alreadyHeld?, unusedPayment?, blockers, notChecked }: the live fee and which side pays gas, the balances that matter, whether the spending limit permits it, and — for a template credential — the attributes it requires.",
       "`blockers` lists EVERY reason it is not ready at once (a low balance and a too-low spending limit are different problems and both appear together), so one round of fixes is enough rather than discovering them one failed payment at a time.",
       "ALWAYS relay `notChecked` too: a clean result is not a guarantee.",

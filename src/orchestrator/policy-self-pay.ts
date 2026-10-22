@@ -1,5 +1,5 @@
 /**
- * Self-paid policy write (phase 2): the wallet builds the contract call itself, signs it through Wallet BE and submits it
+ * Self-paid policy write: the wallet builds the contract call itself, signs it through Wallet BE and submits it
  * directly, paying only the network gas in ZTX. No service fee and no call to ms-zetrix.
  *
  * The call is `PolicyRegistry.createOrUpdatePolicy`, made by the owner as a top-level transaction (the contract requires

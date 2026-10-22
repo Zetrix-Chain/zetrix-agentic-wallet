@@ -308,7 +308,7 @@ describe('requestAiBirthcertVerification', () => {
       verificationUrl: 'https://zvg.test/verify/old-tok', paymentReceipt: 'receipt-old',
     })
     getSession.mockResolvedValue({ sessionId: 's-old', status: 'issued', expiresAt: '2026-08-17T08:30:00+00:00', vcId: 'did:zid:vc-old' })
-    // APP-C01: the cache is empty, so the pre-payment existing-VC check resolves this
+    // an earlier change/APP-C01: the cache is empty, so the pre-payment existing-VC check resolves this
     // issued session's VC via MBI before deciding whether to pay — expired, so it auto-replaces.
     deps.mbi.downloadVcs.mockResolvedValue([
       { vc: { id: 'did:zid:vc-old', credentialSubject: { id: 'did:zid:owner123' }, validUntil: '2026-01-01T00:00:00Z' } },
@@ -332,7 +332,7 @@ describe('requestAiBirthcertVerification', () => {
       verificationUrl: 'https://zvg.test/verify/old-tok', paymentReceipt: 'receipt-old',
     })
     getSession.mockResolvedValue({ sessionId: 's-old', status: 'issued', expiresAt: '2026-08-17T08:30:00+00:00', vcId: 'did:zid:vc-old' })
-    // APP-C01: same as above — resolved as expired, so the pre-payment check auto-replaces.
+    // an earlier change/APP-C01: same as above — resolved as expired, so the pre-payment check auto-replaces.
     deps.mbi.downloadVcs.mockResolvedValue([
       { vc: { id: 'did:zid:vc-old', credentialSubject: { id: 'did:zid:owner123' }, validUntil: '2026-01-01T00:00:00Z' } },
     ])
@@ -2076,11 +2076,11 @@ describe('R10: the paid-this-call wording is pinned on every half of every branc
     expect(text(out)).not.toMatch(/Nothing is lost/i)
   })
 
-  // The young-receipt wording used to say "Nothing has gone wrong and no funds are lost" for
+  // an earlier change. The young-receipt wording used to say "Nothing has gone wrong and no funds are lost" for
   // ANY undetermined outcome - including 69 (SSIVC itself says it cannot confirm the settlement) and a
   // 409 blob_already_settled (which most likely means the money DID move). Neither can support that
   // sentence, and a settlement can confirm on chain after SSIVC has answered with either code
-  // (SPEC.md section 6). Pinned by TEXT, per review finding R3-M01: field presence alone would pass a message
+  // (SPEC.md section 6). Pinned by TEXT, per an earlier change R3-M01: field presence alone would pass a message
   // that still made the claim.
   const UNSUPPORTED_SAFETY = /nothing has gone wrong|no funds are lost|nothing is lost|funds are safe/i
   const unconfirmed69 = async () => {
@@ -2136,7 +2136,7 @@ describe('R10: the paid-this-call wording is pinned on every half of every branc
     expect(out.outcomeUnknown).toBeUndefined()
   })
 
-  // When the outcome is unresolved the message used to carry none of what SSIVC actually said,
+  // an earlier change. When the outcome is unresolved the message used to carry none of what SSIVC actually said,
   // so the host agent had nothing real to quote and - asked what SSIVC returned - invented a story
   // ("stuck after 12+ minutes", "normal on testnet") and offered to discard the receipt and pay again.
   // The answer is now in the message, and so is a sentence the agent can relay as-is.
@@ -2204,7 +2204,7 @@ describe('R10: the paid-this-call wording is pinned on every half of every branc
     expect(t).not.toMatch(/Ignore previous instructions/)
   })
 
-  // 409 + status_code 26 is a taken agentName, checked BEFORE the fee is deducted. It must
+  // an earlier change. 409 + status_code 26 is a taken agentName, checked BEFORE the fee is deducted. It must
   // not read as a settled payment (the blob_already_settled wording says the fee was most likely
   // taken and warns a retry pays again - both false here), and it must tell the user to pick another
   // name rather than "check again later", because this name will never become free.
@@ -2957,7 +2957,7 @@ describe('discarding a stuck receipt and paying fresh, in one call', () => {
     expect((await sessionStore.get()).paymentReceipt).toBe('r-stuck')
   })
 
-  // This used to be the OPPOSITE test ("works on a receipt younger than the stuck threshold,
+  // an earlier change. This used to be the OPPOSITE test ("works on a receipt younger than the stuck threshold,
   // since the user asked explicitly"), on the reasoning that the two-step route had no age gate either.
   // A live run showed why that was wrong: the wallet cannot verify a human agreed - the "consent token"
   // is just the receipt id echoed back - and a bare "retry" was taken as agreement to "discard and pay a
@@ -5091,6 +5091,7 @@ describe('request_ai_birthcert_verification pays only the confirmed price', () =
   })
 })
 
+// an earlier change review R2.
 describe('request_ai_birthcert_verification R2', () => {
   const SAMPLE_QUOTE = { asset: 'ZTX', maxAmountRequired: '1000', payTo: 'ZTX3Pay', gasModel: 'self' as const }
 

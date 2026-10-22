@@ -16,9 +16,9 @@ export type AiBirthcertKind = 'basic' | 'verified'
 export function aiBirthcertChoice(kind: AiBirthcertKind, opts: { unavailable?: boolean } = {}): string {
   const note =
     'AI Birthcert comes in two kinds. BASIC: self-declared by the agent, with no check of the owner\'s identity; it is quick, shows only the agent\'s username, and does not mean the owner was verified. ' +
-    'VERIFIED: the owner\'s identity is confirmed through MyDigital ID; the fee is paid up front, the owner completes a check in the MyDigital ID app (not the MyID wallet, which is only for a verification QR), and the agent name must be unique ' +
-    '(the name is only checked after payment, so a name that turns out to be taken is refused late, and whether the fee was spent cannot be confirmed). ' +
-    'Each kind has its own price, read from the check for that kind: never assume Basic is free. ' +
+    'VERIFIED: the owner\'s identity is confirmed through MyDigital ID; the owner completes a check in the MyDigital ID app (not the MyID wallet, which is only for a verification QR), and the agent name must be unique. ' +
+    'Whether a fee applies, and how much, comes from the check for that kind and not from this note. When the check says one does, it is paid up front, the name is only checked after payment (so a name that turns out to be taken is refused late, and whether the fee was spent cannot be confirmed). When the check says no payment is needed, nothing is paid. ' +
+    'Each kind has its own price, read from the check for that kind: never assume either kind is free or paid, and never assume Basic is free. ' +
     `This result is for the ${kind === 'basic' ? 'BASIC' : 'VERIFIED'} one. ` +
     'If the user has not said which kind they want (they did not say "verified" or "basic", and did not mention MyDigital ID or owner verification), do not start either: ' +
     'run this check for both kinds (it is free) to see what the wallet already holds, tell the user the difference in plain words, offer only the kind or kinds they do not already hold, and ask which they prefer. ' +

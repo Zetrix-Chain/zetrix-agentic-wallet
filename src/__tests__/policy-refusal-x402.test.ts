@@ -1,5 +1,5 @@
 /**
- * the four x402 paying paths report a Wallet BE policy refusal as what it is.
+ * an earlier change — the four x402 paying paths report a Wallet BE policy refusal as what it is.
  *
  * Wallet BE gates every signature that spends the signer's assets, so the same two codes that
  * `transfer_token` handles can reach `pay_and_fetch`, `subscribe_and_issue`, the Verified AI Birthcert

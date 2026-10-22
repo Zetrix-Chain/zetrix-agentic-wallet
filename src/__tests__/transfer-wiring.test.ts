@@ -19,7 +19,7 @@ import { ZTP20_V1 } from './fixtures/real-policy-templates'
  * collaborators — which is the right thing for an orchestrator test and exactly why it cannot see
  * a production wiring swap.
  *
- * Same defect class and same remedy as `payment-cap-wiring.test.ts`: the
+ * Same defect class and same remedy as `payment-cap-wiring.test.ts` (an earlier review): the
  * pairing is moved out of `main()` into a function, so this file is the only place it exists.
  *
  * The validator is a DEFAULT PARAMETER rather than something `main()` passes. That matters for what
@@ -166,7 +166,7 @@ describe('the wired deps behave correctly end to end through the orchestrator', 
 // round 4's APP-M02 was that calling them one gate is false.
 describe('buildAddressValidator — policy_preflight\'s checksum gate', () => {
   /**
-   * APP-M04. policy_preflight's ADDRESS gate was wired at the mcp-tools call site as
+   * an earlier change APP-M04. policy_preflight's ADDRESS gate was wired at the mcp-tools call site as
    * `deps.transferDeps?.isValidAddress`. Replacing that with `undefined` or `() => true` disabled
    * the entire gate and left 1204/1204 green, because every test supplied its own validator.
    *

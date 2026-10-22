@@ -1,5 +1,5 @@
 /**
- * The three things a real transcript showed preflight leaving to guesswork.
+ * the three things a real transcript showed preflight leaving to guesswork.
  *
  * "token use jmyr, limit per transaction 1 jmyr, cumulativeMax 100, window per week" on ztp20-v1:
  *  1. the agent asked the user for JMYR's contract address, which the wallet already holds;
@@ -418,7 +418,7 @@ describe('window format', () => {
   })
 })
 
-// ── review findings ──────────────────────────────────────────────────────────────────
+// ── review findings on an earlier change ──────────────────────────────────────────────────────────────────
 
 describe('a valid window says what period it is', () => {
   const withWindow = (value: string) =>

@@ -1668,7 +1668,7 @@ async function runSelfPayLocked(
     case 'rejected':
       return { state: 'refused', paid: false, policyKey, interpretation, message: `NOTHING WAS SENT and no gas was spent: ${sent.reason}. Fix the cause and ask again.` }
     case 'refused': {
-      // An older Wallet BE refuses any contract call that is not a plain transfer from a wallet that has a policy contract. That
+      // A Wallet BE without an earlier change refuses any contract call that is not a plain transfer from a wallet that has a policy contract. That
       // says nothing about the policy's limits and retrying cannot help, so it is not worded as "review your policy". It is a decision
       // (kind "denied") and names UNSUPPORTED_OPERATION; both must hold.
       if (sent.refusal.kind === 'denied' && /UNSUPPORTED_OPERATION/.test(sent.refusal.reason)) {
@@ -1680,7 +1680,7 @@ async function runSelfPayLocked(
           ...policyRefusalFlags(sent.refusal),
           message:
             `No policy was ${done}, nothing was signed and no gas was spent. This Wallet BE refuses to sign this kind of transaction (a contract call that is not a ` +
-            `plain token transfer) for a wallet that already has a policy contract (an older Wallet BE does): ${sent.refusal.reason}. That is not about this ` +
+            `plain token transfer) for a wallet that already has a policy contract: ${sent.refusal.reason}. That is not about this ` +
             `policy's limits and retrying will not help. ` +
             (deps.client ? 'Use gasPayer "sponsored" instead.' : 'Sponsored is not available either (no policy service is configured).'),
         }

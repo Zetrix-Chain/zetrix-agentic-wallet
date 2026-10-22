@@ -1,5 +1,5 @@
 /**
- * The checks that would have caught that, run against the REAL templates.
+ * The checks that would have caught an earlier change, run against the REAL templates.
  *
  * Everything here uses `fixtures/real-policy-templates.ts`, copied from chain. The five defects this
  * pins all shipped through a thorough, self-consistent suite that validated against an invented
@@ -137,7 +137,7 @@ describe('type validation actually fires on a real template', () => {
 })
 
 describe('list attributes are read with the RIGHT POLARITY, or not interpreted at all', () => {
-  // APP-C01: the first cut keyed on the TYPE alone, so a denylist got allowlist prose —
+  // an earlier change APP-C01: the first cut keyed on the TYPE alone, so a denylist got allowlist prose —
   // a user told that listing an address permits it would list the addresses they wanted to allow,
   // thereby blocking exactly those and permitting everyone else. The type says a value is a list;
   // it says nothing about which way the list points.

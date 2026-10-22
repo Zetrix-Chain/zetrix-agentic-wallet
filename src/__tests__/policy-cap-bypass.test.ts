@@ -1,5 +1,5 @@
 /**
- * when the owner's spending policy governs an asset, the DEFAULT wallet cap for that asset stands aside.
+ * an earlier change — when the owner's spending policy governs an asset, the DEFAULT wallet cap for that asset stands aside.
  *
  * The rule bypasses a safety limit, so the tests are mostly about when it must NOT: an explicit cap, a policy for another
  * asset, a policy with no per-transaction cap, a bounded policy, a failed read.
@@ -138,7 +138,7 @@ describe('createPolicyGovernsCheck', () => {
     expect(read).not.toHaveBeenCalled()
   })
 
-  it('is never true without a policy registry (mainnet today) or an owner', async () => {
+  it('is never true without a policy registry (a network with no deployment) or an owner', async () => {
     const read = vi.fn(async () => owned([policy(JMYR_POLICY)]))
     expect(await createPolicyGovernsCheck({ ...base, registryAddress: undefined, read })(JMYR)).toBe(false)
     expect(await createPolicyGovernsCheck({ ...base, owner: undefined, read })(JMYR)).toBe(false)

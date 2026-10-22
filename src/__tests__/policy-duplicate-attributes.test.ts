@@ -1,5 +1,5 @@
 /**
- * A repeated attribute name is refused (review finding APP-M01).
+ * A repeated attribute name is refused.
  *
  * Every scope and token rule reads the FIRST attribute with a given name. A repeat could therefore
  * carry a value those rules never see: `assetScope: "native"` followed by `assetScope: "JMYR"` was read

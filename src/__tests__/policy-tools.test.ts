@@ -23,7 +23,7 @@ const OWNER = 'ZTX3YzAyKBxjbSaMPeaPKEBpV93wjzN4SjTaN'
 /**
  * The REAL ztp20-v1 template. Was an invented body using `x402`/`uint` and an ARRAY of
  * templateAttributeIds — a shape this repo has since confirmed on chain to be a MAP, and the exact
- * values that review names as the fiction that caused it. Left behind when the other files moved; the
+ * values an earlier change names as the fiction that caused it. Left behind when the other files moved; the
  * only handler-level policy test is the last place it should have survived (APP-L06).
  */
 const TEMPLATE_BODY = ZTP20_V1

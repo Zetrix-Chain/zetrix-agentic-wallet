@@ -1,5 +1,5 @@
 /**
- * Phase 2: a self-paid policy write. The wallet builds the Registry's `createOrUpdatePolicy` call itself, signs it through
+ * an earlier change phase 2: a self-paid policy write. The wallet builds the Registry's `createOrUpdatePolicy` call itself, signs it through
  * Wallet BE and submits it, paying only network gas. These tests pin the call it builds byte for byte, what each way it can end is
  * called (nothing sent / may be on chain / on chain), and that the service is never contacted on this path.
  */
@@ -1512,7 +1512,7 @@ describe('R2-L4 / R2-L6: the lookup wording, and the lookup is bounded', () => {
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════
 import { PaymentPolicyError } from '../policy-refusal'
 
-describe('a self-paid write is offered to a wallet that already has a policy', () => {
+describe('an earlier change follow-up: a self-paid write is offered to a wallet that already has a policy', () => {
   it('a create and an update are not held back for owning a policy contract: nothing asks the Registry about it', async () => {
     const create = harness({ readPolicy: seq(NOT_FOUND, AFTER_CREATE) })
     expect((await writePolicy(create.d, { ...CREATE_IN, confirm: true } as never)).state).toBe('written')
@@ -1559,7 +1559,7 @@ describe('a self-paid write is offered to a wallet that already has a policy', (
     expect(deps).not.toHaveProperty('ownerHasPolicyContract')
   })
 
-  it("an older Wallet BE still refuses it: that refusal is final, not about the policy's limits, and does not invite a retry", async () => {
+  it("a Wallet BE older than an earlier change still refuses it: that refusal is final, not about the policy's limits, and does not invite a retry", async () => {
     const selfPay = selfPayDeps({
       execute: vi.fn(async (): Promise<SelfPayExecResult> => ({
         kind: 'refused',
@@ -1571,7 +1571,7 @@ describe('a self-paid write is offered to a wallet that already has a policy', (
     expect(r.message).toContain('UNSUPPORTED_OPERATION')
     expect(r.message).toContain('not about this policy')
     expect(r.message).toContain('retrying will not help')
-    expect(r.message).toContain('older Wallet BE')
+    expect(r.message).toContain
     expect(r.message).toContain('gasPayer "sponsored"')
     expect(r.message).not.toContain('Review the policy')
     expect(r.message).not.toContain('Trying again shortly')

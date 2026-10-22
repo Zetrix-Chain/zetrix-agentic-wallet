@@ -374,13 +374,16 @@ describe('no default is applied where there is none', () => {
     expect(String(r.error)).toMatch(/needs the policy template contract/i)
   })
 
-  it('has no default publisher off testnet, and an override wins on testnet', () => {
+  it('has a default publisher on testnet and on mainnet and none elsewhere, and an override wins', () => {
     expect(derivePolicyTemplatePublisher('zetrix:testnet')).toBe(PUBLISHER)
-    expect(derivePolicyTemplatePublisher('zetrix:mainnet')).toBeUndefined()
+    expect(derivePolicyTemplatePublisher('zetrix:mainnet')).toBe('ZTX3dco8hFcbYn3k1nxKJXVjeB3soikzNBStm')
+    expect(derivePolicyTemplatePublisher('zetrix:devnet')).toBeUndefined()
+    expect(derivePolicyTemplatePublisher('')).toBeUndefined()
     const base = { HSM_PASSWORD: 'x', WALLET_BE_URL: 'https://be.test', ZETRIX_NODE_HOST: 'n.test' }
     expect(loadConfig({ ...base }).policyTemplatePublisher).toBe(PUBLISHER)
     expect(loadConfig({ ...base, POLICY_TEMPLATE_PUBLISHER: 'ZTX3Override' }).policyTemplatePublisher).toBe('ZTX3Override')
-    expect(loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet' }).policyTemplatePublisher).toBeUndefined()
+    expect(loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet' }).policyTemplatePublisher).toBe('ZTX3dco8hFcbYn3k1nxKJXVjeB3soikzNBStm')
+    expect(loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet', POLICY_TEMPLATE_PUBLISHER: 'ZTX3Override' }).policyTemplatePublisher).toBe('ZTX3Override')
   })
 })
 

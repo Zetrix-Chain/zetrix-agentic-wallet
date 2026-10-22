@@ -53,7 +53,7 @@ describe('buildPayers', () => {
   // rather than a fake, so a swap anywhere in buildPayers — not just at its return statement —
   // would surface here too.
   it('with DIFFERENT maps: `pay` refuses the credential fee, `payForCredential` accepts it, via a real cap guard', async () => {
-    // Hand-built maps: now the real mainnet defaults are the same for both, so they can no longer tell a swap apart.
+    // Hand-built maps: the real mainnet defaults are the same for both, so they can no longer tell a swap apart.
     const cfg = { maxPaymentAmount: { '*': '0' }, credentialIssuanceCaps: { [JMYR_MAINNET]: '1000000', '*': '0' } }
     const fee = { asset: JMYR_MAINNET, maxAmountRequired: '1000000' }
     const makePayFromGuard = (caps: Record<string, string>) => async (accept: typeof fee) => {

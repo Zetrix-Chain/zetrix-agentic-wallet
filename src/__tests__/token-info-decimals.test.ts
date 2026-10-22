@@ -1,5 +1,5 @@
 /**
- * Token decimals are typed strictly and bounded, at the read (review finding APP-M01).
+ * Token decimals are typed strictly and bounded, at the read.
  *
  * `Number(null)`, `Number("")`, `Number(false)` and `Number([])` are all 0, so a contract answering any of them used to
  * read as a genuine 0-decimal token — and `amountUnit: "whole"` would then write 1 token as `1`, a million times too small

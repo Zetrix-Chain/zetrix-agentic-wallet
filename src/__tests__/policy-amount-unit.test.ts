@@ -379,7 +379,7 @@ describe('the conversion line', () => {
   })
 })
 
-// ── review findings ──────────────────────────────────────────────────────────────────
+// ── review findings on an earlier change ──────────────────────────────────────────────────────────────────
 
 describe('APP-M01 — token decimals are typed strictly and bounded', () => {
   const unit = (decimals: unknown) => ({ describeUnit: async () => ({ symbol: 'TKN', decimals: decimals as number }) })

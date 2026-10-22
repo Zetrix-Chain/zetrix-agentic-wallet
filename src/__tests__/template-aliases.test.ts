@@ -189,7 +189,7 @@ describe('the Verified name check reads verification wording and negation', () =
   })
 })
 
-// A name with both kinds of wording is unclear, not Basic.
+// an earlier change re-review follow-up: a name with both kinds of wording is unclear, not Basic.
 describe('aiBirthcertKindOfName', () => {
   it.each([
     // R3: a negator cancels the word after it, Basic wording too, so these say Verified twice over.

@@ -154,7 +154,7 @@ describe('policyPreflight', () => {
       ok(),
       draftWith({ attributeName: 'maxTransactionCount', attributeType: 'NUMBER', value: '10' }),
     )
-    // Review: this used to be a quiet interpretation on a ready:true result, so the owner paid for a policy with
+    // an earlier change review: this used to be a quiet interpretation on a ready:true result, so the owner paid for a policy with
     // no count limit. The fix (add countWindow) is free, so it is a blocker, like velocityCap without its window.
     expect(result.ready).toBe(false)
     const line = result.blockers.find((b) => b.includes('maxTransactionCount'))

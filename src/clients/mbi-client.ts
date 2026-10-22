@@ -90,6 +90,13 @@ export interface MbiVpCreateBody {
   vc: unknown
   revealAttributes: string[]
   rangeProof?: unknown
+  /**
+   * The verifier's one-time challenge this presentation is for. MBI passes it to ms-credential, which writes it into the payload the holder
+   * signs, so the verifier can tell the presentation was made for its session. Left out when there is none.
+   */
+  nonce?: string
+  /** Who the presentation is for: the verifier's origin (see x401-audience.ts). Left out when it is not known. */
+  audience?: string
 }
 
 export interface MbiVpCreateResult {
@@ -127,6 +134,12 @@ export interface MbiQuote {
    * quoted amount should then be reported as unconfirmed rather than as a certain charge.
    */
   paymentRequired?: boolean
+}
+
+/** `POST /v1/vc/ext/revoke/status`: whether the issuer has revoked the credential, and when. */
+export interface MbiRevokeStatus {
+  revoked: boolean
+  revokedAt?: string
 }
 
 /** One entry from `POST /v1/vc/ext/download` — every VC the holder has, not just one. */
@@ -218,6 +231,25 @@ export class MbiClient {
     const res = await this.signedFetch('POST', '/v1/vp/ext/submit', body, sign)
     if (!res.ok) throw await this.error(res, 'vp/ext/submit failed')
     return this.unwrap<MbiVpSubmitResult>(res)
+  }
+
+  /**
+   * POST /v1/vc/ext/revoke/status — has the issuer revoked this credential? Holder-authenticated like the other `/ext` calls.
+   *
+   * MBI's response field is the Java `isRevoked`. Jackson serialises a boolean property of that name as `revoked`, and a build
+   * that keeps the name emits `isRevoked`; both are read, so this works whichever MBI ships. A 2xx with neither is an error, not
+   * "not revoked": the caller must be able to tell "active" from "could not tell".
+   */
+  async revokeStatus(vcId: string, sign: MbiRequestSigner): Promise<MbiRevokeStatus> {
+    const res = await this.signedFetch('POST', '/v1/vc/ext/revoke/status', { vcId }, sign)
+    if (!res.ok) throw await this.error(res, 'vc/ext/revoke/status failed')
+    const data = await this.unwrap<Record<string, unknown> | null | undefined>(res)
+    const flag = data?.revoked ?? data?.isRevoked
+    if (typeof flag !== 'boolean') {
+      throw new MbiError(`MBI vc/ext/revoke/status succeeded (2xx) but returned no revoked flag: ${JSON.stringify(data)}`, res.status)
+    }
+    const revokedAt = typeof data?.revokedAt === 'string' && data.revokedAt !== '' ? data.revokedAt : undefined
+    return { revoked: flag, ...(revokedAt !== undefined ? { revokedAt } : {}) }
   }
 
   /** POST /v1/vc/ext/download — holder-authenticated; returns EVERY VC for the address, not one. */
