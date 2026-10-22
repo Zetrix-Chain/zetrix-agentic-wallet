@@ -371,7 +371,7 @@ describe('SKILL.md', () => {
       .join('\n')
     expect(instructions).not.toMatch(/openclaw mcp set|npm install|openclaw plugins install/)
     // The one permitted `npx` is the credential-backup command the user runs themselves.
-    expect(instructions).not.toMatch(/\bnpx\b(?!\s+agentic-wallet-mcp export-credentials)/)
+    expect(instructions).not.toMatch(/\bnpx\b(?!\s+agentic-wallet-mcp@\d+\.\d+\.\d+ export-credentials)/)
   })
 
   it('forbids handling secrets rather than merely omitting the topic', () => {
@@ -387,5 +387,53 @@ describe('SKILL.md', () => {
     expect(skill.startsWith('---\n')).toBe(true)
     expect(skill).toMatch(/^name: zetrix-agentic-wallet$/m)
     expect(skill).toMatch(/^description: >/m)
+  })
+})
+
+// ClawHub's scan of 0.8.0 (suspicious): what it objected to in the plugin's own text, kept from coming back.
+describe('what the ClawHub scan objected to stays fixed', () => {
+  const guide = readFileSync(join(pluginRoot, 'USER_GUIDE.md'), 'utf8').replace(/\r\n/g, '\n')
+  const readme = readFileSync(join(pluginRoot, 'README.md'), 'utf8').replace(/\r\n/g, '\n')
+  const walletVersion = JSON.parse(readFileSync(join(walletRoot, 'package.json'), 'utf8')).version as string
+
+  it('the skill never tells the agent to withhold or hide what it knows from the user', () => {
+    // The scanner read "never tell the user ..." as an instruction to withhold. The rule is about not asserting what is
+    // not known, so it is written as what to say instead.
+    expect(skill).not.toMatch(/never tell (the user|them)/i)
+    expect(skill).not.toMatch(/do not tell the user/i)
+    expect(skill).not.toMatch(/do not ask the user/i)
+    expect(skill).not.toMatch(/no confirmation needed/i)
+  })
+
+  it('every backup command runs the wallet version this plugin bundles, never an unpinned npx', () => {
+    for (const [name, text] of [['SKILL.md', skill], ['USER_GUIDE.md', guide], ['README.md', readme]] as const) {
+      const uses = [...text.matchAll(/npx agentic-wallet-mcp(@\S+)?/g)]
+      expect(uses.length, name).toBeGreaterThan(0)
+      for (const u of uses) expect(u[1], `${name}: ${u[0]}`).toBe(`@${walletVersion}`)
+    }
+  })
+
+  it('the guide does not say the wallet pays for credentials only', () => {
+    expect(guide).not.toMatch(/credential\s+issuance only/i)
+    expect(guide).toMatch(/pay_and_fetch/)
+    expect(guide).toMatch(/testnet and on mainnet/)
+    expect(guide).toMatch(/no running total/i)
+  })
+
+  it('the skill states the default limit, that it covers pay_and_fetch, and that a bare {"*":"0"} is ignored', () => {
+    expect(skill).toMatch(/## The spending limit/)
+    expect(skill).toMatch(/1 JMYR per payment/)
+    expect(skill).toMatch(/pay_and_fetch/)
+    expect(skill).toMatch(/bare `\{"\*":"0"\}` is treated as a leftover/)
+  })
+
+  it('the manifest and the package declare token transfers and spending-policy changes', () => {
+    for (const d of [manifest.description as string, pkg.description as string]) {
+      expect(d, d).toMatch(/transfer|sends tokens/i)
+      expect(d, d).toMatch(/spending[- ]polic/i)
+      expect(d, d).toMatch(/confirm/i)
+    }
+    expect(readme).toMatch(/send tokens to a destination the user names/)
+    expect(readme).toMatch(/removing one lifts every limit/)
   })
 })

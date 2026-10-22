@@ -79,11 +79,12 @@ the wallet says it could not check; that is not the same as the credential being
 
 ## Setting your spending limit
 
-Leave this empty and the wallet uses its own default: it allows **exactly the AI Birthcert fee of
-1 JMYR per payment**, and declines everything else. That is enough to get your first credential
-without configuring anything, and not enough for a wallet that could spend whatever a website asked
-for straight out of the box — which is not a safe default. (On mainnet the allowance covers credential
-issuance only; paying an arbitrary URL still needs a limit you set yourself.)
+Leave this empty and the wallet uses its own default: **1 JMYR per payment, and nothing in any other
+token**, on testnet and on mainnet. That is enough to get your first credential without configuring
+anything. It applies to whatever the wallet pays, including a website the agent pays for with
+`pay_and_fetch`, and it is a limit per payment with no running total: several payments of up to 1 JMYR
+can each go through. The agent is told to ask you before every payment, but the limit is the only
+thing that stops a payment the agent should not have made.
 
 Set a limit here when you want the wallet to pay for more than that.
 
@@ -246,7 +247,7 @@ only thing that can authorise payments from your account. If you lose this machi
 account and anything in it are **gone permanently** — nobody can recover it, including us.
 
 ```bash
-npx agentic-wallet-mcp export-credentials
+npx agentic-wallet-mcp@0.17.0 export-credentials
 ```
 
 Run it in your own terminal window. It prints your address, DID and password. Store them somewhere

@@ -1,8 +1,8 @@
 {
   "name": "zetrix-agentic-wallet",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "private": true,
-  "description": "OpenClaw plugin: Zetrix identity, verifiable-credential and pay-per-use wallet tools for agents",
+  "description": "OpenClaw plugin: Zetrix identity, verifiable-credential and pay-per-use wallet tools for agents, including token transfers and spending-policy changes that need the user's confirmation",
   "license": "MIT",
   "author": "MyEG Services Berhad",
   "homepage": "https://github.com/Zetrix-Chain/zetrix-agentic-wallet",

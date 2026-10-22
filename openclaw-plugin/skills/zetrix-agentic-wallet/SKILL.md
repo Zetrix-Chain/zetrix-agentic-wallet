@@ -40,7 +40,7 @@ Your host may present them slightly differently — match on the part after the 
 | `query_contract` | no | Read-only contract or account state |
 | `prove_identity` | no | Answering an identity proof request with a held credential |
 | `create_verification_qr` | no | Giving a person a link and QR code that open the agent's credential in the MyID wallet, to verify the agent. It presents the Verified AI Birthcert if held, otherwise the Basic AI Birthcert, otherwise tells you to get one first. It reveals a standard minimal set by default (Verified: agentName, evidenceProvider, ownerVerified; Basic: agentUsername) — other attributes only if the user asks (`revealAttribute`), everything only if the user explicitly asks (`revealAll`); in a chat channel such as WhatsApp, attach the QR file at `qrCodePath`, never another image (the credential's pass design is not a QR code), and if you cannot attach an image, give the link and say so; if `vcPassImagePaths` is present, the credential's pass design can be sent too, as its own picture; a Basic credential does not mean the owner was verified; the link is built in on both networks (MyID's UAT link on testnet, its production link on mainnet), so there is no setting to ask the user for |
-| `pay_and_fetch` | **yes** | Fetching a resource that returned HTTP 402 |
+| `pay_and_fetch` | **yes** | Fetching a resource that returned HTTP 402. It pays that site's price within the per-call limit (1 JMYR by default, on both networks, with no running total), so the limit is what bounds it. Say the price and get the user's yes first |
 | `subscribe_and_issue` | **yes** | Buying and receiving a verifiable credential |
 | `create_holder_account` | no | Creating an additional holder account (rarely needed) |
 | `request_ai_birthcert_verification` | **yes** | Starting a Verified AI Birthcert session (MyDigitalID owner verification) |
@@ -65,7 +65,7 @@ plainly — mainnet spends real funds, testnet does not.
 ## Before collecting anything for a credential
 
 When a user asks for a credential, your **first** action is `credential_preflight`. If it returns `alreadyHeld`, the wallet already holds a
-valid copy: tell the user, name it, and **stop** — do not ask for an agent name or any other detail and do not begin an issuance. Buying another
+valid copy: tell the user, name it, and **stop**: there is no need for an agent name or any other detail, and no issuance should begin. Buying another
 would replace it and cost the fee. Only if the user explicitly says they want a replacement, run it again with `replacing: true`. It is free,
 spends nothing and starts nothing. Do this **before you collect** a single application detail — not
 after, and not just before paying. Asking someone for a name and optional metadata and only then
@@ -76,8 +76,8 @@ State the whole picture in one message: the fee (`fee.display`), which side pays
 (`fee.gasModel`), the balances, whether the wallet is ready, and — for a template credential — the
 attributes it will need. Then either collect the details, or say exactly what to fix and stop.
 One exception: when a Verified result has `unusedPayment`, an earlier payment has not been used yet
-and the next link reuses it, so do not quote the fee as a charge and do not ask the user to agree to
-one. Follow its `note` instead.
+and the next link reuses it, so there is no fee to quote and nothing for the user to agree to.
+Follow its `note` instead.
 
 **Relay `notChecked` as well.** A ready result is not a guarantee. In particular preflight cannot
 tell you whether an agent name is free — myid decides that at issuance, after payment — so never
@@ -128,12 +128,12 @@ spend from the user's wallet. Every time:
    it tells you which attributes are required. Paying before checking risks paying for an issuance
    that then fails.
 5. For `request_ai_birthcert_verification`, get `agentName` from the user directly — never invent it
-   — and tell them it must be unique. Payment happens at session creation, and myid checks the name only afterwards, at issuance; a duplicate name is refused then, and whether the fee was spent cannot be confirmed, so never tell the user they were or were not charged for it. Calling this
+   — and tell them it must be unique. Payment happens at session creation, and myid checks the name only afterwards, at issuance; a duplicate name is refused then. Whether the fee was spent cannot be confirmed in that case, so say that it is not known. Calling this
    tool again with the SAME name while a session is still pending does not pay again — it returns
    that same session. A new link after an expired one does not pay again either: it reuses the
    payment already made, which is only used up once the credential is issued. Each result says
-   whether that call paid in `paidThisCall`; count a fee only when it is `true`, and never tell the
-   user they paid once per link.
+   whether that call paid in `paidThisCall`; count a fee only when it is `true`. One payment covers every
+   link until the credential is issued, so describe it as paid once, not once per link.
 6. Before it pays, `request_ai_birthcert_verification` checks whether this holder already has a
    Verified AI Birthcert. If one is found and still valid, nothing is paid — show it to the user and
    only call the tool again with `confirmReplaceExistingVc` if they explicitly ask to replace it. An
@@ -142,7 +142,7 @@ spend from the user's wallet. Every time:
    `{ error }` when an already-issued credential exists but could not be confirmed — relay that error
    as given rather than retrying blindly.
 7. `subscribe_and_issue` has the same check, its own way: a still-valid cached credential is always
-   returned for free with no confirmation needed (`issued: false, alreadyHeld: true, fromCache: true`):
+   returned for free, so there is nothing to pay and nothing to confirm (`issued: false, alreadyHeld: true, fromCache: true`):
    tell the user they already have it, never that it was just issued. If `differsFromRequest` is set
    (a different username, say), tell the user and ask whether to keep it or replace it. `forceReissue: true` on its own
    does **not** pay either — it only returns that same existing credential (`issued: false, reason`)
@@ -154,10 +154,10 @@ spend from the user's wallet. Every time:
    live status once, at the moment you call it, and nothing more — there is no background polling,
    webhook, or timer behind it. (A couple of OTHER tools do their own bounded, synchronous
    in-call waiting — e.g. `subscribe_and_issue`'s brief settlement retry — but that waiting is
-   entirely inside that one call; it never continues after the call returns.) Never tell the user
-   you have "set up an automation" or that you will "alert them" when a pending verification
-   completes — you cannot act between messages, so that promise can never be kept and leaves them
-   waiting for a notification that will never come. Instead, tell them how long the link is good
+   entirely inside that one call; it never continues after the call returns.) You cannot set up an
+   automation or alert the user when a pending verification completes, because you cannot act between
+   messages, so say that plainly. A promise to do it can never be kept and leaves them waiting for a
+   notification that will never come. Instead, tell them how long the link is good
    for (`expiresIn`) and ask them to message you back once they are done, or after a few minutes, so
    you can check again.
 
@@ -212,9 +212,9 @@ completed, and the user cannot tell the difference.
 ## When a payment is still clearing
 
 `check_ai_birthcert_verification` may return `status: "settlement_pending"` with a `paymentReceipt`.
-This means a payment **was sent** and the wallet is following it. Never say it failed, and never
-call `request_ai_birthcert_verification` to "try again" — that is a second payment for the same
-thing. This one call can take up to about 90 seconds, because it is actively advancing the
+This means a payment **was sent** and the wallet is following it. It has not failed, so describe it as
+sent and in progress. Calling `request_ai_birthcert_verification` to "try again" is a second payment for
+the same thing. This one call can take up to about 90 seconds, because it is actively advancing the
 settlement rather than just reporting on it. It is not hung.
 
 Read `message`, not just the flags. These cases need different answers:
@@ -231,7 +231,7 @@ Read `message`, not just the flags. These cases need different answers:
   quote it to support; it is the only record of the payment.
 - **`issuerRejected: true` or `paymentInvalid: true`** — the credential service was reached and
   refused. Relay what `message` quotes. Neither says whether the fee was taken, in either
-  direction, so never tell the user they were not charged, and never tell them they were.
+  direction, so say that it is not known whether they were charged.
 
 ## Discarding a stuck receipt
 
@@ -287,8 +287,8 @@ A policy is the user's own spending rulebook for this wallet, stored on chain. R
 always free. Writing one costs a fee and goes through write_policy; reading and checking are free.
 
 **`check_policy_decision` has three outcomes, and `undetermined` is the one to get right.** It is
-NOT a refusal and NOT permission — it means nothing was evaluated, so never tell the user their
-policy blocked them on the strength of it, and never spend. There is no step-up verdict: the
+NOT a refusal and NOT permission — it means nothing was evaluated, so it is no basis for saying the
+user's policy blocked them, and nothing may be spent on it. There is no step-up verdict: the
 decision service answers only allow or deny. A permitted answer reserves capacity for about
 fifteen minutes, so do not call it in a loop — and do not probe amounts to find one that fits,
 because every permitted answer along the way reserves again and the owner's next real payment can
@@ -296,7 +296,7 @@ be refused by their own agent. Read `remaining` from ONE answer and work it out 
 retry automatically after a timeout either: the call may have succeeded and reserved already.
 Read `ignored` back even on a permitted answer —
 it lists constraints the policy carries that the service could not enforce.
-**To write a policy, start by listing the templates — do not ask the user for an address.** Call
+**To write a policy, start by listing the templates; you do not need an address from the user.** Call
 get_policy_template_schema with no arguments: it returns the templates on offer, each with its
 declared attributes and a templateId the chain has confirmed. Use that id in write_policy and leave
 templateContractAddress out. A user has no way to know a publisher, a policy key or a template
@@ -308,7 +308,7 @@ it (`affordability`): tell the user about any shortfall — fee asset, gas or th
 treat "unknown" as not yet confirmed, never as a yes. A quote is not a promise the payment will be
 allowed — balances move and the cap is enforced again when paying. assetScope is exactly "native" or
 "ztp20", never a token symbol; a token policy also needs its tokenAddress — the contract address,
-which wallet_status({ token }) returns as tokenAddress, so do not ask the user for the address of a
+which wallet_status({ token }) returns as tokenAddress, so the user does not need to supply the address of a
 token the wallet knows. Amounts are RAW BASE units: policy_preflight's interpretation says what each
 means in whole tokens (1 of a 6-decimal token is 0.000001 of it), so show it. A non-zero amount
 under one whole token is refused until you say what is meant: when the user states an amount in
@@ -327,8 +327,8 @@ such as 7d, 12h or 30m — never "week" and never a bare number.
 **On the sponsored path, a policy write that is `settling` or `submitted` has ALREADY BEEN PAID FOR.** No policy exists
 yet, and that is the normal window rather than a failure. Never call `write_policy` again for it —
 pass its `paymentReceipt` to `check_policy_write`, which never pays. `submitted` carries a
-`txHash` and still is not a written policy: the block has not confirmed it, so do not tell the user
-their policy exists. Only `written` means that. The one state where paying again is right is
+`txHash` and still is not a written policy: the block has not confirmed it, so the policy is not yet known to
+exist. Only `written` means that. The one state where paying again is right is
 "receipt_void", and it sets `payFresh` to say so.
 
 **To change a policy, read it first, then use `update_policy`.** `get_my_policy` gives each policy's current attributes and
@@ -407,9 +407,18 @@ actually confirmed.
 - A newly issued credential is retained by the wallet. Do not paste credential contents into the
   conversation unless the user asks.
 
+## The spending limit
+
+The wallet's default limit is **1 JMYR per payment and nothing in any other token**, on testnet and on mainnet, to
+any payee. That includes a website paid for by `pay_and_fetch`. It is a per-payment limit with no running
+total, so several payments of up to 1 JMYR can each go through; the user's yes before each one is what
+bounds the total. To refuse every payment, the limit must name a token, for example `{"*":"0","JMYR":"0"}`:
+a bare `{"*":"0"}` is treated as a leftover of old plugin versions and ignored. Never change the limit on
+the user's behalf.
+
 ## Backing up the wallet
 
 If the wallet generated its own credentials, they exist only on this machine and cannot be recovered
 if lost. If the user asks how to back up, tell them to run
-`npx agentic-wallet-mcp export-credentials` in their own terminal. **You cannot do this for them** —
+`npx agentic-wallet-mcp@0.17.0 export-credentials` in their own terminal (the version is the wallet this plugin bundles; keep it in the command). **You cannot do this for them** —
 it is deliberately not a tool, so that credentials never enter a conversation.

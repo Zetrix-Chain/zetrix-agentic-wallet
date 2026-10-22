@@ -321,7 +321,7 @@ describe('no text contradicts the new contracts', () => {
   // M2: the QA failure was quoting a fee for a link that reuses an earlier payment.
   it('the skill makes the fee exception for unusedPayment, and the README lists the field', () => {
     expect(SKILL).toMatch(/unusedPayment/)
-    expect(SKILL).toMatch(/do not quote the fee as a charge/i)
+    expect(SKILL).toMatch(/there is no fee to quote and nothing for the user to agree to/i)
     expect(README).toMatch(/unusedPayment\?/)
   })
 })

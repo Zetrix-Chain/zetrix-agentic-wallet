@@ -8,6 +8,8 @@ and what to know before changing it.
 
 ---
 
+What the wallet can do, as the manifest declares it: hold an identity and verifiable credentials, pay for resources and credentials over x402 within the spending limit, send tokens to a destination the user names (only after they confirm the exact amount, destination and fee), and create, update and remove the on-chain spending policies that limit it (removing one lifts every limit it set, so it needs the user's explicit yes).
+
 Installs the Zetrix Agentic Wallet into an OpenClaw gateway, so a subscriber gets the wallet by
 installing one package instead of hand-writing an `mcp.servers` entry — which they cannot do at all on
 a hosted gateway they do not own.
@@ -145,7 +147,7 @@ openclaw mcp unset zetrix-agentic-wallet
 
 ⚠️ **Before deleting `<gatewayStateDir>/zetrix-agentic-wallet/`, back up the wallet.** It holds the
 holder identity and the generated HSM password, and that password is the only thing that can authorize
-signing for the account. Run `npx agentic-wallet-mcp export-credentials` in an interactive terminal
+signing for the account. Run `npx agentic-wallet-mcp@0.17.0 export-credentials` (the wallet version this plugin bundles) in an interactive terminal
 first. There is no recovery once it is gone.
 
 Two things to know if `mcp unset` fails: OpenClaw rejects config writes that shrink the file sharply
