@@ -2,10 +2,13 @@
 name: zetrix-agentic-wallet
 description: >
   Use the Zetrix Agentic Wallet to report the holder identity, answer identity proof
-  requests, obtain verifiable credentials, pay for pay-per-use resources, and read
-  credential templates or on-chain contract state. Use for wallet status, Zetrix
-  address or DID, identity proof, verifiable credentials, or a resource that returns
-  HTTP 402.
+  requests, obtain verifiable credentials, pay for pay-per-use resources, send tokens
+  to a destination the user names, create, update and remove on-chain spending
+  policies, give a person a link and QR code to verify the agent in the MyID wallet,
+  and read credential templates or on-chain contract state. Transfers and policy
+  changes always need the user's confirmation of the exact amount, destination and
+  fee. Use for wallet status, Zetrix address or DID, identity proof, verifiable
+  credentials, spending policies, sending tokens, or a resource that returns HTTP 402.
 version: 0.1.0
 metadata:
   openclaw:
@@ -407,6 +410,20 @@ actually confirmed.
 - A newly issued credential is retained by the wallet. Do not paste credential contents into the
   conversation unless the user asks.
 
+## When asked for proof that the agent is verified
+
+If the user asks whether the agent is verified, or for proof of it, call `create_verification_qr` straight away and answer in one
+reply: the QR code as its own picture (the file at `qrCodePath`), the link, and how long it is good for. Do not wait to be asked
+for the link or the QR, and do not answer from the credential's details alone. The credential's pass design is a separate picture
+of the card and is never the QR code. The result's `credentialUsed` says which credential was presented: say that name.
+
+With a Verified AI Birthcert held, the Verified one is shown. To show the Basic one on a wallet that holds both, pass
+`credential: "basic"`, and only when the user asks for the Basic one.
+
+If the wallet holds only a Basic AI Birthcert and the user asked for proof that the agent is verified, say that the credential is
+Basic and does not prove the owner was verified, offer to get a Verified one, and make a link only if the user asks to see the Basic
+one.
+
 ## The spending limit
 
 The wallet's default limit is **1 JMYR per payment and nothing in any other token**, on testnet and on mainnet, to
@@ -420,5 +437,5 @@ the user's behalf.
 
 If the wallet generated its own credentials, they exist only on this machine and cannot be recovered
 if lost. If the user asks how to back up, tell them to run
-`npx agentic-wallet-mcp@0.17.0 export-credentials` in their own terminal (the version is the wallet this plugin bundles; keep it in the command). **You cannot do this for them** —
+`npx agentic-wallet-mcp@0.18.0 export-credentials` in their own terminal (the version is the wallet this plugin bundles; keep it in the command). **You cannot do this for them** —
 it is deliberately not a tool, so that credentials never enter a conversation.

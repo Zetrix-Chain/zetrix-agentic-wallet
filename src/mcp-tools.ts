@@ -352,9 +352,18 @@ export function createTools(deps: ToolDeps) {
      * chooses it, but a choice that cannot be made is an ordinary answer (`created: false` plus the reason) rather
      * than a thrown error, so the agent reads one result shape whether or not a link came back.
      */
-    async create_verification_qr(input: { vc?: unknown; revealAttribute?: string[]; revealAll?: boolean; expiryMinutes?: number } = {}): Promise<VerificationLinkResult> {
+    async create_verification_qr(input: { vc?: unknown; credential?: string; revealAttribute?: string[]; revealAll?: boolean; expiryMinutes?: number } = {}): Promise<VerificationLinkResult> {
       if (!deps.createVerificationLink) {
         return { created: false, reason: 'create_verification_qr is not configured on this wallet.' }
+      }
+      // Which kind to present, when the caller says. Anything else is refused rather than guessed: a wrong kind would show the
+      // wrong credential to a person who is about to rely on it (QA saw the Verified credential presented for a request for the Basic one).
+      const wanted = input.credential
+      if (wanted !== undefined && wanted !== 'verified' && wanted !== 'basic') {
+        return { created: false, reason: `credential must be "verified" or "basic", not ${JSON.stringify(wanted)}. Nothing was presented.` }
+      }
+      if (wanted !== undefined && input.vc !== undefined) {
+        return { created: false, reason: 'pass either vc (the credential itself) or credential (which kind to present), not both. Nothing was presented.' }
       }
       let vc = input.vc
       let credentialUsed = 'the credential you supplied'
@@ -372,7 +381,23 @@ export function createTools(deps: ToolDeps) {
         const held = await loadValidCachedCredentials(deps.cache)
         const verified = verifiedId ? held.find((entry) => entry.templateId === verifiedId) : undefined
         const basic = basicId ? held.find((entry) => entry.templateId === basicId) : undefined
-        const chosen = verified ?? basic
+        const chosen = wanted === 'basic' ? basic : wanted === 'verified' ? verified : (verified ?? basic)
+        if (!chosen && wanted === 'basic') {
+          return {
+            created: false,
+            reason:
+              'the wallet holds no valid Basic AI Birthcert, so there is nothing to present as one. Nothing was presented in its place. ' +
+              'subscribe_and_issue gets the Basic AI Birthcert. Tell the user, and ask whether to present the Verified one instead.',
+          }
+        }
+        if (!chosen && wanted === 'verified') {
+          return {
+            created: false,
+            reason:
+              'the wallet holds no valid Verified AI Birthcert, so it cannot show proof that the owner was verified. Nothing was presented in its place. ' +
+              'request_ai_birthcert_verification (then check_ai_birthcert_verification) gets one. Tell the user, and do not offer the Basic one as proof of verification.',
+          }
+        }
         if (!chosen) {
           return {
             created: false,
@@ -384,8 +409,9 @@ export function createTools(deps: ToolDeps) {
         }
         vc = chosen.vc
         savedPassImages = chosen.vcPassImagePaths
-        credentialUsed = verified ? 'Verified AI Birthcert' : 'Basic AI Birthcert'
-        kind = verified ? 'verified' : 'basic'
+        const presentedVerified = chosen === verified
+        credentialUsed = presentedVerified ? 'Verified AI Birthcert' : 'Basic AI Birthcert'
+        kind = presentedVerified ? 'verified' : 'basic'
       } else if (wantsDefault && typeof vc === 'object' && vc !== null && !Array.isArray(vc)) {
         // A credential passed in gets the standard set only when it is one the wallet holds and recognises; for any
         // other the wallet has no standard set, so the caller has to say what to reveal.
@@ -453,10 +479,15 @@ export function createTools(deps: ToolDeps) {
         passImages.length > 0
           ? " The credential's pass design image is also returned (vcPassImagePaths): if the user wants to see it, send it as its own picture, captioned as the credential's pass design. It is not the QR code."
           : ''
-      const extra = basicNote + passNote + (statusNote ? ` ${statusNote}` : '')
+      // The reply that answers the user carries the QR and the link together. QA saw the first answer to "what is the proof you are
+      // verified?" go out with neither, and the link and the QR arrive only after a second and a third request.
+      const sameReplyNote =
+        ' Put the QR code and the link in the reply that answers the user now, with the QR code as its own picture; do not wait to be asked for them.'
+      const extra = sameReplyNote + basicNote + passNote + (statusNote ? ` ${statusNote}` : '')
       return {
         ...result,
         credentialUsed,
+        ...(kind !== undefined ? { credentialKind: kind } : {}),
         ...(credentialStatus !== undefined ? { credentialStatus } : {}),
         ...(revealedByDefault ? { revealedByDefault: true } : {}),
         ...(passImages.length > 0 ? { vcPassImagePaths: passImages } : {}),

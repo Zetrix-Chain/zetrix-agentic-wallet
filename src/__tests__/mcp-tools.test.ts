@@ -788,6 +788,113 @@ describe('create_verification_qr', () => {
     config: { ...deps.config, aiBirthcertVerifiedTemplateId: VERIFIED },
   })
 
+  describe('credential: which kind to present, asked for by the caller', () => {
+    const VERIFIED_VC = { id: 'verified-vc' }
+    const BASIC_VC = { id: 'basic-vc' }
+    const both = (deps: ReturnType<typeof makeDeps>['deps']) =>
+      holding(deps, { templateId: VERIFIED, vc: VERIFIED_VC }, { templateId: BASIC_TESTNET, vc: BASIC_VC })
+
+    it('presents the Basic AI Birthcert when asked for it, even though a Verified one is held (QA: the Verified one was shown for "Show Basic VC QR")', async () => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+
+      const out = await createTools({ ...both(deps), createVerificationLink }).create_verification_qr({ credential: 'basic' })
+
+      expect(createVerificationLink.mock.calls[0][0].vc).toEqual(BASIC_VC)
+      expect(out).toMatchObject({ created: true, credentialUsed: 'Basic AI Birthcert', credentialKind: 'basic' })
+      expect((out as { message: string }).message).toMatch(/does not mean the owner was verified/)
+    })
+
+    it('presents the Verified one when asked for it', async () => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+
+      const out = await createTools({ ...both(deps), createVerificationLink }).create_verification_qr({ credential: 'verified' })
+
+      expect(createVerificationLink.mock.calls[0][0].vc).toEqual(VERIFIED_VC)
+      expect(out).toMatchObject({ credentialKind: 'verified' })
+    })
+
+    it('still presents the Verified one when the caller says nothing, and says which kind it was', async () => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+
+      const out = await createTools({ ...both(deps), createVerificationLink }).create_verification_qr({})
+
+      expect(createVerificationLink.mock.calls[0][0].vc).toEqual(VERIFIED_VC)
+      expect(out).toMatchObject({ credentialKind: 'verified' })
+    })
+
+    it('refuses "basic" when no valid Basic AI Birthcert is held, and presents nothing in its place', async () => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+
+      const out = await createTools({ ...holding(deps, { templateId: VERIFIED, vc: VERIFIED_VC }), createVerificationLink }).create_verification_qr({ credential: 'basic' })
+
+      expect(out).toMatchObject({ created: false })
+      expect((out as { reason: string }).reason).toMatch(/no valid Basic AI Birthcert/)
+      expect((out as { reason: string }).reason).toMatch(/Nothing was presented in its place/)
+      expect(createVerificationLink).not.toHaveBeenCalled()
+    })
+
+    it('refuses "verified" when only a Basic one is held, so a Basic credential is never offered as proof of verification', async () => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+
+      const out = await createTools({ ...holding(deps, { templateId: BASIC_TESTNET, vc: BASIC_VC }), createVerificationLink }).create_verification_qr({ credential: 'verified' })
+
+      expect(out).toMatchObject({ created: false })
+      expect((out as { reason: string }).reason).toMatch(/no valid Verified AI Birthcert/)
+      expect((out as { reason: string }).reason).toMatch(/do not offer the Basic one as proof of verification/)
+      expect(createVerificationLink).not.toHaveBeenCalled()
+    })
+
+    it('refuses an expired Verified one the same way', async () => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+
+      const out = await createTools({
+        ...holding(deps, { templateId: VERIFIED, vc: VERIFIED_VC, validUntil: '2020-01-01T00:00:00Z' }, { templateId: BASIC_TESTNET, vc: BASIC_VC }),
+        createVerificationLink,
+      }).create_verification_qr({ credential: 'verified' })
+
+      expect(out).toMatchObject({ created: false })
+      expect(createVerificationLink).not.toHaveBeenCalled()
+    })
+
+    it.each(['Verified', 'both', '', 1, null])('refuses a value that is not "verified" or "basic" (%j)', async (credential) => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+
+      const out = await createTools({ ...both(deps), createVerificationLink }).create_verification_qr({ credential: credential as never })
+
+      expect(out).toMatchObject({ created: false })
+      expect((out as { reason: string }).reason).toMatch(/must be "verified" or "basic"/)
+      expect(createVerificationLink).not.toHaveBeenCalled()
+    })
+
+    it('refuses vc and credential together rather than guess which was meant', async () => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn().mockResolvedValue(link)
+
+      const out = await createTools({ ...both(deps), createVerificationLink }).create_verification_qr({ vc: BASIC_VC, credential: 'basic' })
+
+      expect(out).toMatchObject({ created: false })
+      expect((out as { reason: string }).reason).toMatch(/not both/)
+      expect(createVerificationLink).not.toHaveBeenCalled()
+    })
+
+    it('tells the agent to put the QR code and the link in the reply that answers the user now', async () => {
+      const { deps } = makeDeps()
+      const createVerificationLink = vi.fn().mockResolvedValue({ ...link, message: 'Send the QR.' })
+
+      const out = await createTools({ ...both(deps), createVerificationLink }).create_verification_qr({})
+
+      expect((out as { message: string }).message).toMatch(/reply that answers the user now/)
+      expect((out as { message: string }).message).toMatch(/do not wait to be asked/)
+    })
+  })
+
   describe('which credential it presents when none is named', () => {
     it('presents the Verified AI Birthcert when the wallet holds one, and passes the other inputs through', async () => {
       const { deps } = makeDeps()
@@ -799,7 +906,7 @@ describe('create_verification_qr', () => {
       })
 
       expect(createVerificationLink).toHaveBeenCalledWith({ vc: { id: 'verified-vc' }, revealAttribute: ['a.b'], revealAll: undefined, expiryMinutes: 10 })
-      expect(out).toEqual({ ...link, credentialUsed: 'Verified AI Birthcert' })
+      expect(out).toMatchObject({ ...link, credentialUsed: 'Verified AI Birthcert', credentialKind: 'verified' })
     })
 
     it('prefers the Verified AI Birthcert over the Basic one and over any other credential held', async () => {
@@ -1149,7 +1256,7 @@ describe('create_verification_qr', () => {
       }).create_verification_qr({})
 
       expect(out).not.toHaveProperty('vcPassImagePaths')
-      expect(out).toEqual({ ...link, credentialUsed: 'Verified AI Birthcert', revealedByDefault: true })
+      expect(out).toMatchObject({ ...link, credentialUsed: 'Verified AI Birthcert', credentialKind: 'verified', revealedByDefault: true })
     })
 
     it('returns only the pages that still exist', async () => {
@@ -1171,7 +1278,7 @@ describe('create_verification_qr', () => {
 
       const out = await createTools({ ...holding(deps, { templateId: VERIFIED, vc: { id: 'verified-vc' } }), createVerificationLink }).create_verification_qr({})
 
-      expect(out).toEqual({ ...link, credentialUsed: 'Verified AI Birthcert', revealedByDefault: true })
+      expect(out).toMatchObject({ ...link, credentialUsed: 'Verified AI Birthcert', credentialKind: 'verified', revealedByDefault: true })
     })
 
     it('returns the pass design of the credential it presented, not of another one the wallet holds', async () => {

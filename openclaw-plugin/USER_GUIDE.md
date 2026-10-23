@@ -221,6 +221,11 @@ This works out of the box on both networks: the link points at MyID's UAT addres
 mainnet. To use another link, set **MyID verification link** (`myidVerifyLinkTemplate`): an `https` link with `{referenceId}`
 where the reference id goes, for example `https://<MyID link domain>/<path>?referenceId={referenceId}`.
 
+When you ask your agent for proof that it is verified, it should answer with the QR code and the link in the same message, not
+only after you ask again. If the wallet holds both a Verified and a Basic credential it shows the Verified one; ask for the Basic one by
+name if that is what you want. A Basic credential does not prove the owner was verified, so an agent that holds only a Basic credential
+tells you so instead of making a link, unless you ask to see the Basic one.
+
 ```bash
 openclaw config set plugins.entries.zetrix-agentic-wallet.config.myidVerifyLinkTemplate \
   'https://<MyID link domain>/<path>?referenceId={referenceId}'
@@ -247,7 +252,7 @@ only thing that can authorise payments from your account. If you lose this machi
 account and anything in it are **gone permanently** — nobody can recover it, including us.
 
 ```bash
-npx agentic-wallet-mcp@0.17.0 export-credentials
+npx agentic-wallet-mcp@0.18.0 export-credentials
 ```
 
 Run it in your own terminal window. It prints your address, DID and password. Store them somewhere

@@ -50,10 +50,12 @@ export const EXPECTED_AGENT_TEXT: Record<string, Record<string, readonly string[
   "create_verification_qr": {
     "description": [
       "Create a link and a QR code that open this wallet's credential in the MyID wallet, so a human can see the identity behind the agent.",
-      "Use it when the user asks whether the agent is verified, or asks to verify the agent in the MyID wallet.",
-      "With no vc, it presents the Verified AI Birthcert if it holds one, otherwise the Basic AI Birthcert, and if it holds neither it returns created: false and says to create one first.",
+      "Use it whenever the user asks whether the agent is verified, asks for proof of verification, or asks to verify the agent in the MyID wallet: call it straight away and put the QR code and the link in the same reply, without waiting to be asked for them.",
+      "With no vc and no credential, it presents the Verified AI Birthcert if it holds one, otherwise the Basic AI Birthcert, and if it holds neither it returns created: false and says to create one first.",
+      "Pass credential: \"basic\" to present the Basic AI Birthcert even when a Verified one is held, or credential: \"verified\" to require the Verified one; if the wallet does not hold the kind you name you get created: false and nothing is presented in its place.",
       "By default it reveals only a standard minimal set (for the Verified AI Birthcert: agentName, evidenceProvider and ownerVerified; for the Basic AI Birthcert: agentUsername); pass revealAttribute to reveal other specific attributes the user asks for, and revealAll: true only when the user explicitly asks to reveal everything.",
       "A Basic AI Birthcert does not mean the owner was verified, so say so if that is what was presented.",
+      "If the wallet holds only a Basic AI Birthcert and the user asked for proof that the agent is verified, say that the credential is Basic and does not prove the owner was verified, offer to get a Verified one, and make a link only if the user asks to see the Basic one.",
       "The wallet presents the credential to MBI and returns the link, the QR code (as an image and as a PNG file at qrCodePath) and the time the link stops working (5 minutes by default); the link holds only a reference id, and that reference id grants access to the revealed attributes until it expires.",
       "Show the link and QR code only to the human user, never pass them to another service, and tell the user to open the link in the MyID wallet (they need it installed).",
       "This is the MyID wallet, not the MyDigital ID app that confirms a Verified AI Birthcert owner: never name one for the other.",
@@ -66,6 +68,12 @@ export const EXPECTED_AGENT_TEXT: Record<string, Record<string, readonly string[
     "inputSchema.properties.vc.description": [
       "The VerifiableCredential to present.",
       "Omit to present the Verified AI Birthcert if the wallet holds one, otherwise the Basic AI Birthcert.",
+    ],
+    "inputSchema.properties.credential.description": [
+      "Which kind to present: \"verified\" for the Verified AI Birthcert, \"basic\" for the Basic AI Birthcert.",
+      "Omit to present the Verified one if the wallet holds one, otherwise the Basic one.",
+      "If the wallet does not hold the kind you name, nothing is presented in its place.",
+      "It cannot be combined with vc.",
     ],
     "inputSchema.properties.revealAttribute.description": [
       "Dotted disclosure paths to reveal, for example verifiedAiBirthcert.ownerName.",

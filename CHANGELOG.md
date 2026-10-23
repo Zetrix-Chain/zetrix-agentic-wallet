@@ -10,6 +10,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] — 23 October 2026
+
+### Added
+
+- **`create_verification_qr` takes `credential` (`"verified"` or `"basic"`), so the agent can show the Basic AI Birthcert when a Verified one is held.** Before, with both held the Verified credential was always presented, and a request for the Basic QR gave a Verified QR while the agent called it Basic (QA saw the MyID app open "Verified AI Birthcert" for it). Omitting `credential` keeps the old choice (Verified if held, else Basic). Asking for a kind the wallet does not hold, or one that has expired, returns `created: false` and presents nothing in its place; a value other than the two, or `credential` together with `vc`, is refused. The result carries `credentialKind` beside `credentialUsed`.
+
+### Changed
+
+- **A request for proof that the agent is verified now gets the QR code and the link in the same answer.** QA saw the first answer go out with only the pass image (no QR, no link, and once "scanning the QR code above" under the pass card), the link only after a second request, and nothing at all on the web channel until the user asked for the MyID link. The tool text, the result message, the plugin skill and the user guide now say: call `create_verification_qr` straight away, send the QR code as its own picture and the link in that reply, and never present the pass design as the QR code. A wallet that holds only a Basic AI Birthcert says the credential is Basic and does not prove the owner was verified, offers to get a Verified one, and makes a link only if the user asks to see the Basic one. The agent still decides whether to call the tool; this is guidance, not enforcement.
+
+### Fixed
+
+- **The published bundle no longer carries a folder path from the machine that built it.** The 0.17.0 package (and the 0.8.1 OpenClaw plugin) had build-time module comments that named the builder's user folders, because it was built with node_modules reached through a link to another folder. It held no keys, passwords or tokens. 0.18.0 is built with its own node_modules, and the build now fails if a bundle contains such a path (`scripts/check-bundle.mjs`, run by both builds). **Use 0.18.0 instead of 0.17.0.**
+- **The plugin skill's own description now says what the skill can do.** It listed only identity, credentials, payments and reads, while the skill also covers sending tokens, spending-policy changes and the verification QR, which a security scan of the plugin flagged as undeclared.
+
 ## [0.17.0] — 22 October 2026
 
 ### Added

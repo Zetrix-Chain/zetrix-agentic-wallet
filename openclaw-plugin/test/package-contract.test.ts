@@ -427,6 +427,14 @@ describe('what the ClawHub scan objected to stays fixed', () => {
     expect(skill).toMatch(/bare `\{"\*":"0"\}` is treated as a leftover/)
   })
 
+  it('the skill tells the agent to answer a proof-of-verification request with the QR and the link, and to choose the kind', () => {
+    expect(skill).toMatch(/## When asked for proof that the agent is verified/)
+    expect(skill).toMatch(/call `create_verification_qr` straight away/)
+    expect(skill).toMatch(/the QR code as its own picture/)
+    expect(skill).toMatch(/credential: "basic"/)
+    expect(skill).toMatch(/only a Basic AI Birthcert[\s\S]*does not prove the owner was verified/)
+  })
+
   it('the manifest and the package declare token transfers and spending-policy changes', () => {
     for (const d of [manifest.description as string, pkg.description as string]) {
       expect(d, d).toMatch(/transfer|sends tokens/i)

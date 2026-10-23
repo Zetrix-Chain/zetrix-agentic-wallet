@@ -74,6 +74,8 @@ export type VerificationLinkResult =
       revealed: string[] | 'all'
       /** Which credential was presented. Set by the create_verification_qr tool, which chooses it. */
       credentialUsed?: string
+      /** `verified` or `basic` when the presented credential is one of the wallet's two AI Birthcerts. Set by the tool. */
+      credentialKind?: 'verified' | 'basic'
       /** True when the caller named nothing and the wallet's standard minimal set was revealed. Set by the tool. */
       revealedByDefault?: boolean
       /** Absent when rendering failed; the link above is still good. */
