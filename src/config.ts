@@ -269,7 +269,7 @@ function deriveWalletBeUrl(network: string): string {
 }
 
 /** MyID's production universal link, on the MyID verifier host (the presentation is verified in the MyID app). */
-export const MAINNET_MYID_VERIFY_LINK_TEMPLATE = 'https://myid-verifier.zetrix.com/api/agentic-verify?referenceId={referenceId}'
+export const MAINNET_MYID_VERIFY_LINK_TEMPLATE = 'https://myid-verifier.zetrix.com/agentic-verify?referenceId={referenceId}'
 
 /**
  * MyID's universal link for create_verification_qr, per network.

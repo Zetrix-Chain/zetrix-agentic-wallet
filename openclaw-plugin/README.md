@@ -40,7 +40,7 @@ Set by the subscriber, through the gateway's plugin config UI or `plugins.entrie
 | `network` | `zetrix:testnet` | Mainnet spends real funds |
 | `maxPaymentAmount` | *(unset)* | Per-asset ceiling in raw units. Unset means the wallet's own default: the 1 JMYR credential fee, nothing else |
 | `zetrixAddress` | *(unset)* | Pin an existing holder account instead of creating one |
-| `myidVerifyLinkTemplate` | *(unset)* | MyID's link for `create_verification_qr`, with `{referenceId}` in it (https, placeholder in the path or query). It defaults to MyID's UAT link on testnet and to its production link (`https://myid-verifier.zetrix.com/api/agentic-verify?referenceId={referenceId}`) on mainnet, so leave it unset on both |
+| `myidVerifyLinkTemplate` | *(unset)* | MyID's link for `create_verification_qr`, with `{referenceId}` in it (https, placeholder in the path or query). It defaults to MyID's UAT link on testnet and to its production link (`https://myid-verifier.zetrix.com/agentic-verify?referenceId={referenceId}`) on mainnet, so leave it unset on both |
 
 These defaults apply with no action from the subscriber, so a fresh install can obtain its first
 credential and nothing more. A bare `{"*":"0"}` — the refuse-all value plugin ≤0.3.2 planted, in config
@@ -147,7 +147,7 @@ openclaw mcp unset zetrix-agentic-wallet
 
 ⚠️ **Before deleting `<gatewayStateDir>/zetrix-agentic-wallet/`, back up the wallet.** It holds the
 holder identity and the generated HSM password, and that password is the only thing that can authorize
-signing for the account. Run `npx agentic-wallet-mcp@0.18.0 export-credentials` (the wallet version this plugin bundles) in an interactive terminal
+signing for the account. Run `npx agentic-wallet-mcp@0.18.1 export-credentials` (the wallet version this plugin bundles) in an interactive terminal
 first. There is no recovery once it is gone.
 
 Two things to know if `mcp unset` fails: OpenClaw rejects config writes that shrink the file sharply

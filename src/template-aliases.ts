@@ -62,7 +62,7 @@ const TEMPLATE_ALIASES: TemplateAliasEntry[] = [
     validateAttributes: { dob: validateDob, countryOfOrigin: validateCountryOfOrigin },
     passDesignId: {
       testnet: 'did:zid:bb7202482ef6053be6d46ad8e2190b0ba1e3b2024d24ce7f37bc4c3747e2378f',
-      mainnet: 'did:zid:915955cb71c6fd2a256d04344f57381084903cb6a85a1c9ddb71c746f08932ab',
+      mainnet: 'did:zid:717f726afd240e13bcdf2b450b13881e62ad357725f599457faf267192d0c228',
     },
   },
 ]

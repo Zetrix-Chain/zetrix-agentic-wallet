@@ -252,7 +252,7 @@ only thing that can authorise payments from your account. If you lose this machi
 account and anything in it are **gone permanently** — nobody can recover it, including us.
 
 ```bash
-npx agentic-wallet-mcp@0.18.0 export-credentials
+npx agentic-wallet-mcp@0.18.1 export-credentials
 ```
 
 Run it in your own terminal window. It prints your address, DID and password. Store them somewhere

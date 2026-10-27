@@ -1330,6 +1330,26 @@ describe('subscribeAndIssue — VC pass image (extraData.vcPassBase64 from /v1/v
     expect(readFileSync(out.vcPassImagePaths![0], 'utf8')).toBe('pass-png-bytes')
   })
 
+  it('calls downloadVcs on the client it came from, so a real client that reads this.* works', async () => {
+    // The mocks above are plain functions, which cannot lose `this`. MbiClient.downloadVcs is a method that
+    // uses this.signedFetch; read off the client as a bare function it threw before reaching MBI, and the
+    // best-effort catch hid it, so no pass image ever came back (found on mainnet).
+    class ClientLike {
+      private readonly signed = 'signedFetch'
+      async downloadVcs(): Promise<unknown[]> {
+        if (this.signed !== 'signedFetch') throw new Error('Cannot read properties of undefined (reading signed)')
+        return [{ vc: { id: 'did:zid:vc-1' }, extraData: { vcPassBase64: [Buffer.from('pass-png-bytes').toString('base64')] } }]
+      }
+    }
+    const base = passImageDeps()
+    const mbi = Object.assign(new ClientLike(), { applyChallenge: base.mbi.applyChallenge, applySettle: base.mbi.applySettle })
+
+    const out = await subscribeConfirmed(passImageDeps({ mbi }) as never, opts)
+
+    expect(out.vcPassImagePaths).toHaveLength(1)
+    expect(readFileSync(out.vcPassImagePaths![0], 'utf8')).toBe('pass-png-bytes')
+  })
+
   it('caches vcPassImagePaths alongside the issued VC', async () => {
     const cache = { get: vi.fn().mockResolvedValue(null), set: vi.fn(), list: vi.fn() }
     const deps = passImageDeps({ cache })

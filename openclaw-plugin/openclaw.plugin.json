@@ -2,7 +2,7 @@
   "id": "zetrix-agentic-wallet",
   "name": "Zetrix Agentic Wallet",
   "description": "Zetrix identity, verifiable-credential and pay-per-use wallet tools for agents. It also sends tokens to a destination the user names and creates, updates and removes on-chain spending policies, each only after the user confirms the exact amount, destination and fee.",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "activation": {
     "onStartup": true
   },

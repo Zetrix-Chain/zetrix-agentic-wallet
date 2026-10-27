@@ -10,6 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.1] — 27 October 2026
+
+### Changed
+
+- **The mainnet MyID verify link has no `/api`.** The built-in mainnet default for `MYID_VERIFY_LINK_TEMPLATE` is now `https://myid-verifier.zetrix.com/agentic-verify?referenceId={referenceId}` (it was `.../api/agentic-verify?...`): on production the link is on the host's root, which is the path the MyID app's app-link file claims. Testnet is unchanged. A link made by 0.18.0 on mainnet still carries `/api`; set `MYID_VERIFY_LINK_TEMPLATE` to the link above to get the new one before the next release.
+
+### Fixed
+
+- **The Basic AI Birthcert can be issued on mainnet again.** Issuing it on mainnet was refused with `Pass design id not found for template` because the wallet sent a pass design id that the credential service does not have for that template. It now sends the registered one. Testnet is unchanged.
+- **The Basic AI Birthcert's card image now comes back after issuance, on every network.** The wallet fetched it after issuing, but the fetch failed before it reached the service and the failure was hidden, so the credential was issued without its card. The credential itself was never affected.
+
 ## [0.18.0] — 23 October 2026
 
 ### Added

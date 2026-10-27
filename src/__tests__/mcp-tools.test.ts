@@ -188,7 +188,7 @@ describe('createTools', () => {
     deps.config.network = 'zetrix:mainnet'
     await createTools(deps).subscribe_and_issue({ templateId: 'birth cert', attributes: { name: 'x' } })
     const sentData = JSON.parse((mbi.applyChallenge.mock.calls[0][0] as { data: string }).data)
-    expect(sentData[0].passDesignId).toBe('did:zid:915955cb71c6fd2a256d04344f57381084903cb6a85a1c9ddb71c746f08932ab')
+    expect(sentData[0].passDesignId).toBe('did:zid:717f726afd240e13bcdf2b450b13881e62ad357725f599457faf267192d0c228')
   })
 
   it('subscribe_and_issue omits passDesignId entirely for a template that is not the Basic Birthcert', async () => {

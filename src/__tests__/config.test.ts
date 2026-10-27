@@ -621,7 +621,7 @@ describe('MYID_VERIFY_LINK_TEMPLATE', () => {
   })
 
   // PRODUCTION: MyID's verifier host, which MyID says is ready. It is the mainnet default, so nobody has to set it.
-  const PROD_LINK = 'https://myid-verifier.zetrix.com/api/agentic-verify?referenceId={referenceId}'
+  const PROD_LINK = 'https://myid-verifier.zetrix.com/agentic-verify?referenceId={referenceId}'
 
   it('defaults to the MyID production link on mainnet', () => {
     const mainnet = { ...base, ZETRIX_NETWORK: 'zetrix:mainnet' } as NodeJS.ProcessEnv

@@ -437,5 +437,5 @@ the user's behalf.
 
 If the wallet generated its own credentials, they exist only on this machine and cannot be recovered
 if lost. If the user asks how to back up, tell them to run
-`npx agentic-wallet-mcp@0.18.0 export-credentials` in their own terminal (the version is the wallet this plugin bundles; keep it in the command). **You cannot do this for them** —
+`npx agentic-wallet-mcp@0.18.1 export-credentials` in their own terminal (the version is the wallet this plugin bundles; keep it in the command). **You cannot do this for them** —
 it is deliberately not a tool, so that credentials never enter a conversation.

@@ -370,7 +370,7 @@ async function pollSettlementOutcome(
  * call) would 404 instead of returning the credential again.
  */
 async function resolveVcPassImagePaths(deps: SubscribeDeps, vcId: string): Promise<string[] | undefined> {
-  const downloadVcs = deps.mbi.downloadVcs
+  const downloadVcs = deps.mbi.downloadVcs?.bind(deps.mbi)
   const signRequest = deps.signRequest
   const address = deps.address
   const quarantine = deps.quarantine
