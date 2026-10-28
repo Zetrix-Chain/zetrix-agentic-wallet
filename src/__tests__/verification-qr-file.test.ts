@@ -63,6 +63,29 @@ describe('create_verification_qr: a QR file a chat channel can attach', () => {
     expect(r.message).toMatch(/never/i)
   })
 
+  it('tells the agent to reply with only what the QR reveals, and to keep the owner, the address and the DID out of the chat', async () => {
+    const { deps } = makeDeps()
+
+    const r = await createVerificationLink(input, deps)
+
+    if (!r.created) throw new Error('expected a link')
+    expect(r.message).toMatch(/what this reveals, and nothing beyond it/)
+    expect(r.message).toMatch(/do not call wallet_status for more/)
+    expect(r.message).toMatch(/do not add the owner's name or ID number, the wallet address or the holder DID unless what this reveals includes it or the user asks for it/)
+    // The guidance says nothing about a channel: it must hold on every one.
+    expect(r.message).not.toMatch(/telegram|whatsapp/i)
+  })
+
+  it('does not claim the QR reveals less than the wallet holds when the whole credential is revealed', async () => {
+    const { deps } = makeDeps()
+
+    const r = await createVerificationLink({ vc, revealAll: true }, deps)
+
+    if (!r.created) throw new Error('expected a link')
+    expect(r.message).toMatch(/reveals the whole credential/)
+    expect(r.message).not.toMatch(/less than the wallet holds/)
+  })
+
   it('tells the agent to give the link and say so when it cannot attach an image', async () => {
     const { deps } = makeDeps()
 

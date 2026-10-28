@@ -467,3 +467,39 @@ describe('the Verified fee is never stated as fact', () => {
     expect(CHOICE_SRC).toMatch(/never assume either kind is free or paid/)
   })
 })
+
+// QA (Telegram): asked for proof of identity, the agent put the owner's name, the wallet address and the holder DID in the chat,
+// more than the QR reveals; the same ask on WhatsApp gave only what the QR reveals. Nothing in the wallet differs by channel, so
+// what the agent may say has to be stated where it reads it.
+describe('proof of verification: what the agent may say', () => {
+  it('the tool description says to give only what the QR reveals, not to call wallet_status for more, and to leave out the owner, address and DID', () => {
+    const d = tool('create_verification_qr').description
+    expect(d).toMatch(/what the result's `revealed` list says it reveals, and nothing beyond it/)
+    expect(d).toMatch(/do not call wallet_status first/)
+    expect(d).toMatch(/owner's name or ID number, the wallet address or the holder DID/)
+    expect(d).toMatch(/unless the `revealed` list includes it or the user asks for it/)
+  })
+
+  it('the tool description also covers a request for proof of identity, and keeps a proof request from a verifier with prove_identity', () => {
+    const d = tool('create_verification_qr').description
+    expect(d).toMatch(/proof of verification or of its identity/)
+    expect(d).toMatch(/a proof request from a verifier is answered with prove_identity, not this/)
+  })
+
+  it('SKILL.md says the same, in the section about proof that the agent is verified', () => {
+    const proof = SKILL.split('## When asked for proof that the agent is verified')[1].split('\n## ')[0]
+    expect(proof).toMatch(/Say only what the result's `revealed` list says the QR reveals/)
+    expect(proof).toMatch(/Do not call `wallet_status`/)
+    expect(proof).toMatch(/owner's\s+name or ID number, the wallet address or the holder DID/)
+    expect(proof).toMatch(/unless the[ \n]+`revealed` list includes them or the user asks for them/)
+  })
+
+  it('SKILL.md Safe first action no longer says to confirm the DID and address, and sends a proof request straight to the QR', () => {
+    const safe = SKILL.split('## Safe first action')[1].split('\n## ')[0]
+    expect(safe).not.toMatch(/confirm the[ \n]+holder DID/)
+    expect(safe).toMatch(/do not repeat the holder DID, the Zetrix address, the owner's name or the ID number to the user unless they ask/)
+    expect(safe).toContain('**Exception:**')
+    expect(safe).toMatch(/straight to[ \n]+`create_verification_qr`/)
+    expect(safe).toMatch(/do not call `wallet_status` first/)
+  })
+})

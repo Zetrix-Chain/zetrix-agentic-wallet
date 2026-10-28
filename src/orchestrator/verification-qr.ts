@@ -298,6 +298,8 @@ export async function createVerificationLink(
       `(they need it installed first). It stops working at about ${expiresAt}, ` +
       `${expiryMinutes} minute${expiryMinutes === 1 ? '' : 's'} after it was created — if it lapses, create a new one. ` +
       `This ${revealed.revealed === 'all' ? 'reveals the whole credential' : `reveals: ${revealed.revealed.map((p) => JSON.stringify(p)).join(', ')}`}. ` +
-      `Show it only to the user: whoever holds the link can open what it reveals until then.`,
+      `Show it only to the user: whoever holds the link can open what it reveals until then. ` +
+      `In your reply give the QR code, the link, how long it is good for and what this reveals, and nothing beyond it: ` +
+      `do not call wallet_status for more, and do not add the owner's name or ID number, the wallet address or the holder DID unless what this reveals includes it or the user asks for it, because a chat message is not private.`,
   }
 }

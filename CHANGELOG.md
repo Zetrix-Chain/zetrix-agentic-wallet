@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.2] — 28 October 2026
+
+### Fixed
+
+- **Asked for proof of identity, the agent now says only what the QR reveals.** On Telegram an agent answering a proof request put the owner's name, the wallet address and the holder DID in the chat, which is more than the QR reveals; on WhatsApp the same request gave only the QR, the link and the three things it reveals. The wallet does not behave differently by channel: the agent had the credential's details in front of it (from `wallet_status`) and nothing told it to leave them out. Worse, the skill's "Safe first action" told it to call `wallet_status` and "confirm" the holder DID and address, which reads as telling the user. The tool description, the result's message and the plugin skill now say to give the QR code, the link, the expiry and what the result says it reveals, not to call `wallet_status` for more, and to give the owner's name or ID number, the wallet address or the DID only if the result reveals them or the user asks; a request for proof of identity, as well as of verification, goes straight to the QR. **Scope:** this covers the proof-of-verification and proof-of-identity requests the QR answers. Other requests that show credential details ("show my credential", or the table of claims after an issuance) are unchanged. It is guidance to the agent, not a technical block: `wallet_status` still returns the full credential.
+
 ## [0.18.1] — 27 October 2026
 
 ### Changed

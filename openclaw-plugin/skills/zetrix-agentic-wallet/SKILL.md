@@ -1,7 +1,7 @@
 ---
 name: zetrix-agentic-wallet
 description: >
-  Use the Zetrix Agentic Wallet to report the holder identity, answer identity proof
+  Use the Zetrix Agentic Wallet to report the wallet status, answer identity proof
   requests, obtain verifiable credentials, pay for pay-per-use resources, send tokens
   to a destination the user names, create, update and remove on-chain spending
   policies, give a person a link and QR code to verify the agent in the MyID wallet,
@@ -61,9 +61,13 @@ Your host may present them slightly differently — match on the part after the 
 
 ## Safe first action
 
-Before anything identity-, credential- or payment-sensitive, call `wallet_status` and confirm the
+Before anything credential- or payment-sensitive, call `wallet_status` and check for yourself the
 holder DID, the Zetrix address, the **network**, and which credentials are held. Report the network
-plainly — mainnet spends real funds, testnet does not.
+plainly — mainnet spends real funds, testnet does not. What `wallet_status` returns is for your own
+check: do not repeat the holder DID, the Zetrix address, the owner's name or the ID number to the user unless they ask for them.
+
+**Exception:** when asked for proof that the agent is verified, or for proof of its identity, go straight to
+`create_verification_qr` (see "When asked for proof that the agent is verified") and do not call `wallet_status` first.
 
 ## Before collecting anything for a credential
 
@@ -412,10 +416,15 @@ actually confirmed.
 
 ## When asked for proof that the agent is verified
 
-If the user asks whether the agent is verified, or for proof of it, call `create_verification_qr` straight away and answer in one
+If the user asks whether the agent is verified, or for proof of it or of its identity, call `create_verification_qr` straight away and answer in one
 reply: the QR code as its own picture (the file at `qrCodePath`), the link, and how long it is good for. Do not wait to be asked
 for the link or the QR, and do not answer from the credential's details alone. The credential's pass design is a separate picture
 of the card and is never the QR code. The result's `credentialUsed` says which credential was presented: say that name.
+
+Say only what the result's `revealed` list says the QR reveals. Do not call `wallet_status` to add more, and do not put the owner's
+name or ID number, the wallet address or the holder DID in the reply, even though you can read them from the credential, unless the
+`revealed` list includes them or the user asks for them: a chat message is not private. A verifier's own proof request is answered
+with `prove_identity`, not with this.
 
 With a Verified AI Birthcert held, the Verified one is shown. To show the Basic one on a wallet that holds both, pass
 `credential: "basic"`, and only when the user asks for the Basic one.
@@ -437,5 +446,5 @@ the user's behalf.
 
 If the wallet generated its own credentials, they exist only on this machine and cannot be recovered
 if lost. If the user asks how to back up, tell them to run
-`npx agentic-wallet-mcp@0.18.1 export-credentials` in their own terminal (the version is the wallet this plugin bundles; keep it in the command). **You cannot do this for them** —
+`npx agentic-wallet-mcp@0.18.2 export-credentials` in their own terminal (the version is the wallet this plugin bundles; keep it in the command). **You cannot do this for them** —
 it is deliberately not a tool, so that credentials never enter a conversation.
