@@ -142,6 +142,47 @@ export interface MbiRevokeStatus {
   revokedAt?: string
 }
 
+/** What `POST /v1/vc/ext/agent/{delegation|policy}/issue` takes. MBI sets every authority value itself and ignores anything else sent. */
+export interface MbiAgentVcBody {
+  agentUsername: string
+  purpose?: string
+  additionalDetails?: string
+  /** YYYY-MM-DD, in the future, at most 365 days out; MBI defaults to 365 days. */
+  expirationDate?: string
+}
+
+/** A credential MBI issued to the signing key. The full credential is in the response: it is never fetched again with download. */
+export interface MbiAgentVcIssued {
+  vcId: string
+  verifiableCredential: unknown
+  extraData?: unknown
+}
+
+/** The body `POST /v1/vc/x401/agent-policy/apply` takes, the same on all three calls of one application. */
+export interface MbiAgentApplyBody {
+  /** The sub-agent's public key; MBI derives its DID and address from it and issues the credential to that address. */
+  subAgentPublicKey: string
+  /** The sub-agent's username, which becomes the agentUsername of its policy credential. */
+  agentUsername: string
+  purpose?: string
+  additionalDetails?: string
+  expirationDate?: string
+}
+
+/** What MBI answered to one call of `POST /v1/vc/x401/agent-policy/apply`. */
+export interface MbiAgentApplyReply {
+  status: number
+  /** The PROOF-REQUEST header of a 401: the next proof to make. */
+  proofRequest?: string
+  /** On 200 only: the credential's id and who it was issued to. The credential itself is never in this answer. */
+  data?: { vcId?: string; holderDid?: string; holderAddress?: string }
+  /** MBI's reason for a refusal ("REPLAY_DETECTED", ...) when it names one. */
+  code?: string
+  /** MBI's own number on a refusal that carries one (6004 no valid Verified AI Birthcert on record, 6005 the name differs from it). */
+  mbiStatus?: number
+  message?: string
+}
+
 /** One entry from `POST /v1/vc/ext/download` — every VC the holder has, not just one. */
 export interface MbiVcEntry {
   vc: unknown
@@ -252,11 +293,76 @@ export class MbiClient {
     return { revoked: flag, ...(revokedAt !== undefined ? { revokedAt } : {}) }
   }
 
-  /** POST /v1/vc/ext/download — holder-authenticated; returns EVERY VC for the address, not one. */
-  async downloadVcs(body: { address: string }, sign: MbiRequestSigner): Promise<MbiVcEntry[]> {
+  /**
+   * POST /v1/vc/ext/agent/{delegation|policy}/issue — issue the delegation credential or the main agent's policy credential to the signing
+   * key. Request-bound signing like the other `/ext` calls; no payment and no presentation. MBI chooses every authority value (the limits,
+   * the policy levels, the role) from its own configuration, so the body carries only the labels the agent may set.
+   *
+   * The issued credential is in the response and the caller must keep it: MBI marks a credential DOWNLOADED once it is downloaded, and a
+   * second issue for the same holder is refused (409), so a credential lost here is not simply fetched again.
+   */
+  async issueAgentVc(kind: 'delegation' | 'policy', body: MbiAgentVcBody, sign: MbiRequestSigner): Promise<MbiAgentVcIssued> {
+    const path = `/v1/vc/ext/agent/${kind}/issue`
+    const res = await this.signedFetch('POST', path, body, sign)
+    if (!res.ok) throw await this.error(res, `vc/ext/agent/${kind}/issue failed`)
+    const data = await this.unwrap<Partial<MbiAgentVcIssued> | null | undefined>(res)
+    if (typeof data?.vcId !== 'string' || data.verifiableCredential === undefined || data.verifiableCredential === null) {
+      throw new MbiError(`MBI ${path} succeeded (2xx) but returned no credential: ${JSON.stringify(data)}`, res.status)
+    }
+    return { vcId: data.vcId, verifiableCredential: data.verifiableCredential, ...(data.extraData !== undefined ? { extraData: data.extraData } : {}) }
+  }
+
+  /**
+   * POST /v1/vc/x401/agent-policy/apply — one call of the three that give a sub-agent its policy credential. A public path: no signed
+   * headers, only the proofs. The caller sends the SAME body text on all three calls (MBI binds each challenge to it), so the body is
+   * taken as text and sent exactly as given. Call 1 sends no proof, call 2 the birthcert's PROOF-RESPONSE, call 3 the delegation
+   * credential's. A 401 carries the next PROOF-REQUEST; any other answer is returned as it is and never thrown, so the caller can
+   * tell a refusal MBI explained from a network failure (which does throw).
+   */
+  async applyAgentPolicy(bodyText: string, proofResponse?: string): Promise<MbiAgentApplyReply> {
+    const res = await this.send(
+      'POST',
+      '/v1/vc/x401/agent-policy/apply',
+      bodyText,
+      proofResponse !== undefined ? { 'PROOF-RESPONSE': proofResponse } : undefined,
+      'error',
+    )
+    const text = await res.text().catch(() => '')
+    let json: Record<string, unknown> = {}
+    try {
+      const parsed: unknown = JSON.parse(text)
+      if (parsed !== null && typeof parsed === 'object') json = parsed as Record<string, unknown>
+    } catch {
+      /* an empty or non-JSON body is still an answer */
+    }
+    const proofRequest = res.headers?.get?.('proof-request') ?? undefined
+    const data = json.data !== null && typeof json.data === 'object' ? (json.data as MbiAgentApplyReply['data']) : undefined
+    return {
+      status: res.status,
+      ...(proofRequest ? { proofRequest } : {}),
+      ...(res.status === 200 && data ? { data } : {}),
+      ...(typeof json.code === 'string' ? { code: json.code } : {}),
+      // MBI's own number (6004, 6005, ...) on a refusal that carries one; the HTTP status stays in `status`.
+      ...(typeof json.status === 'number' && json.status !== res.status ? { mbiStatus: json.status } : {}),
+      ...(typeof json.message === 'string' ? { message: json.message } : {}),
+    }
+  }
+
+  /**
+   * POST /v1/vc/ext/download — holder-authenticated. With `vcId` it returns only that credential and marks only it DOWNLOADED; without it,
+   * EVERY issued VC for the address, each marked DOWNLOADED. A credential can be downloaded once: ask only for the one needed.
+   */
+  async downloadVcs(body: { address: string; vcId?: string }, sign: MbiRequestSigner): Promise<MbiVcEntry[]> {
     const res = await this.signedFetch('POST', '/v1/vc/ext/download', body, sign)
     if (!res.ok) throw await this.error(res, 'vc/ext/download failed')
-    const raw = await this.unwrap<unknown>(res)
+    let raw: unknown
+    try {
+      raw = await this.unwrap<unknown>(res)
+    } catch (err) {
+      // The body of a 2xx could not be read as JSON. Say so as an MbiError carrying the 2xx status: callers (the one-time policy download) tell
+      // this from a refusal, because MBI may already have changed the credential's status before the answer broke.
+      throw new MbiError(`MBI vc/ext/download succeeded (2xx) but its body could not be read: ${err instanceof Error ? err.message : String(err)}`, res.status)
+    }
     // Confirmed live (2026-08-17): MBI's real response double-wraps the list —
     // `{ data: { data: [...] } }` — NOT `{ data: [...] }` as SPEC.md's documented example assumed
     // (that example was never verified live until now). Accept either shape: the confirmed live

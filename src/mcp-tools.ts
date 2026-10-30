@@ -25,6 +25,10 @@
  *   remove_policy                       — remove a deployed policy (free; lifts its limits; needs confirm)
  *   check_policy_write                  — resume a paid-for policy write or update from its receipt
  *   transfer_token                      — send native ZTX or any ZTP20 token to an address
+ *   apply_delegation_vc                 — a main agent asks MBI for its AI Delegation Credential (no payment)
+ *   apply_policy_vc                     — a main agent asks MBI for its AI Policy Credential (no payment)
+ *   apply_sub_agent_policy_vc           — a main agent has MBI issue a policy credential to a sub-agent (x401, no payment)
+ *   download_policy_vc                  — the sub-agent fetches that credential by its vcId, once
  */
 
 import { aiBirthcertChoice } from './orchestrator/birthcert-choice.js'
@@ -32,6 +36,10 @@ import { access } from 'node:fs/promises'
 import type { X401Wallet } from 'x401-zetrix-client'
 import type { VcPresentInput } from './clients/mbi-vp-adapter.js'
 import { proveIdentity } from './orchestrator/prove.js'
+import type { AgentVcKind, ApplyAgentVcInput, ApplyAgentVcResult } from './orchestrator/agent-vc.js'
+import type { ApplySubAgentPolicyInput, ApplySubAgentPolicyResult, SubAgentProofResult } from './orchestrator/sub-agent-policy.js'
+import type { DownloadPolicyVcInput, DownloadPolicyVcResult } from './orchestrator/policy-download.js'
+import type { DelegationSuggestion } from './orchestrator/delegation-suggestion.js'
 import {
   credentialId,
   describeCredentialStatus,
@@ -65,6 +73,12 @@ function unclearBirthcertKind(name: string): string {
     `whether they want the Basic (self-declared) one or the Verified (MyDigital ID) one, then use "AI Birthcert" or ` +
     `"verified_ai_birthcert".`
   )
+}
+
+/** apply_delegation_vc / apply_policy_vc on a wallet built without the MBI wiring: say so, send nothing. */
+function agentVcUnwired(kind: AgentVcKind): ApplyAgentVcResult {
+  const credential = kind === 'delegation' ? 'AI Delegation Credential' : 'AI Policy Credential'
+  return { issued: false, kind, credential, reason: 'unavailable', message: `This wallet is not set up to request the ${credential}. Nothing was sent.` }
 }
 
 /** subscribe_and_issue's answer to an unclear name: nothing priced, signed or paid. */
@@ -123,6 +137,8 @@ export interface ToolDeps {
     holderDid: string
     zetrixAddress: string
     network: string
+    /** This wallet's own public key in Zetrix's encoded form (`b001...`), for wallet_status: a sub-agent gives it to its main agent. Absent when unknown. */
+    publicKey?: string
     /** Policy Registry address; undefined where the policy contracts are not deployed. */
     policyRegistryAddress?: string
     /** Policy Template address, for the id-only lookup the Registry does not proxy. */
@@ -236,6 +252,23 @@ export interface ToolDeps {
    * ever warns: it never throws and a failed check is `unknown`, so a presentation is never blocked by it.
    */
   credentialStatus?: CredentialStatusChecker
+  /**
+   * Asks MBI for the agent's delegation or policy credential and saves it (see orchestrator/agent-vc.ts). Optional so tests can omit it;
+   * index.ts always wires it. Without it the two apply tools say the wallet cannot request them.
+   */
+  agentVc?: (kind: AgentVcKind, input: ApplyAgentVcInput) => Promise<ApplyAgentVcResult>
+  /**
+   * The main agent's application for a sub-agent's policy credential (see orchestrator/sub-agent-policy.ts). It makes the three calls to
+   * MBI and needs the wallet's own proofs, so it is handed `prove`, which the tool wires to prove_identity. Optional so tests can omit it.
+   */
+  subAgentPolicy?: (input: ApplySubAgentPolicyInput, prove: (proofRequest: string, vc: unknown, revealAttribute: string[]) => Promise<SubAgentProofResult>) => Promise<ApplySubAgentPolicyResult>
+  /**
+   * What the wallet could offer the user next about the delegation credential (see orchestrator/delegation-suggestion.ts): undefined when
+   * there is nothing to offer. It reads only what the wallet holds. Optional so tests can omit it; then no result carries a suggestion.
+   */
+  delegationSuggestion?: () => Promise<DelegationSuggestion | undefined>
+  /** The sub-agent's one-time download of its policy credential by vcId (see orchestrator/policy-download.ts). Optional so tests can omit it. */
+  policyDownload?: (input: DownloadPolicyVcInput) => Promise<DownloadPolicyVcResult>
   verifyAiBirthcert?: {
     request: (input: RequestAiBirthcertVerificationInput) => Promise<RequestVerificationResult>
     check: () => Promise<CheckVerificationResult>
@@ -302,6 +335,8 @@ export function createTools(deps: ToolDeps) {
         for (const t of input.tokens) tokenBalances.push(await deps.queryTokenBalance(t))
       }
       const credentials = input.heldCredentials ?? (await loadValidCachedCredentials(deps.cache)).map((entry) => entry.vc)
+      // An offer about the delegation credential, when the wallet holds a Verified AI Birthcert and no delegation credential.
+      const suggestion = deps.delegationSuggestion ? await deps.delegationSuggestion() : undefined
       // Whether the issuer has revoked each one. Alongside the credentials, never inside them: a credential is signed and must be
       // passed on byte for byte. At most MAX_STATUS_CHECKS are asked about, concurrently; each check is bounded in time and never
       // throws, so this cannot fail wallet_status.
@@ -314,11 +349,13 @@ export function createTools(deps: ToolDeps) {
         holderDid: deps.config.holderDid,
         zetrixAddress: deps.config.zetrixAddress,
         network: deps.config.network,
+        ...(deps.config.publicKey ? { publicKey: deps.config.publicKey } : {}),
         credentials,
         ...(credentialStatus !== undefined && credentialStatus.length > 0 ? { credentialStatus } : {}),
         ...(balances !== undefined ? { balances } : {}),
         ...(tokenBalance !== undefined ? { tokenBalance } : {}),
         ...(tokenBalances !== undefined ? { tokenBalances } : {}),
+        ...(suggestion !== undefined ? { suggestion } : {}),
       }
     },
 
@@ -556,6 +593,32 @@ export function createTools(deps: ToolDeps) {
      * an agent reasoning about required fields had no obvious reason to reach for it. Reported
      * live: an agent discovered a newly-required attribute only by failing an issuance first.
      */
+    async apply_delegation_vc(input: ApplyAgentVcInput = {}) {
+      return deps.agentVc ? deps.agentVc('delegation', input) : agentVcUnwired('delegation')
+    },
+
+    async apply_policy_vc(input: ApplyAgentVcInput = {}) {
+      return deps.agentVc ? deps.agentVc('policy', input) : agentVcUnwired('policy')
+    },
+
+    async apply_sub_agent_policy_vc(input: ApplySubAgentPolicyInput): Promise<ApplySubAgentPolicyResult> {
+      if (!deps.subAgentPolicy) {
+        return { issued: false, reason: 'unavailable', message: 'This wallet is not set up to request a sub-agent policy credential. Nothing was sent.', safeToStartAgain: false }
+      }
+      // Each proof is made by prove_identity, with the credential the step names, so it is bound to MBI's challenge and answered once.
+      // The disclosure is fixed by the step (the claims MBI needs and nothing else), never left to what the challenge names.
+      return deps.subAgentPolicy(input, async (proofRequest, vc, revealAttribute) => {
+        const proof = (await tools.prove_identity({ proofRequest, vc, revealAttribute })) as { proofResponseHeader?: string; verified?: boolean }
+        return { proofResponseHeader: proof.proofResponseHeader, verified: proof.verified }
+      })
+    },
+
+    async download_policy_vc(input: DownloadPolicyVcInput): Promise<DownloadPolicyVcResult> {
+      return deps.policyDownload
+        ? deps.policyDownload(input)
+        : { downloaded: false, reason: 'unavailable', message: 'This wallet is not set up to download a policy credential. Nothing was sent.' }
+    },
+
     async get_template_schema(input: { templateId: string }) {
       const resolved = resolveTemplateAlias(input.templateId, deps.config.network)
       const templateId = resolved ?? input.templateId
@@ -928,6 +991,19 @@ export function createTools(deps: ToolDeps) {
   const readSchema = tools.get_policy_template_schema
   tools.get_policy_template_schema = (async (input: Parameters<typeof readSchema>[0] = {}) =>
     attachAttributeMeanings(await readSchema(input), deps.readPolicyVocabulary)) as typeof readSchema
+
+  // One more place to raise the delegation credential, only as a suggestion on a result that is otherwise unchanged: right
+  // after the Verified AI Birthcert was issued (the Basic one does not count for the delegation credential).
+  if (deps.delegationSuggestion) {
+    const suggest = deps.delegationSuggestion
+    const checkTool = tools.check_ai_birthcert_verification
+    tools.check_ai_birthcert_verification = (async () => {
+      const result = await checkTool()
+      if ((result as { status?: unknown } | undefined)?.status !== 'issued') return result
+      const suggestion = await suggest()
+      return suggestion === undefined ? result : { ...(result as object), suggestion }
+    }) as typeof checkTool
+  }
 
   return tools
 }

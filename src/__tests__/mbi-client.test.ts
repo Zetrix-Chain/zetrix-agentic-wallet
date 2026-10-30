@@ -327,6 +327,13 @@ describe('MbiClient', () => {
   // (observed transiently right as an async issuance was still landing) must not be handed to a
   // caller expecting MbiVcEntry[] — that produced a raw, undiagnosable
   // "entries.find is not a function" crash in checkAiBirthcertVerification instead of a clean error.
+  it('downloadVcs throws MbiError carrying the 2xx status when the body of a 2xx is not JSON', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('<html>not json</html>', { status: 200 })))
+    await expect(
+      mbi.downloadVcs({ address: 'ZTX3Holder' }, sign()),
+    ).rejects.toMatchObject({ name: 'MbiError', httpStatus: 200, message: expect.stringContaining('could not be read') })
+  })
+
   it('downloadVcs throws MbiError (not a raw TypeError downstream) when a 2xx response has a non-array data field', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(resp(200, { status: 200, data: {} })))
     await expect(

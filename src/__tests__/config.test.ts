@@ -143,11 +143,25 @@ describe('loadConfig', () => {
       stateDir: join(homedir(), '.agentic-wallet-mcp'),
       ssivcBaseUrl: 'https://ssivc-api-uat.myegdev2.com/api',
       aiBirthcertVerifiedTemplateId: 'did:zid:9641ee92552e9bcec672f300b071ff86d340ac78c83c225e95971cab8108fb80',
+      aiDelegationTemplateId: 'did:zid:1724245eb96cb0092c3ae354a68d9e21466aa5ef3e74019f4cfc7554b28cf1a9',
+      aiPolicyTemplateId: 'did:zid:d3e08efbeea484bcb21483b269230f250abb34d097e88ef22059b0aafbce6ce9',
       gasPreference: 'sponsored',
       maxSettlementAttempts: 20,
       settlementWaitBudgetMs: 90_000,
       settlementStuckAfterMs: 86_400_000,
     })
+  })
+
+  it('defaults the AI Delegation and AI Policy templateIds on testnet only, and honours an override', () => {
+    expect(loadConfig(base).aiDelegationTemplateId).toBe('did:zid:1724245eb96cb0092c3ae354a68d9e21466aa5ef3e74019f4cfc7554b28cf1a9')
+    expect(loadConfig(base).aiPolicyTemplateId).toBe('did:zid:d3e08efbeea484bcb21483b269230f250abb34d097e88ef22059b0aafbce6ce9')
+    // Not deployed on mainnet: nothing is guessed there.
+    const main = loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet' } as NodeJS.ProcessEnv)
+    expect(main.aiDelegationTemplateId).toBeUndefined()
+    expect(main.aiPolicyTemplateId).toBeUndefined()
+    const set = loadConfig({ ...base, ZETRIX_NETWORK: 'zetrix:mainnet', AI_DELEGATION_TEMPLATE_ID: 'did:zid:d1', AI_POLICY_TEMPLATE_ID: 'did:zid:p1' } as NodeJS.ProcessEnv)
+    expect(set.aiDelegationTemplateId).toBe('did:zid:d1')
+    expect(set.aiPolicyTemplateId).toBe('did:zid:p1')
   })
 
   it('defaults stateDir to ~/.agentic-wallet-mcp', () => {

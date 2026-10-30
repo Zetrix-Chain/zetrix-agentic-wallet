@@ -26,7 +26,7 @@ Check it worked:
 ```bash
 openclaw plugins list          # zetrix-agentic-wallet, enabled
 openclaw mcp doctor            # zetrix-agentic-wallet: ok
-openclaw mcp probe zetrix-agentic-wallet   # 21 tools
+openclaw mcp probe zetrix-agentic-wallet   # 25 tools
 ```
 
 Nothing else is needed. No `npx`, no account signup, no password, no MCP configuration.
@@ -252,7 +252,7 @@ only thing that can authorise payments from your account. If you lose this machi
 account and anything in it are **gone permanently** — nobody can recover it, including us.
 
 ```bash
-npx agentic-wallet-mcp@0.18.2 export-credentials
+npx agentic-wallet-mcp@0.19.0 export-credentials
 ```
 
 Run it in your own terminal window. It prints your address, DID and password. Store them somewhere

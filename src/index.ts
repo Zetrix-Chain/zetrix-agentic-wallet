@@ -38,11 +38,16 @@ import { WalletBeClient, WalletBeError } from './clients/wallet-be-client.js'
 import { WalletBeSigner } from './signer.js'
 import { createFsPresentedNonceStore } from './clients/presented-nonce-store.js'
 import { createX401WalletFactory } from './x401-wallet-factory.js'
+import { encodePublicKey } from './public-key.js'
 import { MbiClient, type PayRequirement } from './clients/mbi-client.js'
 import { ZidResolverClient } from './clients/zid-resolver-client.js'
 import { resolveIssuerProofKeys } from './clients/resolve-issuer-proof-keys.js'
 import { createTools, type ToolDeps } from './mcp-tools.js'
 import { createHeldCredentialFinder } from './held-credential.js'
+import { applyAgentVc } from './orchestrator/agent-vc.js'
+import { suggestDelegationVc } from './orchestrator/delegation-suggestion.js'
+import { applySubAgentPolicyVc } from './orchestrator/sub-agent-policy.js'
+import { downloadPolicyVc } from './orchestrator/policy-download.js'
 import { createVerificationLink } from './orchestrator/verification-qr.js'
 import { renderQrPng } from './qr-png.js'
 import { createFsQrFileStore } from './qr-file-store.js'
@@ -121,7 +126,9 @@ export function buildToolList() {
         'also returns that token\'s balance and its contract address (`tokenAddress`) — the value a policy\'s ' +
         'tokenAddress needs, so the user never has to be asked for it. Report a balance to the user as its `display` amount only. ' +
         'It also returns `credentialStatus`, one entry per held credential (at most ten): "active", "revoked" (the issuer has revoked it: tell the user, it is likely to be refused) ' +
-        'or "unknown" (the check could not be made, which is a warning and not a finding). The credentials themselves are returned untouched.',
+        'or "unknown" (the check could not be made, which is a warning and not a finding). The credentials themselves are returned untouched. ' +
+        'It also returns `publicKey`, this wallet\'s own public key. It is not a secret: show it when the user asks for it, and a sub-agent gives it to the main agent that is applying for its policy credential; do not volunteer it otherwise. ' +
+        'When the wallet holds a Verified AI Birthcert but no delegation credential, the result also carries `suggestion`: put its `askUser` to the user, and act on it only if they say yes.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -207,6 +214,87 @@ export function buildToolList() {
           body: { type: 'string' },
         },
         required: ['url'],
+      },
+    },
+    {
+      name: 'apply_delegation_vc',
+      description:
+        'Ask MBI for this agent\'s AI Delegation Credential: the permission a main agent holds to give a sub-agent a policy credential. ' +
+        'It is free (no payment) and the wallet saves it. Use it when the user asks to let this agent delegate to a sub-agent, or says yes when you offer it (a suggestion on a result); never on your own. ' +
+        'It needs a Verified AI Birthcert in the wallet (the owner verified with MyDigital ID) and refuses without one (it says what to get); the Basic AI Birthcert does not count. ' +
+        'Leave agentUsername out: it is the Verified birthcert\'s agentName, and if you pass a different one the call is refused because MBI and the sub-agent step compare the two. ' +
+        'The values inside the credential (whether delegation is allowed, how deep it may go) are set by MBI: never offer to choose them and never claim the user did. ' +
+        'An agent gets one: if the wallet already holds it, or MBI says the account already has one, the result says so (issued: false); do not retry. ' +
+        'On a refusal relay the message; on "rate_limited" wait and do not retry now.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          agentUsername: { type: 'string', description: 'Only to confirm the Verified birthcert\'s agentName; omit it. A different value is refused.' },
+          purpose: { type: 'string', description: 'Optional free text saying what the delegation is for.' },
+          additionalDetails: { type: 'string', description: 'Optional free text.' },
+          expirationDate: { type: 'string', description: 'Optional YYYY-MM-DD, in the future and at most 365 days away. Omit for MBI\'s default of 365 days.' },
+        },
+      },
+    },
+    {
+      name: 'apply_policy_vc',
+      description:
+        'Ask MBI for this main agent\'s AI Policy Credential: its policy levels (policyA, policyB, policyC) and transfer limit, which services can ask the agent to show. ' +
+        'It is free (no payment) and the wallet saves it. The levels, the limit and the role are set by MBI, not by the agent or the user: never offer to choose them, never promise a particular level, and report the values from the result\'s "attributes". ' +
+        'The agent needs this before it can give a sub-agent a policy credential. It needs a Verified AI Birthcert in the wallet (the Basic one does not count); the agentUsername is its agentName (leave agentUsername out; a different one is refused). ' +
+        'An agent gets one: if the wallet already holds it, or MBI says the account already has one, the result says so (issued: false); do not retry. ' +
+        'On a refusal relay the message; on "rate_limited" wait and do not retry now.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          agentUsername: { type: 'string', description: 'Only to confirm the Verified AI Birthcert\'s agentName; omit it. A different value is refused.' },
+          purpose: { type: 'string', description: 'Optional free text saying what the policy is for.' },
+          additionalDetails: { type: 'string', description: 'Optional free text.' },
+          expirationDate: { type: 'string', description: 'Optional YYYY-MM-DD, in the future and at most 365 days away. Omit for MBI\'s default of 365 days.' },
+        },
+      },
+    },
+    {
+      name: 'apply_sub_agent_policy_vc',
+      description:
+        'Have MBI issue an AI Policy Credential to a sub-agent, on this main agent\'s authority. Use it when the user wants this agent to give a sub-agent a policy, and the sub-agent has sent its public key. ' +
+        'It is free (no payment). It makes three calls to MBI and answers two proofs itself, one credential each: this agent\'s Verified AI Birthcert, then its AI Delegation Credential. ' +
+        'So the wallet must hold the delegation credential and this agent\'s own AI Policy Credential too (get them with apply_delegation_vc and apply_policy_vc first: it refuses without them and sends nothing); the Basic AI Birthcert does not count. ' +
+        'Only if apply_policy_vc says MBI already holds this agent\'s policy credential although this wallet has no copy of it, ask the user to confirm that, and then pass ownPolicyCredentialConfirmedAtMbi: true; never set it on your own. ' +
+        'Pass subAgentPublicKey exactly as the sub-agent gave it (a sub-agent reads its own from wallet_status, `publicKey`) and the sub-agent\'s own agentUsername. ' +
+        'On success the result has a vcId and the sub-agent\'s address, and the credential is NOT in it: this agent never holds it. Give the vcId to the sub-agent and tell it to call download_policy_vc from its own wallet; never try to download it from this wallet. ' +
+        'MBI chooses every value in the credential (this agent\'s own levels, and a limit it caps), so never promise the sub-agent a level or a limit. ' +
+        'Never call it again for the same sub-agent after a result with issued: true, or when MBI says the sub-agent already holds one. ' +
+        'If issued is false, relay the message. When safeToStartAgain is true nothing was issued and a new attempt may be made once the cause is fixed; when it is false do not retry. ' +
+        'Do not retry on "rate_limited".',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          subAgentPublicKey: { type: 'string', description: 'The sub-agent\'s public key, exactly as it sent it. The credential is issued to the address this key makes.' },
+          agentUsername: { type: 'string', description: 'The sub-agent\'s own username, not this agent\'s.' },
+          purpose: { type: 'string', description: 'Optional free text saying what the sub-agent is for.' },
+          additionalDetails: { type: 'string', description: 'Optional free text.' },
+          expirationDate: { type: 'string', description: 'Optional YYYY-MM-DD, in the future. Omit for MBI\'s default; it is never later than this agent\'s own policy credential.' },
+          ownPolicyCredentialConfirmedAtMbi: { type: 'boolean', description: 'Only after the USER has confirmed that MBI already holds this agent\'s own AI Policy Credential although this wallet has no saved copy of it. Never set it on your own.' },
+        },
+        required: ['subAgentPublicKey', 'agentUsername'],
+      },
+    },
+    {
+      name: 'download_policy_vc',
+      description:
+        'Fetch the AI Policy Credential that MBI issued to THIS wallet as a sub-agent, using the vcId the main agent gave you, and save it. ' +
+        'Call it from the sub-agent\'s own wallet; the main agent cannot fetch it for you and the wallet only ever asks for its own address. ' +
+        'A credential can be downloaded ONCE: MBI marks it taken as it answers, so if the answer is lost it cannot be fetched again. ' +
+        'So call it once, never retry it, and if the result says the outcome is unknown or that it is not available, tell the user and stop. ' +
+        'If this wallet already holds a valid policy credential, it refuses before asking MBI, because the new one would replace it. ' +
+        'The values in the credential were chosen by MBI; report them from the result\'s "attributes".',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          vcId: { type: 'string', description: 'The credential\'s id exactly as the main agent gave it; it starts with "did:zid:".' },
+        },
+        required: ['vcId'],
       },
     },
     {
@@ -1347,7 +1435,8 @@ export function buildToolList() {
         'the user they were not charged; give them paymentReceipt for support. The wallet has already ' +
         'DISCARDED the dead receipt, so nothing is blocking a new purchase: if the user wants the ' +
         'credential, call request_ai_birthcert_verification again and it pays normally. That is the ' +
-        'fee AGAIN, so ask them first rather than calling it on their behalf.',
+        'fee AGAIN, so ask them first rather than calling it on their behalf. ' +
+        'When the wallet holds a Verified AI Birthcert but no delegation credential, the result also carries `suggestion`: put its `askUser` to the user, and act on it only if they say yes.',
       inputSchema: { type: 'object', properties: {} },
     },
     {
@@ -1703,11 +1792,13 @@ export function buildToolConfig(
   >,
   holderDid: string,
   zetrixAddress: string,
+  publicKey?: string,
 ): ToolDeps['config'] {
   return {
     holderDid,
     zetrixAddress,
     network: config.network,
+    ...(publicKey ? { publicKey } : {}),
     policyRegistryAddress: config.policyRegistryAddress,
     policyTemplateAddress: config.policyTemplateAddress,
     policyTemplatePublisher: config.policyTemplatePublisher,
@@ -2315,7 +2406,7 @@ async function main(): Promise<void> {
   const { readPolicyVocabulary } = buildPolicyVocabularyReader(config.policyWriteUrl)
 
   const deps: ToolDeps = {
-    config: buildToolConfig(config, holderDid, zetrixAddress),
+    config: buildToolConfig(config, holderDid, zetrixAddress, encodePublicKey(publicKeyHex)),
     makeWallet,
     payer,
     subscribeDeps: {
@@ -2408,6 +2499,39 @@ async function main(): Promise<void> {
     // Whether the issuer has revoked a credential about to be presented. One signed call to MBI per credential, cached briefly;
     // it only warns, so a failed or slow check never blocks anything (see orchestrator/credential-status.ts).
     credentialStatus: createCredentialStatusChecker({ revokeStatus: (vcId) => mbi.revokeStatus(vcId, messageSigner) }),
+    // The main agent's delegation and policy credentials: free, issued by MBI with MBI's own values, saved in the cache at once.
+    agentVc: (kind, input) =>
+      applyAgentVc(kind, input, {
+        cache: vcCache,
+        network: config.network,
+        verifiedTemplateId: config.aiBirthcertVerifiedTemplateId,
+        templateIds: { delegation: config.aiDelegationTemplateId, policy: config.aiPolicyTemplateId },
+        issue: (k, body, sign) => mbi.issueAgentVc(k, body, sign),
+        sign: messageSigner,
+      }),
+    // Offered, never done: a Verified AI Birthcert with no delegation credential. Reads only the wallet's own cache.
+    delegationSuggestion: () => suggestDelegationVc({ cache: vcCache, verifiedTemplateId: config.aiBirthcertVerifiedTemplateId, delegationTemplateId: config.aiDelegationTemplateId }),
+    // A sub-agent's policy credential: three calls to MBI's x401-protected service, answered with this wallet's own proofs.
+    subAgentPolicy: (input, prove) =>
+      applySubAgentPolicyVc(input, {
+        cache: vcCache,
+        network: config.network,
+        verifiedTemplateId: config.aiBirthcertVerifiedTemplateId,
+        delegationTemplateId: config.aiDelegationTemplateId,
+        policyTemplateId: config.aiPolicyTemplateId,
+        apply: (bodyText, proofResponse) => mbi.applyAgentPolicy(bodyText, proofResponse),
+        prove,
+      }),
+    // The sub-agent's one-time download, always for this wallet's own address.
+    policyDownload: (input) =>
+      downloadPolicyVc(input, {
+        cache: vcCache,
+        policyTemplateId: config.aiPolicyTemplateId,
+        address: zetrixAddress,
+        holderDid,
+        download: (body, sign) => mbi.downloadVcs(body, sign),
+        sign: messageSigner,
+      }),
     createVerificationLink: (input) =>
       createVerificationLink(input, {
         mbi,

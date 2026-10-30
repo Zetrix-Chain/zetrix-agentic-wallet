@@ -40,11 +40,11 @@ function moneySentences(): { tool: string; path: string; sentence: string }[] {
 }
 
 describe('buildToolList', () => {
-  it('exposes exactly the 21 agent tools with the correct required inputs', () => {
+  it('exposes exactly the 25 agent tools with the correct required inputs', () => {
     const tools = buildToolList()
     expect(tools.map((t) => t.name).sort()).toEqual([
-      'check_ai_birthcert_verification', 'check_policy_decision', 'check_policy_write', 'clear_stuck_payment_receipt',
-      'create_holder_account', 'create_verification_qr', 'credential_preflight', 'get_my_policy', 'get_policy_template_schema',
+      'apply_delegation_vc', 'apply_policy_vc', 'apply_sub_agent_policy_vc', 'check_ai_birthcert_verification', 'check_policy_decision', 'check_policy_write', 'clear_stuck_payment_receipt',
+      'create_holder_account', 'create_verification_qr', 'credential_preflight', 'download_policy_vc', 'get_my_policy', 'get_policy_template_schema',
       'get_template_schema', 'pay_and_fetch', 'policy_preflight', 'prove_identity',
       'query_contract', 'remove_policy', 'request_ai_birthcert_verification', 'subscribe_and_issue', 'transfer_token',
       'update_policy', 'wallet_status', 'write_policy',

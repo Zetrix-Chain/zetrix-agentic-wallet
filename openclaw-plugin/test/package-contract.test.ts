@@ -32,8 +32,11 @@ const nextStepNames = (() => {
 })()
 
 describe('the wallet tool list is readable', () => {
-  it('finds exactly the twenty-one tools', () => {
+  it('finds exactly the twenty-five tools', () => {
     expect(walletToolNames.sort()).toEqual([
+      'apply_delegation_vc',
+      'apply_policy_vc',
+      'apply_sub_agent_policy_vc',
       'check_ai_birthcert_verification',
       'check_policy_decision',
       'check_policy_write',
@@ -41,6 +44,7 @@ describe('the wallet tool list is readable', () => {
       'create_holder_account',
       'create_verification_qr',
       'credential_preflight',
+      'download_policy_vc',
       'get_my_policy',
       'get_policy_template_schema',
       'get_template_schema',

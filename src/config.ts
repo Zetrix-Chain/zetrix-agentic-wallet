@@ -166,6 +166,16 @@ export interface AgenticWalletConfig {
    * AI_BIRTHCERT_VERIFIED_TEMPLATE_ID overrides it.
    */
   aiBirthcertVerifiedTemplateId?: string
+  /**
+   * The AI Delegation Credential's on-chain templateId: the permission a main agent holds to give a sub-agent a policy credential.
+   * Deployed on testnet only so far, so undefined on any other network (the tool says so); AI_DELEGATION_TEMPLATE_ID overrides it.
+   */
+  aiDelegationTemplateId?: string
+  /**
+   * The AI Policy Credential's on-chain templateId (one template for the main agent and its sub-agents). Deployed on testnet only
+   * so far, so undefined on any other network; AI_POLICY_TEMPLATE_ID overrides it.
+   */
+  aiPolicyTemplateId?: string
   /** Which side pays network gas when the resource server offers a choice. Default 'sponsored'. */
   gasPreference: GasPreference
   /** How many times to re-poll SSIVC for a queued sponsored settlement before giving up. */
@@ -403,6 +413,21 @@ export const MAINNET_AI_BIRTHCERT_VERIFIED_TEMPLATE_ID = 'did:zid:2d8f9476809fe2
 /**
  * `AI_BIRTHCERT_VERIFIED` templateId, deployed 2026-08-05 (`TEMPLATE_ONCHAIN_REFERENCE.md` §2). Both ids were read from chain.
  */
+/**
+ * The testnet `AI Delegation Credential` v1.0.0 and `AI Policy Credential` v1.0.0 templateIds, deployed 2026-10-22 and read back from
+ * the testnet template registry on 2026-10-23 (same issuer as the AI Birthcert). Not deployed on mainnet yet.
+ */
+export const TESTNET_AI_DELEGATION_TEMPLATE_ID = 'did:zid:1724245eb96cb0092c3ae354a68d9e21466aa5ef3e74019f4cfc7554b28cf1a9'
+export const TESTNET_AI_POLICY_TEMPLATE_ID = 'did:zid:d3e08efbeea484bcb21483b269230f250abb34d097e88ef22059b0aafbce6ce9'
+
+function deriveAiDelegationTemplateId(network: string): string | undefined {
+  return network.includes('testnet') ? TESTNET_AI_DELEGATION_TEMPLATE_ID : undefined
+}
+
+function deriveAiPolicyTemplateId(network: string): string | undefined {
+  return network.includes('testnet') ? TESTNET_AI_POLICY_TEMPLATE_ID : undefined
+}
+
 function deriveAiBirthcertVerifiedTemplateId(network: string): string {
   return network.includes('testnet') ? 'did:zid:9641ee92552e9bcec672f300b071ff86d340ac78c83c225e95971cab8108fb80' : MAINNET_AI_BIRTHCERT_VERIFIED_TEMPLATE_ID
 }
@@ -648,6 +673,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): AgenticWalletConfig {
       return v ? stripTrailingSlash(v) : undefined
     })(),
     aiBirthcertVerifiedTemplateId: opt('AI_BIRTHCERT_VERIFIED_TEMPLATE_ID') ?? deriveAiBirthcertVerifiedTemplateId(network),
+    aiDelegationTemplateId: opt('AI_DELEGATION_TEMPLATE_ID') ?? deriveAiDelegationTemplateId(network),
+    aiPolicyTemplateId: opt('AI_POLICY_TEMPLATE_ID') ?? deriveAiPolicyTemplateId(network),
     // Unrecognised values fall back to the default rather than throwing — a typo here must not
     // brick startup, and 'sponsored' is always attemptable thanks to Task 5's self-pay fallback.
     gasPreference: env.GAS_PREFERENCE === 'self' ? 'self' : 'sponsored',

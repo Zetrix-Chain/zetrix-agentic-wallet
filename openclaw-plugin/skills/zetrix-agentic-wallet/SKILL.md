@@ -37,7 +37,7 @@ Your host may present them slightly differently — match on the part after the 
 
 | Tool | Costs money? | Use it for |
 |---|---|---|
-| `wallet_status` | no | Holder address, DID, network, held credentials, token balance |
+| `wallet_status` | no | Holder address, DID, network, public key, held credentials, token balance |
 | `credential_preflight` | no | **First step for any credential** — fee, gas model, balances, spending limit, required fields |
 | `get_template_schema` | no | What attributes a credential template requires |
 | `query_contract` | no | Read-only contract or account state |
@@ -58,6 +58,10 @@ Your host may present them slightly differently — match on the part after the 
 | `remove_policy` | no | Removing a deployed spending policy. Free, but it lifts every limit it set, so it needs the user's clear yes |
 | `check_policy_write` | no | Finishing a policy write already paid for — the right answer to "did it get created?" |
 | `transfer_token` | **yes** | Sending ZTX or a ZTP20 token to an address — **moves real funds, irreversible** |
+| `apply_delegation_vc` | no | Getting this agent's delegation credential (the permission to give a sub-agent a policy). Free; needs a Verified AI Birthcert; MBI sets the values |
+| `apply_policy_vc` | no | Getting this main agent's policy credential (its policy levels and transfer limit). Free; MBI sets the values |
+| `apply_sub_agent_policy_vc` | no | Having MBI issue a policy credential to a sub-agent (three calls, two proofs the wallet makes itself). Free; the credential goes to the sub-agent, not here |
+| `download_policy_vc` | no | The sub-agent fetching its policy credential by vcId. **Once only**: never retry it |
 
 ## Safe first action
 
@@ -403,6 +407,32 @@ balance from earlier messages, from what was spent during this conversation, or 
 call reported — a figure derived that way is indistinguishable, to the user, from one the wallet
 actually confirmed.
 
+## Delegation and policy credentials
+
+- `apply_delegation_vc` and `apply_policy_vc` ask MBI for the agent's two credentials. Neither costs money and neither needs a presentation.
+- MBI chooses every value in them (the policy levels, the transfer limit, the role, whether delegation is allowed). Never offer to
+  choose them, never promise a level, and report the values from the result's `attributes`.
+- An agent gets one of each. If the result says it is already held, do not call again; if it says MBI holds one the wallet does
+  not, do not retry and tell the user.
+- A result may carry a `suggestion` to offer the delegation credential: right after the Verified AI Birthcert is issued
+  (`check_ai_birthcert_verification`) and in `wallet_status`. Put its `askUser` to the user and call
+  `apply_delegation_vc` only if they say yes; never on your own, and do not raise it again once they have said no.
+- Both credentials need a **Verified** AI Birthcert in the wallet, with the owner verified; the Basic AI Birthcert does not count.
+  Without one, say so and offer the verification (`request_ai_birthcert_verification`). Leave `agentUsername` out: it is the
+  birthcert's `agentName`, and the credentials must carry that name.
+- If the wallet holds a delegation or policy credential made under another name (before this rule), the result says it has to be
+  revoked and issued again by whoever runs MBI. Tell the user; do not retry.
+
+### Giving a sub-agent a policy
+
+- A sub-agent reads its own public key from `wallet_status` (`publicKey`) and gives it to the main agent that applies for its policy credential. It is not a secret: show it when the user asks for it (it is what the owner hands to the main agent), and do not volunteer it otherwise.
+- When a sub-agent has sent its public key, `apply_sub_agent_policy_vc` has MBI issue it a policy credential. The wallet needs the Verified
+  AI Birthcert, the delegation credential and this agent's own policy credential (`apply_policy_vc`) first; without them it refuses and sends nothing. If `apply_policy_vc` says MBI already holds this agent's policy credential but this wallet has no copy, ask the user to confirm that, and only then pass `ownPolicyCredentialConfirmedAtMbi: true`; never set it on your own.
+- The result carries a `vcId`, not the credential. Pass the vcId to the sub-agent; never fetch the credential for it.
+- The sub-agent fetches it with `download_policy_vc`, from its own wallet. **That works once.** Never call it twice for the same vcId, and
+  if it says the outcome is unknown, tell the user and stop.
+- Never retry `apply_sub_agent_policy_vc` unless the result says `safeToStartAgain`: a proof is good once, and MBI counts applications.
+
 ## Identity and credentials
 
 - Never fabricate a DID, address, credential, transaction hash or proof result. If a tool did not
@@ -446,5 +476,5 @@ the user's behalf.
 
 If the wallet generated its own credentials, they exist only on this machine and cannot be recovered
 if lost. If the user asks how to back up, tell them to run
-`npx agentic-wallet-mcp@0.18.2 export-credentials` in their own terminal (the version is the wallet this plugin bundles; keep it in the command). **You cannot do this for them** —
+`npx agentic-wallet-mcp@0.19.0 export-credentials` in their own terminal (the version is the wallet this plugin bundles; keep it in the command). **You cannot do this for them** —
 it is deliberately not a tool, so that credentials never enter a conversation.

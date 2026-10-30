@@ -147,7 +147,7 @@ openclaw mcp unset zetrix-agentic-wallet
 
 ⚠️ **Before deleting `<gatewayStateDir>/zetrix-agentic-wallet/`, back up the wallet.** It holds the
 holder identity and the generated HSM password, and that password is the only thing that can authorize
-signing for the account. Run `npx agentic-wallet-mcp@0.18.2 export-credentials` (the wallet version this plugin bundles) in an interactive terminal
+signing for the account. Run `npx agentic-wallet-mcp@0.19.0 export-credentials` (the wallet version this plugin bundles) in an interactive terminal
 first. There is no recovery once it is gone.
 
 Two things to know if `mcp unset` fails: OpenClaw rejects config writes that shrink the file sharply
